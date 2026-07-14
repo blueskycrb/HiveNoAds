@@ -1,4 +1,4 @@
-name: Build HiveNoAds dylib
+name: Build ad-block dylibs
 
 on:
   push:
@@ -13,75 +13,70 @@ jobs:
   build:
     runs-on: macos-14
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Show Xcode
-        run: |
-          xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-path
-          clang --version | head -2
-
-      - name: Build arm64 dylib
+      - name: Build all apps/*/ dylibs
         run: |
           set -euo pipefail
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          OUT=dist
-          mkdir -p "$OUT"
+          mkdir -p dist
+          shopt -s nullglob
+          srcs=(apps/*/*.m)
+          if [ ${#srcs[@]} -eq 0 ]; then
+            echo "No sources under apps/*/*.m" >&2
+            exit 1
+          fi
+          for src in "${srcs[@]}"; do
+            app=$(basename "$(dirname "$src")")
+            # dylib 与 App 同名: apps/HiveConsumer/HiveConsumer.m → HiveConsumer.dylib
+            out="dist/${app}.dylib"
+            echo "==> building $out from $src"
+            clang -dynamiclib \
+              -isysroot "$SDK" \
+              -arch arm64 \
+              -miphoneos-version-min=13.0 \
+              -fobjc-arc \
+              -O2 \
+              -fvisibility=hidden \
+              -framework Foundation \
+              -framework UIKit \
+              -install_name "@rpath/${app}.dylib" \
+              -o "$out" \
+              "$src"
+            file "$out"
+            ls -lh "$out"
+          done
+          ls -lh dist/
 
-          clang -dynamiclib \
-            -isysroot "$SDK" \
-            -arch arm64 \
-            -miphoneos-version-min=13.0 \
-            -fobjc-arc \
-            -O2 \
-            -framework Foundation \
-            -framework UIKit \
-            -install_name @rpath/HiveNoAds.dylib \
-            -o "$OUT/HiveNoAds.dylib" \
-            HiveNoAds.m
-
-          # TrollFools 兼容：同时给一份不带 install_name 特殊路径的拷贝
-          cp "$OUT/HiveNoAds.dylib" "$OUT/HiveNoAds_trollfools.dylib"
-
-          echo "==== file ===="
-          file "$OUT/HiveNoAds.dylib"
-          echo "==== otool -hv ===="
-          otool -hv "$OUT/HiveNoAds.dylib" || true
-          echo "==== otool -L ===="
-          otool -L "$OUT/HiveNoAds.dylib" || true
-          ls -lh "$OUT"
-
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: HiveNoAds-dylib
-          path: |
-            dist/HiveNoAds.dylib
-            dist/HiveNoAds_trollfools.dylib
+          name: noads-dylibs
+          path: dist/*.dylib
           if-no-files-found: error
 
-      - name: Create GitHub Release (on main)
+      - name: Release
         if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.0-${{ github.run_number }}
-          name: HiveNoAds dylib build #${{ github.run_number }}
+          tag_name: build-${{ github.run_number }}
+          name: NoAds dylibs #${{ github.run_number }}
           body: |
-            丰巢 `com.fcbox.hiveconsumer` 去广告 dylib（无 Substrate，适配 **TrollFools**）。
+            按 **App 名** 命名的去广告 dylib（TrollFools，无 Substrate）。
 
-            ## 使用
-            1. 下载 `HiveNoAds.dylib`
-            2. 用 **TrollFools** 注入到「丰巢」App
-            3. 完全划掉 App 后冷启动
+            | 文件 | 注入目标 |
+            |------|----------|
+            | `HiveConsumer.dylib` | 丰巢 (`com.fcbox.hiveconsumer`) |
 
-            ## 说明
-            - 架构: arm64
-            - 最低 iOS: 13.0
-            - 不依赖 MobileSubstrate / 越狱 hook 框架
-          files: |
-            dist/HiveNoAds.dylib
-          draft: false
-          prerelease: false
+            ## 用法
+            1. 下载对应 `AppName.dylib`
+            2. TrollFools → 选择 App → 注入
+            3. 彻底杀掉 App 后冷启动
+
+            ## v2 性能
+            - 取消全进程类扫描
+            - 取消 UIView 全局 swizzle
+            - 默认关闭日志
+          files: dist/*.dylib
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

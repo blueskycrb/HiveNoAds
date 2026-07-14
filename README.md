@@ -1,72 +1,86 @@
-# HiveNoAds
+# NoAds dylibs (TrollFools)
 
-丰巢 iOS App（`com.fcbox.hiveconsumer` / `HiveConsumer`）**去广告 dylib**，面向 **TrollFools** 注入，**不依赖** MobileSubstrate / ElleKit / 越狱 Substrate。
-
-基于 **HiveConsumer 6.32.0** 解密二进制静态分析编写。
+按 **App 可执行文件名 / 产品名** 命名的去广告动态库，专供 [TrollFools](https://github.com/Lessica/TrollFools) 注入。  
+**不依赖** MobileSubstrate / 越狱。
 
 ## 下载
 
-1. 打开本仓库 [Actions](../../actions) → 最新成功的 **Build HiveNoAds dylib**
-2. 下载 Artifact **`HiveNoAds-dylib`**，解压得到 `HiveNoAds.dylib`  
-   或在 [Releases](../../releases) 直接下载
+- [Releases](../../releases) 里每个 `AppName.dylib`
+- 或 [Actions](../../actions) 最新成功 run 的 artifact `noads-dylibs`
 
-## TrollFools 使用
+## 已支持
 
-1. 手机安装 [TrollFools](https://github.com/Lessica/TrollFools)（需 TrollStore）
-2. 将 `HiveNoAds.dylib` 拷到手机（文件 App / 电脑 iTunes 等）
-3. 打开 TrollFools → 选择 **丰巢** → 注入该 dylib
-4. **彻底关掉** 丰巢后重新打开（冷启动）
+| dylib | App | Bundle ID |
+|-------|-----|-----------|
+| **HiveConsumer.dylib** | 丰巢 | `com.fcbox.hiveconsumer` |
 
-成功时系统日志可见：`[HiveNoAds] loaded in com.fcbox.hiveconsumer`
+## 使用 (TrollFools)
 
-## 广告栈（分析摘要）
+1. 下载与 App 同名的 dylib（如 `HiveConsumer.dylib`）
+2. TrollFools → 选对应 App → 注入
+3. **彻底划掉** App 再打开
 
-| 层级 | 组件 |
-|------|------|
-| 业务 | `SplashAdManager` / `FCSplashADSManager` / `AdCenter` / `OpenScrAdLib*` / `InterstScrAdLib*` / `NativeSplashAdView` 等 |
-| 聚合 | **WindMill（Sigmob）**、ToBid、AnyThink、UBiX |
-| 渠道 | 穿山甲 CSJ、广点通 GDT、快手 KSAd、百度等 |
-| 其它 | DCloud Uni：`DCUniSplashAd` 等 |
+若之前注入过旧的 `HiveNoAds.dylib`，请先在 TrollFools 里 **移除旧插件**，再注入新的 `HiveConsumer.dylib`。
 
-## 原理
+## 启动变慢？(已优化)
 
-纯 `objc/runtime`：
+旧版 `HiveNoAds` 启动偏慢的原因：
 
-1. 阻断 WindMill / DCUni 的 `loadAd*` / `showAd*` / `isReady`
-2. 禁止 `+[WindMillAds setupSDKWithAppId:sdkConfigures:]`
-3. 扫描类名像广告的类，替换广告控制方法
-4. 隐藏广告 UIView，拦截广告 VC 的 `present`
+1. 每次启动 `objc_copyClassList` 扫全部类  
+2. hook 了 **整个** `UIView` 的 `didMoveToWindow` / `setHidden`（每个控件都走）  
+3. 默认 `NSLog` 很吵  
+4. 2s / 3s / 6s 多次全量重扫  
 
-激励视频默认只禁止展示。若要实验“假装发奖”，改 `HiveNoAds.m`：
+**当前 `HiveConsumer.dylib`（v2）：**
 
-```objc
-static const BOOL kHiveNoAdsFakeReward = YES;
+- 只 hook 白名单里的广告类  
+- 只给广告 View 子类装 `didMoveToWindow`  
+- 默认无日志  
+- 构造期一次 + 主线程一次 + **1.5s 后台再补一次**  
+
+体感应接近未注入时的启动速度；若仍偏慢，把 iOS 版本发我再收紧白名单。
+
+## 仓库结构（方便加新 App）
+
+```
+apps/
+  HiveConsumer/
+    HiveConsumer.m      → 编译为 HiveConsumer.dylib
+  # 下一个 App:
+  # SomeApp/
+  #   SomeApp.m         → SomeApp.dylib
+.github/workflows/build.yml   # 自动编译 apps/*/*.m
 ```
 
-后重新跑 Actions 编译。
+约定：
 
-## 本地编译（可选，macOS）
+- 目录名 = dylib 名 = 建议与 App 可执行文件名一致  
+- 每个 App 一个 `.m`，互不依赖  
+- push 到 `main` 即构建全部 dylib 并发 Release  
+
+需要去广告的新 App：丢解密包 / IPA 里主二进制，或说明 Bundle ID，我按同样结构加 `apps/新名字/`。
+
+## 本地编译 (macOS)
 
 ```bash
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 clang -dynamiclib -isysroot "$SDK" -arch arm64 -miphoneos-version-min=13.0 \
   -fobjc-arc -O2 -framework Foundation -framework UIKit \
-  -o HiveNoAds.dylib HiveNoAds.m
+  -o HiveConsumer.dylib apps/HiveConsumer/HiveConsumer.m
 ```
 
-## 仓库文件
+## 调试
 
-- `HiveNoAds.m` — dylib 源码（TrollFools 用这个）
-- `.github/workflows/build.yml` — GitHub Actions 自动编 arm64 dylib
-- `Tweak.x` / `Makefile` — 传统 Theos 越狱插件备选（非 TrollFools 必需）
+把 `apps/HiveConsumer/HiveConsumer.m` 顶部：
 
-## 注意
+```objc
+static const BOOL kVerbose = YES;
+```
 
-- 仅供自有设备学习研究；可能违反 App 用户协议  
-- 未修改支付 / 开柜 / 服务端会员校验  
-- 大版本更新后类名可能变化，需按新二进制补 hook  
-- 若闪退：用 TrollFools 移除注入，或提 Issue 附 iOS 版本与 App 版本  
+再推送构建。Console 过滤 `HiveConsumer`。
 
-## License
+## 说明
 
-MIT（自用 / 研究）
+- 仅供自有设备研究；可能违反 App 协议  
+- 未改支付 / 开柜 / 服务端校验  
+- 大版本升级后若广告回来，需按新二进制补白名单  
