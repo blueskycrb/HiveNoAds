@@ -368,6 +368,7 @@ static BOOL isTabButtonView(UIView *view) {
     if (!name) return NO;
     return strstr(name, "DCTabBarButton") ||
            strstr(name, "DCTabBarMidButton") ||
+           strstr(name, "MainTabBarItemContentView") ||
            strcmp(name, "UITabBarButton") == 0;
 }
 
