@@ -1,0 +1,83 @@
+name: Build HiveNoAds dylib
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          clang --version | head -2
+
+      - name: Build arm64 dylib
+        run: |
+          set -euo pipefail
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          OUT=dist
+          mkdir -p "$OUT"
+
+          clang -dynamiclib \
+            -isysroot "$SDK" \
+            -arch arm64 \
+            -miphoneos-version-min=13.0 \
+            -fobjc-arc \
+            -O2 \
+            -framework Foundation \
+            -framework UIKit \
+            -install_name @rpath/HiveNoAds.dylib \
+            -o "$OUT/HiveNoAds.dylib" \
+            HiveNoAds.m
+
+          # TrollFools 兼容：同时给一份不带 install_name 特殊路径的拷贝
+          cp "$OUT/HiveNoAds.dylib" "$OUT/HiveNoAds_trollfools.dylib"
+
+          echo "==== file ===="
+          file "$OUT/HiveNoAds.dylib"
+          echo "==== otool -hv ===="
+          otool -hv "$OUT/HiveNoAds.dylib" || true
+          echo "==== otool -L ===="
+          otool -L "$OUT/HiveNoAds.dylib" || true
+          ls -lh "$OUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HiveNoAds-dylib
+          path: |
+            dist/HiveNoAds.dylib
+            dist/HiveNoAds_trollfools.dylib
+          if-no-files-found: error
+
+      - name: Create GitHub Release (on main)
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.0-${{ github.run_number }}
+          name: HiveNoAds dylib build #${{ github.run_number }}
+          body: |
+            丰巢 `com.fcbox.hiveconsumer` 去广告 dylib（无 Substrate，适配 **TrollFools**）。
+
+            ## 使用
+            1. 下载 `HiveNoAds.dylib`
+            2. 用 **TrollFools** 注入到「丰巢」App
+            3. 完全划掉 App 后冷启动
+
+            ## 说明
+            - 架构: arm64
+            - 最低 iOS: 13.0
+            - 不依赖 MobileSubstrate / 越狱 hook 框架
+          files: |
+            dist/HiveNoAds.dylib
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

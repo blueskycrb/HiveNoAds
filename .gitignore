@@ -1,0 +1,9 @@
+.theos/
+packages/
+*.deb
+dist/
+*.dylib
+.DS_Store
+xcuserdata/
+*.xcworkspace
+DerivedData/

@@ -1,0 +1,9 @@
+Package: com.local.hivenoads
+Name: HiveNoAds
+Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 13.0)
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: 丰巢 HiveConsumer 去广告插件 (开屏/插屏/激励/Banner/信息流)
+Maintainer: local
+Author: local
+Section: Tweaks

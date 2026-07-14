@@ -1,0 +1,23 @@
+HiveNoAds build notes
+=====================
+
+Source location (Windows):
+  C:\Users\tang\HiveNoAds\
+
+Compile on a machine with Theos (macOS/Linux recommended):
+
+  export THEOS=~/theos
+  cd HiveNoAds
+  make package FINALPACKAGE=1
+
+Rootless (Dopamine / palera1n rootless):
+  Add to Makefile top:
+    THEOS_PACKAGE_SCHEME = rootless
+  then: make package FINALPACKAGE=1
+
+Install deb, respring / relaunch HiveConsumer.
+
+Binary analyzed:
+  HiveConsumer_6.32.0_decrypted
+  Mach-O 64-bit arm64
+  Bundle: com.fcbox.hiveconsumer

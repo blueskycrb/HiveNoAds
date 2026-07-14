@@ -1,0 +1,10 @@
+{
+	Filter = {
+		Bundles = (
+			"com.fcbox.hiveconsumer",
+		);
+		Executables = (
+			HiveConsumer,
+		);
+	};
+}
