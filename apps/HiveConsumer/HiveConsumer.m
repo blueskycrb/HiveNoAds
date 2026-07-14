@@ -358,10 +358,72 @@ static void installViewHooks(void) {
     }
 }
 
+#pragma mark - Main tab cleanup
+
+// 原顺序: 0 首页, 1 洗衣洗鞋, 2 会员直降, 3 订单, 4 我的
+// 仅在恰好 5 页时处理，避免误伤其它 UITabBarController。
+static void (*orig_setViewControllers)(id, SEL, NSArray *) = NULL;
+static void (*orig_setViewControllersAnimated)(id, SEL, NSArray *, BOOL) = NULL;
+
+static NSArray *filteredMainTabs(NSArray *controllers) {
+    if (controllers.count != 5) return controllers;
+    return @[controllers[0], controllers[3], controllers[4]];
+}
+
+static void hc_setViewControllers(UITabBarController *self, SEL cmd, NSArray *controllers) {
+    NSArray *filtered = filteredMainTabs(controllers);
+    if (orig_setViewControllers) orig_setViewControllers(self, cmd, filtered);
+}
+
+static void hc_setViewControllersAnimated(UITabBarController *self, SEL cmd, NSArray *controllers, BOOL animated) {
+    NSArray *filtered = filteredMainTabs(controllers);
+    if (orig_setViewControllersAnimated) orig_setViewControllersAnimated(self, cmd, filtered, animated);
+}
+
+static void installMainTabHooks(void) {
+    Class cls = objc_getClass("MainTabBarController");
+    if (!cls) cls = objc_getClass("_TtC12HiveConsumer20MainTabBarController");
+    if (!cls || ![cls isSubclassOfClass:[UITabBarController class]]) return;
+
+    Method plain = class_getInstanceMethod(cls, @selector(setViewControllers:));
+    if (plain && method_getImplementation(plain) != (IMP)hc_setViewControllers) {
+        orig_setViewControllers = (void *)method_getImplementation(plain);
+        method_setImplementation(plain, (IMP)hc_setViewControllers);
+    }
+
+    Method animated = class_getInstanceMethod(cls, @selector(setViewControllers:animated:));
+    if (animated && method_getImplementation(animated) != (IMP)hc_setViewControllersAnimated) {
+        orig_setViewControllersAnimated = (void *)method_getImplementation(animated);
+        method_setImplementation(animated, (IMP)hc_setViewControllersAnimated);
+    }
+
+    // Hook 安装时主控制器可能已创建，遍历窗口层级找它并补一次。
+    dispatch_async(dispatch_get_main_queue(), ^{
+        for (UIWindow *window in UIApplication.sharedApplication.windows) {
+            UIViewController *root = window.rootViewController;
+            NSMutableArray<UIViewController *> *queue = [NSMutableArray array];
+            if (root) [queue addObject:root];
+            while (queue.count) {
+                UIViewController *vc = queue.firstObject;
+                [queue removeObjectAtIndex:0];
+                if ([vc isKindOfClass:cls] && [vc isKindOfClass:[UITabBarController class]]) {
+                    UITabBarController *tabs = (UITabBarController *)vc;
+                    NSArray *filtered = filteredMainTabs(tabs.viewControllers);
+                    if (filtered != tabs.viewControllers) tabs.viewControllers = filtered;
+                    return;
+                }
+                if (vc.presentedViewController) [queue addObject:vc.presentedViewController];
+                [queue addObjectsFromArray:vc.childViewControllers];
+            }
+        }
+    });
+}
+
 #pragma mark - Entry
 
 static void applyAll(const char *tag) {
     int n = applyKnownHooks();
+    installMainTabHooks();
     HCLog(@"%s hooks=%d", tag, n);
 }
 
