@@ -360,44 +360,98 @@ static void installViewHooks(void) {
 
 #pragma mark - Main tab cleanup
 
-// 原顺序: 0 首页, 1 洗衣洗鞋, 2 会员直降, 3 订单, 4 我的
-// 仅在恰好 5 页时处理，避免误伤其它 UITabBarController。
-static void (*orig_setViewControllers)(id, SEL, NSArray *) = NULL;
-static void (*orig_setViewControllersAnimated)(id, SEL, NSArray *, BOOL) = NULL;
+// 丰巢使用自定义 TabBar；不能删除 viewControllers，否则按钮与控制器索引会错位。
+// 保留原始 5 个控制器，只隐藏第 2、3 个入口，并将首页/订单/我的三等分排列。
+static void (*orig_tabBarLayoutSubviews)(id, SEL) = NULL;
 
-static NSArray *filteredMainTabs(NSArray *controllers) {
-    if (controllers.count != 5) return controllers;
-    return @[controllers[0], controllers[3], controllers[4]];
+static BOOL isMainTabBar(UITabBar *tabBar) {
+    id delegate = tabBar.delegate;
+    const char *name = delegate ? class_getName(object_getClass(delegate)) : NULL;
+    return name && (strstr(name, "MainTabBarController") != NULL);
 }
 
-static void hc_setViewControllers(UITabBarController *self, SEL cmd, NSArray *controllers) {
-    NSArray *filtered = filteredMainTabs(controllers);
-    if (orig_setViewControllers) orig_setViewControllers(self, cmd, filtered);
+static BOOL isTabButtonView(UIView *view) {
+    const char *name = class_getName(object_getClass(view));
+    if (!name) return NO;
+    return strstr(name, "TabBarButton") ||
+           strstr(name, "DCTabBarButton") ||
+           strstr(name, "DCTabBarMidButton") ||
+           strstr(name, "TabBarItemContentView");
 }
 
-static void hc_setViewControllersAnimated(UITabBarController *self, SEL cmd, NSArray *controllers, BOOL animated) {
-    NSArray *filtered = filteredMainTabs(controllers);
-    if (orig_setViewControllersAnimated) orig_setViewControllersAnimated(self, cmd, filtered, animated);
+static NSString *textInView(UIView *view) {
+    if ([view isKindOfClass:[UILabel class]]) {
+        NSString *text = ((UILabel *)view).text;
+        if (text.length) return text;
+    }
+    NSString *accessibility = view.accessibilityLabel;
+    if (accessibility.length) return accessibility;
+    for (UIView *subview in view.subviews) {
+        NSString *text = textInView(subview);
+        if (text.length) return text;
+    }
+    return nil;
+}
+
+static NSArray<UIView *> *mainTabButtons(UITabBar *tabBar) {
+    NSMutableArray<UIView *> *buttons = [NSMutableArray array];
+    for (UIView *view in tabBar.subviews) {
+        if (isTabButtonView(view) || [view isKindOfClass:[UIControl class]]) {
+            [buttons addObject:view];
+        }
+    }
+    [buttons sortUsingComparator:^NSComparisonResult(UIView *a, UIView *b) {
+        if (CGRectGetMinX(a.frame) < CGRectGetMinX(b.frame)) return NSOrderedAscending;
+        if (CGRectGetMinX(a.frame) > CGRectGetMinX(b.frame)) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+    return buttons;
+}
+
+static void layoutThreeMainTabs(UITabBar *tabBar) {
+    NSArray<UIView *> *buttons = mainTabButtons(tabBar);
+    if (buttons.count < 5) return;
+
+    NSMutableArray<UIView *> *visible = [NSMutableArray array];
+    for (NSUInteger index = 0; index < buttons.count; index++) {
+        UIView *button = buttons[index];
+        NSString *text = textInView(button);
+        BOOL hide = [text containsString:@"洗衣"] ||
+                    [text containsString:@"会员直降"] ||
+                    [text containsString:@"会员"] && (index == 2);
+
+        // 文本不可读取时，按原始固定顺序隐藏索引 1、2。
+        if (buttons.count == 5 && text.length == 0) hide = (index == 1 || index == 2);
+
+        button.hidden = hide;
+        button.userInteractionEnabled = !hide;
+        if (!hide) [visible addObject:button];
+    }
+
+    // 若文本识别失败但按钮超过 5，保持原布局，避免误伤背景/特殊视图。
+    if (visible.count != 3) return;
+
+    CGFloat width = CGRectGetWidth(tabBar.bounds) / 3.0;
+    for (NSUInteger index = 0; index < visible.count; index++) {
+        UIView *button = visible[index];
+        CGRect frame = button.frame;
+        frame.origin.x = width * index;
+        frame.size.width = width;
+        button.frame = frame;
+    }
+}
+
+static void hc_tabBarLayoutSubviews(UITabBar *self, SEL cmd) {
+    if (orig_tabBarLayoutSubviews) orig_tabBarLayoutSubviews(self, cmd);
+    if (isMainTabBar(self)) layoutThreeMainTabs(self);
 }
 
 static void installMainTabHooks(void) {
-    Class cls = objc_getClass("MainTabBarController");
-    if (!cls) cls = objc_getClass("_TtC12HiveConsumer20MainTabBarController");
-    if (!cls || ![cls isSubclassOfClass:[UITabBarController class]]) return;
+    Method method = class_getInstanceMethod([UITabBar class], @selector(layoutSubviews));
+    if (!method || method_getImplementation(method) == (IMP)hc_tabBarLayoutSubviews) return;
+    orig_tabBarLayoutSubviews = (void *)method_getImplementation(method);
+    method_setImplementation(method, (IMP)hc_tabBarLayoutSubviews);
 
-    Method plain = class_getInstanceMethod(cls, @selector(setViewControllers:));
-    if (plain && method_getImplementation(plain) != (IMP)hc_setViewControllers) {
-        orig_setViewControllers = (void *)method_getImplementation(plain);
-        method_setImplementation(plain, (IMP)hc_setViewControllers);
-    }
-
-    Method animated = class_getInstanceMethod(cls, @selector(setViewControllers:animated:));
-    if (animated && method_getImplementation(animated) != (IMP)hc_setViewControllersAnimated) {
-        orig_setViewControllersAnimated = (void *)method_getImplementation(animated);
-        method_setImplementation(animated, (IMP)hc_setViewControllersAnimated);
-    }
-
-    // Hook 安装时主控制器可能已创建，遍历窗口层级找它并补一次。
     dispatch_async(dispatch_get_main_queue(), ^{
         for (UIWindow *window in UIApplication.sharedApplication.windows) {
             UIViewController *root = window.rootViewController;
@@ -406,10 +460,11 @@ static void installMainTabHooks(void) {
             while (queue.count) {
                 UIViewController *vc = queue.firstObject;
                 [queue removeObjectAtIndex:0];
-                if ([vc isKindOfClass:cls] && [vc isKindOfClass:[UITabBarController class]]) {
-                    UITabBarController *tabs = (UITabBarController *)vc;
-                    NSArray *filtered = filteredMainTabs(tabs.viewControllers);
-                    if (filtered != tabs.viewControllers) tabs.viewControllers = filtered;
+                if ([vc isKindOfClass:[UITabBarController class]] &&
+                    strstr(class_getName(object_getClass(vc)), "MainTabBarController")) {
+                    UITabBar *tabBar = ((UITabBarController *)vc).tabBar;
+                    [tabBar setNeedsLayout];
+                    [tabBar layoutIfNeeded];
                     return;
                 }
                 if (vc.presentedViewController) [queue addObject:vc.presentedViewController];
