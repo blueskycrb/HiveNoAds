@@ -13,6 +13,7 @@
 | dylib | App | Bundle ID |
 |-------|-----|-----------|
 | **HiveConsumer.dylib** | 丰巢 | `com.fcbox.hiveconsumer` |
+| **Cainiao4iPhone.dylib** | 菜鸟 | `com.cainiao.cnwireless` |
 
 ## 使用 (TrollFools)
 
@@ -46,6 +47,8 @@
 apps/
   HiveConsumer/
     HiveConsumer.m      → 编译为 HiveConsumer.dylib
+  Cainiao4iPhone/
+    Cainiao4iPhone.m    → 编译为 Cainiao4iPhone.dylib
   # 下一个 App:
   # SomeApp/
   #   SomeApp.m         → SomeApp.dylib

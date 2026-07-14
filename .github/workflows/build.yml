@@ -67,6 +67,7 @@ jobs:
             | 文件 | 注入目标 |
             |------|----------|
             | `HiveConsumer.dylib` | 丰巢 (`com.fcbox.hiveconsumer`) |
+            | `Cainiao4iPhone.dylib` | 菜鸟 (`com.cainiao.cnwireless`) |
 
             ## 用法
             1. 下载对应 `AppName.dylib`
