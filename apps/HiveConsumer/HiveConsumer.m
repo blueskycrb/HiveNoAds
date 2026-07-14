@@ -360,60 +360,78 @@ static void installViewHooks(void) {
 
 #pragma mark - Main tab cleanup
 
-// 原顺序: 0 首页, 1 洗衣洗鞋, 2 会员直降, 3 订单, 4 我的
-static void (*orig_setViewControllers)(id, SEL, NSArray *) = NULL;
-static void (*orig_setViewControllersAnimated)(id, SEL, NSArray *, BOOL) = NULL;
+// 丰巢的自定义 TabBar 依赖固定的 5 个控制器索引；删除控制器会让按钮内容错位。
+// 保留原顺序，只隐藏 1 洗衣洗鞋、2 会员直降，并将 0 首页、3 订单、4 我的三等分。
 static void (*orig_mainTabViewDidLayoutSubviews)(id, SEL) = NULL;
+static char kMainTabButtonsKey;
 
-static NSArray *filteredMainTabs(NSArray *controllers) {
-    if (controllers.count != 5) return controllers;
-    return @[controllers[0], controllers[3], controllers[4]];
+static BOOL classNameContains(UIView *view, const char *fragment) {
+    const char *name = class_getName(object_getClass(view));
+    return name && strstr(name, fragment);
 }
 
-static void hc_setViewControllers(UITabBarController *self, SEL cmd, NSArray *controllers) {
-    if (orig_setViewControllers) {
-        orig_setViewControllers(self, cmd, filteredMainTabs(controllers));
-    }
-}
-
-static void hc_setViewControllersAnimated(UITabBarController *self, SEL cmd,
-                                          NSArray *controllers, BOOL animated) {
-    if (orig_setViewControllersAnimated) {
-        orig_setViewControllersAnimated(self, cmd, filteredMainTabs(controllers), animated);
-    }
-}
-
-static NSArray<UIView *> *sortedTabButtons(UITabBar *tabBar) {
-    NSMutableArray<UIView *> *buttons = [NSMutableArray array];
-    for (UIView *view in tabBar.subviews) {
-        const char *name = class_getName(object_getClass(view));
-        if ((name && (strstr(name, "TabBarButton") ||
-                      strstr(name, "TabBarItemContentView"))) ||
-            [view isKindOfClass:[UIControl class]]) {
-            [buttons addObject:view];
-        }
-    }
-    [buttons sortUsingComparator:^NSComparisonResult(UIView *a, UIView *b) {
+static NSArray<UIView *> *sortedTabViews(NSArray<UIView *> *views) {
+    return [views sortedArrayUsingComparator:^NSComparisonResult(UIView *a, UIView *b) {
         if (a.frame.origin.x < b.frame.origin.x) return NSOrderedAscending;
         if (a.frame.origin.x > b.frame.origin.x) return NSOrderedDescending;
         return NSOrderedSame;
     }];
-    return buttons;
+}
+
+static NSArray<UIView *> *mainTabButtons(UITabBar *tabBar) {
+    NSArray<UIView *> *saved = objc_getAssociatedObject(tabBar, &kMainTabButtonsKey);
+    if (saved.count == 5) {
+        BOOL valid = YES;
+        for (UIView *button in saved) {
+            if (button.superview != tabBar) {
+                valid = NO;
+                break;
+            }
+        }
+        if (valid) return saved;
+    }
+
+    NSMutableArray<UIView *> *buttons = [NSMutableArray array];
+    for (UIView *view in tabBar.subviews) {
+        if (classNameContains(view, "MainTabBarItemContentView")) {
+            [buttons addObject:view];
+        }
+    }
+    if (buttons.count != 5) {
+        [buttons removeAllObjects];
+        for (UIView *view in tabBar.subviews) {
+            const char *name = class_getName(object_getClass(view));
+            if (name && strcmp(name, "UITabBarButton") == 0) {
+                [buttons addObject:view];
+            }
+        }
+    }
+    if (buttons.count != 5) return @[];
+
+    NSArray<UIView *> *sorted = sortedTabViews(buttons);
+    objc_setAssociatedObject(tabBar, &kMainTabButtonsKey, sorted,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return sorted;
 }
 
 static void layoutThreeMainTabs(UITabBar *tabBar) {
-    NSArray<UIView *> *buttons = sortedTabButtons(tabBar);
-    if (buttons.count != 3) return;
+    NSArray<UIView *> *buttons = mainTabButtons(tabBar);
+    if (buttons.count != 5) return;
 
     CGFloat width = tabBar.bounds.size.width / 3.0;
+    NSUInteger visibleIndex = 0;
     for (NSUInteger index = 0; index < buttons.count; index++) {
         UIView *button = buttons[index];
-        button.hidden = NO;
-        button.userInteractionEnabled = YES;
+        BOOL hide = index == 1 || index == 2;
+        button.hidden = hide;
+        button.userInteractionEnabled = !hide;
+        if (hide) continue;
+
         CGRect frame = button.frame;
-        frame.origin.x = width * index;
+        frame.origin.x = width * visibleIndex;
         frame.size.width = width;
         button.frame = frame;
+        visibleIndex++;
     }
 }
 
@@ -432,22 +450,11 @@ static void installMainTabHooks(void) {
     Class cls = mainTabBarControllerClass();
     if (!cls || ![cls isSubclassOfClass:[UITabBarController class]]) return;
 
-    Method plain = class_getInstanceMethod(cls, @selector(setViewControllers:));
-    if (plain && method_getImplementation(plain) != (IMP)hc_setViewControllers) {
-        orig_setViewControllers = (void *)method_getImplementation(plain);
-        method_setImplementation(plain, (IMP)hc_setViewControllers);
-    }
-
-    Method animated = class_getInstanceMethod(cls, @selector(setViewControllers:animated:));
-    if (animated && method_getImplementation(animated) != (IMP)hc_setViewControllersAnimated) {
-        orig_setViewControllersAnimated = (void *)method_getImplementation(animated);
-        method_setImplementation(animated, (IMP)hc_setViewControllersAnimated);
-    }
-
     SEL layoutSel = @selector(viewDidLayoutSubviews);
     IMP current = class_getMethodImplementation(cls, layoutSel);
     if (current && current != (IMP)hc_mainTabViewDidLayoutSubviews) {
         Method method = class_getInstanceMethod(cls, layoutSel);
+        if (!method) return;
         orig_mainTabViewDidLayoutSubviews = (void *)current;
         if (!class_addMethod(cls, layoutSel, (IMP)hc_mainTabViewDidLayoutSubviews,
                              method_getTypeEncoding(method))) {
@@ -465,8 +472,8 @@ static void installMainTabHooks(void) {
                 [queue removeObjectAtIndex:0];
                 if ([vc isKindOfClass:cls]) {
                     UITabBarController *tabs = (UITabBarController *)vc;
-                    NSArray *filtered = filteredMainTabs(tabs.viewControllers);
-                    if (filtered != tabs.viewControllers) tabs.viewControllers = filtered;
+                    [tabs.tabBar setNeedsLayout];
+                    [tabs.tabBar layoutIfNeeded];
                     layoutThreeMainTabs(tabs.tabBar);
                     return;
                 }
