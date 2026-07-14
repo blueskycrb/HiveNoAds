@@ -353,9 +353,6 @@ static const char *kAdViews[] = {
 };
 
 static void installViewHooks(void) {
-    // orig_didMove 统一指向 UIView 原实现
-    Method root = class_getInstanceMethod([UIView class], @selector(didMoveToWindow));
-    if (root && !orig_didMove) orig_didMove = (void *)method_getImplementation(root);
     for (int i = 0; kAdViews[i]; i++) {
         swizzleDidMoveOnClass(kAdViews[i]);
     }
