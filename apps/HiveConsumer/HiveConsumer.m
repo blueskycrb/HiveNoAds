@@ -401,8 +401,8 @@ static NSArray<UIView *> *mainTabButtons(UITabBar *tabBar) {
         }
     }
     [buttons sortUsingComparator:^NSComparisonResult(UIView *a, UIView *b) {
-        if (CGRectGetMinX(a.frame) < CGRectGetMinX(b.frame)) return NSOrderedAscending;
-        if (CGRectGetMinX(a.frame) > CGRectGetMinX(b.frame)) return NSOrderedDescending;
+        if (a.frame.origin.x < b.frame.origin.x) return NSOrderedAscending;
+        if (a.frame.origin.x > b.frame.origin.x) return NSOrderedDescending;
         return NSOrderedSame;
     }];
     return buttons;
@@ -431,7 +431,7 @@ static void layoutThreeMainTabs(UITabBar *tabBar) {
     // 若文本识别失败但按钮超过 5，保持原布局，避免误伤背景/特殊视图。
     if (visible.count != 3) return;
 
-    CGFloat width = CGRectGetWidth(tabBar.bounds) / 3.0;
+    CGFloat width = tabBar.bounds.size.width / 3.0;
     for (NSUInteger index = 0; index < visible.count; index++) {
         UIView *button = visible[index];
         CGRect frame = button.frame;
