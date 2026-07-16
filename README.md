@@ -14,6 +14,7 @@
 |-------|-----|-----------|
 | **HiveConsumer.dylib** | 丰巢 | `com.fcbox.hiveconsumer` |
 | **Cainiao4iPhone.dylib** | 菜鸟 | `com.cainiao.cnwireless` |
+| **QTL.dylib** | 掌上英雄联盟去广告 | `com.tencent.ied.app.lolbible` |
 
 ## 使用 (TrollFools)
 
@@ -49,6 +50,8 @@ apps/
     HiveConsumer.m      → 编译为 HiveConsumer.dylib
   Cainiao4iPhone/
     Cainiao4iPhone.m    → 编译为 Cainiao4iPhone.dylib
+  QTL/
+    QTL.m               → 编译为 QTL.dylib（掌上英雄联盟去广告）
   # 下一个 App:
   # SomeApp/
   #   SomeApp.m         → SomeApp.dylib

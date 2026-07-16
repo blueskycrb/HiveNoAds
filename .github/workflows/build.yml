@@ -30,12 +30,17 @@ jobs:
             app=$(basename "$(dirname "$src")")
             # dylib 与 App 同名: apps/HiveConsumer/HiveConsumer.m → HiveConsumer.dylib
             out="dist/${app}.dylib"
+            min_ios="13.0"
+            if [ "$app" = "QTL" ]; then
+              min_ios="11.0"
+            fi
             echo "==> building $out from $src"
             clang -dynamiclib \
               -isysroot "$SDK" \
               -arch arm64 \
-              -miphoneos-version-min=13.0 \
+              -miphoneos-version-min="$min_ios" \
               -fobjc-arc \
+              -fblocks \
               -O2 \
               -fvisibility=hidden \
               -framework Foundation \
@@ -68,6 +73,7 @@ jobs:
             |------|----------|
             | `HiveConsumer.dylib` | 丰巢 (`com.fcbox.hiveconsumer`) |
             | `Cainiao4iPhone.dylib` | 菜鸟 (`com.cainiao.cnwireless`) |
+            | `QTL.dylib` | 掌上英雄联盟去广告 (`com.tencent.ied.app.lolbible`) |
 
             ## 用法
             1. 下载对应 `AppName.dylib`
