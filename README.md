@@ -17,6 +17,7 @@
 | **QTL.dylib** | 掌上英雄联盟 | `com.tencent.ied.app.lolbible` |
 | **Volunteer.dylib** | 志愿汇 | 可执行名 `Volunteer`（分析版本 5.8.4） |
 | **mCloud_iPhone.dylib** | 中国移动云盘 | `com.chinamobile.mcloud` / `mCloud_iPhone`（分析版本 13.0.0） |
+| **ChinaRadio.dylib** | 中国广电 / ChinaRadio | `com.cbn.app` / `ChinaRadio`（分析版本 2.0.8） |
 
 ## 使用 (TrollFools)
 
@@ -58,6 +59,8 @@ apps/
     Volunteer.m         → 编译为 Volunteer.dylib
   mCloud_iPhone/
     mCloud_iPhone.m     → 编译为 mCloud_iPhone.dylib（移动云盘）
+  ChinaRadio/
+    ChinaRadio.m        → 编译为 ChinaRadio.dylib（中国广电）
   # 下一个 App:
   # SomeApp/
   #   SomeApp.m         → SomeApp.dylib
