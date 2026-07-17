@@ -10,11 +10,12 @@
 
 ## 已支持
 
-| dylib | App | Bundle ID |
-|-------|-----|-----------|
+| dylib | App | Bundle ID / 可执行名 |
+|-------|-----|----------------------|
 | **HiveConsumer.dylib** | 丰巢 | `com.fcbox.hiveconsumer` |
 | **Cainiao4iPhone.dylib** | 菜鸟 | `com.cainiao.cnwireless` |
-| **QTL.dylib** | 掌上英雄联盟去广告 | `com.tencent.ied.app.lolbible` |
+| **QTL.dylib** | 掌上英雄联盟 | `com.tencent.ied.app.lolbible` |
+| **Volunteer.dylib** | 志愿汇 | 可执行名 `Volunteer`（分析版本 5.8.4） |
 
 ## 使用 (TrollFools)
 
@@ -51,7 +52,9 @@ apps/
   Cainiao4iPhone/
     Cainiao4iPhone.m    → 编译为 Cainiao4iPhone.dylib
   QTL/
-    QTL.m               → 编译为 QTL.dylib（掌上英雄联盟去广告）
+    QTL.m               → 编译为 QTL.dylib（掌上英雄联盟）
+  Volunteer/
+    Volunteer.m         → 编译为 Volunteer.dylib
   # 下一个 App:
   # SomeApp/
   #   SomeApp.m         → SomeApp.dylib

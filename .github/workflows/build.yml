@@ -73,7 +73,8 @@ jobs:
             |------|----------|
             | `HiveConsumer.dylib` | 丰巢 (`com.fcbox.hiveconsumer`) |
             | `Cainiao4iPhone.dylib` | 菜鸟 (`com.cainiao.cnwireless`) |
-            | `QTL.dylib` | 掌上英雄联盟去广告 (`com.tencent.ied.app.lolbible`) |
+            | `QTL.dylib` | 掌上英雄联盟 (`com.tencent.ied.app.lolbible`) |
+            | `Volunteer.dylib` | 志愿汇 (`Volunteer` 5.8.4) |
 
             ## 用法
             1. 下载对应 `AppName.dylib`
