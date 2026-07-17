@@ -16,6 +16,7 @@
 | **Cainiao4iPhone.dylib** | 菜鸟 | `com.cainiao.cnwireless` |
 | **QTL.dylib** | 掌上英雄联盟 | `com.tencent.ied.app.lolbible` |
 | **Volunteer.dylib** | 志愿汇 | 可执行名 `Volunteer`（分析版本 5.8.4） |
+| **mCloud_iPhone.dylib** | 中国移动云盘 | `com.chinamobile.mcloud` / `mCloud_iPhone`（分析版本 13.0.0） |
 
 ## 使用 (TrollFools)
 
@@ -55,6 +56,8 @@ apps/
     QTL.m               → 编译为 QTL.dylib（掌上英雄联盟）
   Volunteer/
     Volunteer.m         → 编译为 Volunteer.dylib
+  mCloud_iPhone/
+    mCloud_iPhone.m     → 编译为 mCloud_iPhone.dylib（移动云盘）
   # 下一个 App:
   # SomeApp/
   #   SomeApp.m         → SomeApp.dylib
