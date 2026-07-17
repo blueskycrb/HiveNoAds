@@ -1,11 +1,13 @@
 //
 // HiveConsumer.dylib — 丰巢去广告 (TrollFools)
-// Bundle: com.fcbox.hiveconsumer | 分析版本: 6.32.0
+// Bundle: com.fcbox.hiveconsumer | 分析版本: 6.32.0 | iOS 16.5.1 闪退修复
 //
-// v3.1: 修复注入闪退
-//   - 不 hook 参数过多 / 非 id·BOOL·void 签名的方法（避免 stub ABI 崩）
-//   - openURL 延后到主线程、严格类型检查
-//   - 回前台只补已知类，不做危险全量替换
+// v4 原则（防崩）:
+//   - 禁止 class_copyMethodList 自动替换（签名不可靠会崩）
+//   - 禁止 hook UIApplication openURL（易误伤/崩）
+//   - 禁止 hook 任意 isReady / 复杂参数方法
+//   - 仅对已知「void + 对象参数」的 show/load 做定点替换
+//   - present 拦截广告 VC；View 折叠只针对少数业务类
 //
 
 #import <Foundation/Foundation.h>
@@ -14,293 +16,211 @@
 #import <objc/message.h>
 #import <string.h>
 
-#pragma mark - Config
+static const BOOL kVerbose = NO;
+#define HCLog(fmt, ...) do { if (kVerbose) NSLog(@"[HiveConsumer] " fmt, ##__VA_ARGS__); } while (0)
 
-static const BOOL kFakeReward = NO;
-static const BOOL kVerbose    = NO;
+#pragma mark - Minimal stubs (arm64: self, _cmd, then id args)
 
-#define HCLog(fmt, ...) do { \
-    if (kVerbose) NSLog(@"[HiveConsumer] " fmt, ##__VA_ARGS__); \
-} while (0)
+static void stub_v0(id s, SEL c) { (void)s; (void)c; }
+static void stub_v1(id s, SEL c, id a) { (void)s; (void)c; (void)a; }
+static void stub_v2(id s, SEL c, id a, id b) { (void)s; (void)c; (void)a; (void)b; }
+static void stub_v3(id s, SEL c, id a, id b, id d) { (void)s; (void)c; (void)a; (void)b; (void)d; }
+static void stub_v4(id s, SEL c, id a, id b, id d, id e) {
+    (void)s; (void)c; (void)a; (void)b; (void)d; (void)e;
+}
+static BOOL stub_NO(id s, SEL c) { (void)s; (void)c; return NO; }
 
-#pragma mark - Stubs (仅支持 void / BOOL / id，且参数 ≤5 个业务参数)
-
-static void stub_v0(id s, SEL c) {}
-static void stub_v1(id s, SEL c, id a) {}
-static void stub_v2(id s, SEL c, id a, id b) {}
-static void stub_v3(id s, SEL c, id a, id b, id d) {}
-static void stub_v4(id s, SEL c, id a, id b, id d, id e) {}
-static void stub_v5(id s, SEL c, id a, id b, id d, id e, id f) {}
-static BOOL stub_NO(id s, SEL c) { return NO; }
-static id   stub_nil0(id s, SEL c) { return nil; }
-static id   stub_nil1(id s, SEL c, id a) { return nil; }
-static id   stub_nil2(id s, SEL c, id a, id b) { return nil; }
-
-/// 只接受「返回 void/BOOL/id」且「参数全是指针/id」的简单方法，避免 double/struct 崩
-static BOOL encodingIsSafe(const char *enc, unsigned argc) {
+/// 仅当：返回 void/BOOL，参数个数匹配，且 type encoding 里参数全是指针类 (@ : ^ # *) 时才 hook
+static BOOL canSafelyStub(Method m, IMP *outImp) {
+    if (!m || !outImp) return NO;
+    const char *enc = method_getTypeEncoding(m);
     if (!enc || !enc[0]) return NO;
-    // 业务参数过多时 arm64 寄存器/栈约定复杂，跳过
-    // argc 含 self + _cmd
-    if (argc > 7) return NO; // 最多 5 个业务参数
 
     char ret = enc[0];
-    if (ret != 'v' && ret != 'B' && ret != 'c' && ret != '@') return NO;
+    if (ret != 'v' && ret != 'B' && ret != 'c') return NO;
 
-    // 粗查：编码串里若出现 float/double/struct 返回或参数则跳过
-    // 典型: d f {CGRect  N  ...
-    if (strchr(enc, 'd') || strchr(enc, 'f')) {
-        // BOOL 有时是 c，id 协议里可能有，但 d/f 基本是数值 —— 仍可能误伤
-        // 更严：只允许 v@:@ 这类；若含 d/f 直接拒绝
+    unsigned argc = method_getNumberOfArguments(m); // includes self,_cmd
+    if (argc < 2 || argc > 6) return NO; // 最多 4 个业务参数
+
+    // 解析每个参数类型（跳过 offsets）
+    // 格式大致: v24@0:8@16@24
+    const char *p = enc;
+    // skip return type
+    if (*p == 'v' || *p == 'B' || *p == 'c' || *p == '@' || *p == 'Q' || *p == 'q' ||
+        *p == 'i' || *p == 'I' || *p == 'l' || *p == 'L' || *p == 's' || *p == 'S' ||
+        *p == 'C' || *p == '*' || *p == '#' || *p == ':') {
+        p++;
+    } else if (*p == '^') {
+        p++;
+        if (*p) p++;
+    } else {
         return NO;
     }
-    if (strchr(enc, '{') || strchr(enc, '(')) return NO;
-    return YES;
+    while (*p >= '0' && *p <= '9') p++;
+
+    // 逐个参数
+    for (unsigned i = 0; i < argc; i++) {
+        if (!*p) return NO;
+        char t = *p;
+        // 允许 @ : # * ^@ 以及 block @?
+        if (t == '@') {
+            p++;
+            if (*p == '?' || *p == '"') {
+                // @"NSString" or @?
+                if (*p == '"') {
+                    p++;
+                    while (*p && *p != '"') p++;
+                    if (*p == '"') p++;
+                } else {
+                    p++; // ?
+                }
+            }
+        } else if (t == ':' || t == '#' || t == '*') {
+            p++;
+        } else if (t == '^') {
+            p++;
+            if (*p == '@' || *p == 'v' || *p == '*' || *p == '{') {
+                if (*p == '{') {
+                    // 指针指向 struct —— 仍当指针，寄存器上传 OK
+                    int depth = 0;
+                    do {
+                        if (*p == '{') depth++;
+                        else if (*p == '}') depth--;
+                        p++;
+                    } while (*p && depth > 0);
+                } else {
+                    p++;
+                }
+            }
+        } else {
+            // q i d f { 等值类型 —— 不 hook
+            return NO;
+        }
+        while (*p >= '0' && *p <= '9') p++;
+    }
+
+    if (ret == 'B' || ret == 'c') {
+        if (argc != 2) return NO;
+        *outImp = (IMP)stub_NO;
+        return YES;
+    }
+    // void
+    switch (argc) {
+        case 2: *outImp = (IMP)stub_v0; return YES;
+        case 3: *outImp = (IMP)stub_v1; return YES;
+        case 4: *outImp = (IMP)stub_v2; return YES;
+        case 5: *outImp = (IMP)stub_v3; return YES;
+        case 6: *outImp = (IMP)stub_v4; return YES;
+        default: return NO;
+    }
 }
 
-static IMP stubForEncoding(const char *enc, unsigned argc) {
-    if (!encodingIsSafe(enc, argc)) return NULL;
-    char r = enc[0];
-    if (r == 'v') {
-        if (argc <= 2) return (IMP)stub_v0;
-        if (argc == 3) return (IMP)stub_v1;
-        if (argc == 4) return (IMP)stub_v2;
-        if (argc == 5) return (IMP)stub_v3;
-        if (argc == 6) return (IMP)stub_v4;
-        return (IMP)stub_v5; // argc == 7
-    }
-    if (r == 'B' || r == 'c') {
-        // 仅无参 isReady / isAdValid
-        if (argc != 2) return NULL;
-        return (IMP)stub_NO;
-    }
-    if (r == '@') {
-        if (argc <= 2) return (IMP)stub_nil0;
-        if (argc == 3) return (IMP)stub_nil1;
-        if (argc == 4) return (IMP)stub_nil2;
-        return NULL;
-    }
-    return NULL;
-}
-
-static BOOL replaceMethod(Class cls, SEL sel, BOOL meta) {
-    if (!cls || !sel) return NO;
-    Method m = meta ? class_getClassMethod(cls, sel) : class_getInstanceMethod(cls, sel);
-    if (!m) return NO;
-    const char *enc = method_getTypeEncoding(m);
-    unsigned n = method_getNumberOfArguments(m);
-    IMP imp = stubForEncoding(enc, n);
-    if (!imp) return NO;
-    IMP old = method_getImplementation(m);
-    if (old == imp) return YES;
-    method_setImplementation(m, imp);
-    return YES;
-}
-
-static int hookSel(const char *cname, const char *sname, BOOL meta) {
+static BOOL hookExact(const char *cname, const char *sname, BOOL meta) {
     Class cls = objc_getClass(cname);
-    if (!cls) return 0;
-    return replaceMethod(cls, sel_registerName(sname), meta) ? 1 : 0;
-}
-
-static BOOL selectorLooksLikeAdControl(const char *sn) {
-    if (!sn) return NO;
-    return
-        strstr(sn, "loadAd") || strstr(sn, "LoadAd") || strstr(sn, "loadAD") ||
-        strstr(sn, "showAd") || strstr(sn, "ShowAd") || strstr(sn, "showAD") ||
-        strstr(sn, "showSplash") || strstr(sn, "loadSplash") ||
-        strstr(sn, "loadAndShowSplash") || strstr(sn, "beginToShowSplash") ||
-        strstr(sn, "autoShowAd") || strstr(sn, "showAdInWindow") ||
-        strstr(sn, "showAdFromRoot") || strstr(sn, "showFromRootViewController") ||
-        strstr(sn, "showSplashAdFromRoot") || strstr(sn, "showSplashAdInWindow") ||
-        strstr(sn, "loadAdData") || strstr(sn, "_loadAdData") ||
-        strstr(sn, "setupSDKWithAppId") ||
-        strstr(sn, "loadADWithPlacement") || strstr(sn, "loadAdWithPlacement") ||
-        strstr(sn, "showInsertAds") ||
-        strstr(sn, "openScreenAds") ||
-        strcmp(sn, "isReady") == 0 || strcmp(sn, "isAdValid") == 0 ||
-        strcmp(sn, "loadAD") == 0 ||
-        strcmp(sn, "showSplash") == 0 ||
-        strcmp(sn, "showSplashAd") == 0 ||
-        strcmp(sn, "loadSplashAd") == 0 ||
-        strcmp(sn, "autoShowAd") == 0;
-}
-
-static int hookAdSelectorsOnClass(Class cls, BOOL meta) {
-    if (!cls) return 0;
+    if (!cls) return NO;
     Class target = meta ? object_getClass((id)cls) : cls;
-    if (!target) return 0;
+    if (!target) return NO;
+    SEL sel = sel_registerName(sname);
 
+    // 只改「本类 method list」里的实现。
+    // class_getInstanceMethod 会落到父类，method_setImplementation 会污染父类 → 全局闪退。
+    Method own = NULL;
     unsigned int count = 0;
     Method *list = class_copyMethodList(target, &count);
-    if (!list) return 0;
-
-    int n = 0;
-    for (unsigned int i = 0; i < count; i++) {
-        SEL sel = method_getName(list[i]);
-        const char *sn = sel_getName(sel);
-        if (!selectorLooksLikeAdControl(sn)) continue;
-
-        if (kFakeReward) {
-            const char *cn = class_getName(cls);
-            if (cn && strstr(cn, "Reward") && strstr(sn, "load")) continue;
-        }
-        // 直接用 list[i] 的 encoding，避免再查
-        const char *enc = method_getTypeEncoding(list[i]);
-        unsigned argc = method_getNumberOfArguments(list[i]);
-        IMP imp = stubForEncoding(enc, argc);
-        if (!imp) continue;
-        if (method_getImplementation(list[i]) != imp) {
-            method_setImplementation(list[i], imp);
-            n++;
+    for (unsigned int i = 0; list && i < count; i++) {
+        if (method_getName(list[i]) == sel) {
+            own = list[i];
+            break;
         }
     }
     free(list);
-    return n;
+    if (!own) return NO;
+
+    IMP stub = NULL;
+    if (!canSafelyStub(own, &stub) || !stub) {
+        HCLog(@"skip unsafe %c[%s %s]", meta ? '+' : '-', cname, sname);
+        return NO;
+    }
+    if (method_getImplementation(own) != stub) {
+        method_setImplementation(own, stub);
+    }
+    return YES;
 }
 
-static int hookClassByName(const char *cname) {
-    Class cls = objc_getClass(cname);
-    if (!cls) return 0;
-    return hookAdSelectorsOnClass(cls, NO) + hookAdSelectorsOnClass(cls, YES);
-}
-
-#pragma mark - Known classes
-
-static const char *kKnownClasses[] = {
-    "WindMillAds",
-    "WindMillSplashAd",
-    "WindMillSplashAdManager",
-    "WindMillIntersititialAd",
-    "WindMillInterstitialAd",
-    "WindMillInterstitialAdManager",
-    "WindMillRewardVideoAd",
-    "WindMillRewardVideoAdManager",
-    "WindMillBannerView",
-    "WindMillBannerAdManager",
-    "WindMillNativeAdsManager",
-    "WindMillNativeAdView",
-    "WindAdManager",
-    "WindSplashAdManager",
-    "WindSplashAdView",
-    "WindAds",
-    "AWMWindSplashExpressAdManager",
-    "AWMWindSplashNativeAdManager",
-    "AWMKSCustomSplashAdapter",
-    "AWMKSSplashExpressAdManager",
-    "AWMAdScopeCustomSplashAdapter",
-    "AWMAdScopeExpressSplashAdManager",
-    "AWMAdScopeNativeSplashAdManager",
-    "AWMKSCustomInterstitialAdapter",
-    "AWMKSInterstitialAd",
-    "AWMAdScopeCustomInterstitialAdapter",
-    "AWMAdScopeExpressInterstitial",
-
-    "UbiXMSplashAdManager",
-    "UBiXSplashAd",
-    "UBiXMediationSplashAd",
-    "UbiXMGDTSplashExpressAdapter",
-
-    "DCUniSplashAd",
-    "DCUniInterstitialAd",
-    "DCUniRewardedAd",
-    "DCUniAdManager",
-    "DCBasicSplashAd",
-    "DCDcloudSplashAd",
-    "DCBasicSplashAdLaunch",
-    "DCBasicSplashAdViewController",
-    "DCDcloudSplashAdViewController",
-
-    "ATAdManager",
-    "ATSplash",
-    "ATRewardedVideo",
-    "ATInterstitial",
-    "ATBanner",
-
-    "SplashAdManager",
-    "FCSplashADSManager",
-    "SplashAdLibHandler",
-    "AdCenter",
-    "AdsHandle",
-    "AdsCNManager",
-    "DSPAds",
-    "OpenScrAdLibUBIX",
-    "OpenScrAdLibToBid",
-    "OpenScrLibNative",
-    "InterstScrAdLibTaku",
-    "InterstScrAdLibUBIX",
-    "NativeSplashAdView",
-    "SplashAdModel",
-    "SplashAdBottomView",
-    "DSPHomeAdsAlertView",
-    "CheckOutAlertInsertADViewController",
-    "LifeServiceHomeADPopAlertView",
-    "CashDeskTakuADCell",
-    "SendOrderAdBannerView",
-    "BoxMobilePickADBannerView",
-    "CheckoutAdFeedBannerCell",
-    "WashSOAdsView",
-    "AdMonitor",
-    "HomeConfigUbixHandle",
-    "HomeConfigUbixView",
-    "HomeConfigDspView",
-
-    "_TtC12HiveConsumer15SplashAdManager",
-    "_TtC12HiveConsumer18FCSplashADSManager",
-    "_TtC12HiveConsumer18SplashAdLibHandler",
-    "_TtC12HiveConsumer8AdCenter",
-    "_TtC12HiveConsumer9AdsHandle",
-    "_TtC12HiveConsumer12AdsCNManager",
-    "_TtC12HiveConsumer6DSPAds",
-    "_TtC12HiveConsumer16OpenScrAdLibUBIX",
-    "_TtC12HiveConsumer17OpenScrAdLibToBid",
-    "_TtC12HiveConsumer16OpenScrLibNative",
-    "_TtC12HiveConsumer19InterstScrAdLibTaku",
-    "_TtC12HiveConsumer19InterstScrAdLibUBIX",
-    "_TtC12HiveConsumer18NativeSplashAdView",
-    "_TtC12HiveConsumer13SplashAdModel",
-    "_TtC12HiveConsumer18SplashAdBottomView",
-    "_TtC12HiveConsumer19DSPHomeAdsAlertView",
-    "_TtC12HiveConsumer35CheckOutAlertInsertADViewController",
-    "_TtC12HiveConsumer29LifeServiceHomeADPopAlertView",
-    "_TtC12HiveConsumer18CashDeskTakuADCell",
-    "_TtC12HiveConsumer21SendOrderAdBannerView",
-    "_TtC12HiveConsumer25BoxMobilePickADBannerView",
-    "_TtC12HiveConsumer9AdMonitor",
-    "_TtC12HiveConsumer20HomeConfigUbixHandle",
-    "_TtC12HiveConsumer18HomeConfigUbixView",
-    "_TtC12HiveConsumer17HomeConfigDspView",
-    NULL
-};
+#pragma mark - Exact ad control hooks only
 
 static int applyExactHooks(void) {
     int n = 0;
-    // 仅 hook 签名简单的方法（无 double/struct）
-    const struct { const char *cls; const char *sel; BOOL meta; } exact[] = {
+    const struct { const char *cls; const char *sel; BOOL meta; } table[] = {
+        // WindMill 初始化 / 开屏 / 插屏
         { "WindMillAds", "setupSDKWithAppId:sdkConfigures:", YES },
         { "WindMillAds", "setupPrivacyServices", YES },
         { "WindMillSplashAd", "showAdInWindow:", NO },
         { "WindMillSplashAdManager", "showAdInWindow:", NO },
         { "WindMillSplashAdManager", "autoShowAd", NO },
         { "WindMillSplashAdManager", "showSplashAdFromRootViewController:adapter:nativeAds:", NO },
+        { "WindMillIntersititialAd", "showAdFromRootViewController:", NO },
+        { "WindMillIntersititialAd", "loadAdData", NO },
+        { "WindMillInterstitialAd", "showAdFromRootViewController:", NO },
+        { "WindMillInterstitialAd", "loadAdData", NO },
+        { "WindMillRewardVideoAd", "loadAdData", NO },
+        { "WindMillRewardVideoAd", "showAdFromRootViewController:", NO },
+        { "WindMillBannerView", "loadAdData", NO },
+        { "WindMillNativeAdsManager", "loadAdData", NO },
+        { "WindSplashAdManager", "loadFilterAndReturnError", NO },
+
+        // UBiX 开屏
         { "UbiXMSplashAdManager", "loadSplash:withLifeModel:", NO },
+
+        // 业务开屏 / 插屏（ObjC 名；Swift 短名若桥接可见）
+        { "SplashAdManager", "showAdInWindow:", NO },
+        { "SplashAdManager", "loadAdData", NO },
+        { "FCSplashADSManager", "showAdInWindow:", NO },
+        { "FCSplashADSManager", "loadAdData", NO },
+        { "SplashAdLibHandler", "showAdInWindow:", NO },
+        { "OpenScrAdLibUBIX", "loadAdData", NO },
+        { "OpenScrAdLibToBid", "loadAdData", NO },
+        { "OpenScrLibNative", "loadAdData", NO },
+        { "InterstScrAdLibTaku", "loadAdData", NO },
+        { "InterstScrAdLibTaku", "showAd", NO },
+        { "InterstScrAdLibUBIX", "loadAdData", NO },
+        { "InterstScrAdLibUBIX", "showAd", NO },
+        { "AdsCNManager", "loadAdData", NO },
+        { "AdsHandle", "loadAdData", NO },
+        { "AdCenter", "loadAdData", NO },
+        { "DSPAds", "loadAdData", NO },
+        { "HomeConfigUbixHandle", "loadAdData", NO },
+
+        // Swift mangled 同名选择子
+        { "_TtC12HiveConsumer15SplashAdManager", "showAdInWindow:", NO },
+        { "_TtC12HiveConsumer15SplashAdManager", "loadAdData", NO },
+        { "_TtC12HiveConsumer18FCSplashADSManager", "showAdInWindow:", NO },
+        { "_TtC12HiveConsumer18SplashAdLibHandler", "loadAdData", NO },
+        { "_TtC12HiveConsumer16OpenScrAdLibUBIX", "loadAdData", NO },
+        { "_TtC12HiveConsumer17OpenScrAdLibToBid", "loadAdData", NO },
+        { "_TtC12HiveConsumer16OpenScrLibNative", "loadAdData", NO },
+        { "_TtC12HiveConsumer19InterstScrAdLibTaku", "loadAdData", NO },
+        { "_TtC12HiveConsumer19InterstScrAdLibUBIX", "loadAdData", NO },
+        { "_TtC12HiveConsumer12AdsCNManager", "loadAdData", NO },
+        { "_TtC12HiveConsumer9AdsHandle", "loadAdData", NO },
+        { "_TtC12HiveConsumer8AdCenter", "loadAdData", NO },
+        { "_TtC12HiveConsumer6DSPAds", "loadAdData", NO },
+        { "_TtC12HiveConsumer20HomeConfigUbixHandle", "loadAdData", NO },
+
+        // AnyThink 常见入口
+        { "ATAdManager", "loadADWithPlacementID:extra:delegate:", NO },
+        { "ATSplash", "loadADWithPlacementID:extra:delegate:", NO },
+
         { NULL, NULL, NO }
     };
-    for (int i = 0; exact[i].cls; i++) {
-        n += hookSel(exact[i].cls, exact[i].sel, exact[i].meta);
+
+    for (int i = 0; table[i].cls; i++) {
+        if (hookExact(table[i].cls, table[i].sel, table[i].meta)) n++;
     }
     return n;
 }
 
-static int applyKnownHooks(void) {
-    int total = 0;
-    for (int i = 0; kKnownClasses[i]; i++) {
-        total += hookClassByName(kKnownClasses[i]);
-    }
-    total += applyExactHooks();
-    return total;
-}
-
-#pragma mark - present
+#pragma mark - present 拦截
 
 static void (*orig_present)(id, SEL, id, BOOL, id) = NULL;
 
@@ -308,20 +228,15 @@ static BOOL nameLooksLikeAdVC(const char *n) {
     if (!n) return NO;
     if (strstr(n, "SplashAd")) return YES;
     if (strstr(n, "WindMillSplash") || strstr(n, "WindSplash")) return YES;
-    if (strstr(n, "UBiX") && strstr(n, "Splash")) return YES;
-    if (strstr(n, "UbiX") && strstr(n, "Splash")) return YES;
+    if ((strstr(n, "UBiX") || strstr(n, "UbiX")) && strstr(n, "Splash")) return YES;
     if (strstr(n, "Interstitial") || strstr(n, "Intersititial")) return YES;
     if (strstr(n, "InsertAD")) return YES;
     if (strstr(n, "DSPHomeAds")) return YES;
     if (strstr(n, "LifeServiceHomeAD")) return YES;
-    if (strstr(n, "WindMill") && strstr(n, "Ad")) return YES;
-    if (strstr(n, "Reward") && strstr(n, "Ad") && strstr(n, "ViewController")) return YES;
-    if (strstr(n, "KSSplash") || strstr(n, "KSInterstitial")) return YES;
-    if (strstr(n, "GDTSplash") || strstr(n, "GDTUnified")) return YES;
-    if (strstr(n, "BUSplash") || strstr(n, "CSJSplash")) return YES;
-    if (strstr(n, "DCUniSplash") || strstr(n, "DCBasicSplash") || strstr(n, "DCDcloudSplash")) return YES;
     if (strstr(n, "SMStoreProduct") || strstr(n, "SKStoreProduct")) return YES;
-    if (strstr(n, "OpenScr") && strstr(n, "Ad")) return YES;
+    if (strstr(n, "DCUniSplash") || strstr(n, "DCBasicSplash") || strstr(n, "DCDcloudSplash")) return YES;
+    if (strstr(n, "GDTSplash") || strstr(n, "BUSplash") || strstr(n, "CSJSplash") || strstr(n, "KSSplash")) return YES;
+    if (strstr(n, "Reward") && strstr(n, "Ad") && strstr(n, "Controller")) return YES;
     return NO;
 }
 
@@ -349,343 +264,223 @@ static void installPresentHook(void) {
     method_setImplementation(m, (IMP)hooked_present);
 }
 
-#pragma mark - openURL（防广告外跳，严格安全）
-
-static void (*orig_openURLOpts)(id, SEL, id, id, id) = NULL;
-static BOOL (*orig_openURLLegacy)(id, SEL, id) = NULL;
-static volatile BOOL gOpenURLHookReady = NO;
-
-static BOOL urlLooksLikeAdJump(id urlObj) {
-    if (!urlObj || ![urlObj isKindOfClass:[NSURL class]]) return NO;
-    NSURL *url = (NSURL *)urlObj;
-    NSString *scheme = url.scheme.lowercaseString ?: @"";
-    NSString *host = url.host.lowercaseString ?: @"";
-    NSString *abs = url.absoluteString.lowercaseString ?: @"";
-
-    if ([scheme isEqualToString:@"itms-apps"] ||
-        [scheme isEqualToString:@"itms-appss"] ||
-        [scheme isEqualToString:@"itms"]) {
-        return YES;
-    }
-    if ([host containsString:@"apps.apple.com"] ||
-        [host containsString:@"itunes.apple.com"]) {
-        return YES;
-    }
-    // 常见广告监测 / 聚合域名（尽量不误伤业务 deep link）
-    static NSString * const keys[] = {
-        @"googlesyndication", @"doubleclick", @"admob",
-        @"pangolin", @"pangle.io", @"snssdk.com",
-        @"gdt.qq.com", @"e.qq.com", @"l.qq.com",
-        @"sigmob", @"windmill-ad", @"tobid.cn", @"ubixio.com",
-        @"beizi.biz", @"adscope", @"toponad", @"anythinktech",
-        @"adkwai", @"kuaishou.com/ad",
-        nil
-    };
-    for (int i = 0; keys[i]; i++) {
-        if ([abs containsString:keys[i]]) return YES;
-    }
-    return NO;
-}
-
-static void hooked_openURLOpts(id self, SEL _cmd, id url, id opts, id completion) {
-    if (gOpenURLHookReady && urlLooksLikeAdJump(url)) {
-        HCLog(@"block openURL %@", url);
-        if (completion && [completion isKindOfClass:NSClassFromString(@"NSBlock")]) {
-            @try { ((void (^)(BOOL))completion)(NO); } @catch (__unused NSException *e) {}
-        }
-        return;
-    }
-    if (orig_openURLOpts) orig_openURLOpts(self, _cmd, url, opts, completion);
-}
-
-static BOOL hooked_openURLLegacy(id self, SEL _cmd, id url) {
-    if (gOpenURLHookReady && urlLooksLikeAdJump(url)) {
-        HCLog(@"block openURL legacy %@", url);
-        return NO;
-    }
-    if (orig_openURLLegacy) return orig_openURLLegacy(self, _cmd, url);
-    return NO;
-}
-
-static void installOpenURLHooks(void) {
-    Class cls = [UIApplication class];
-    if (!cls) return;
-
-    SEL selNew = @selector(openURL:options:completionHandler:);
-    Method mNew = class_getInstanceMethod(cls, selNew);
-    if (mNew) {
-        IMP cur = method_getImplementation(mNew);
-        if (cur != (IMP)hooked_openURLOpts) {
-            orig_openURLOpts = (void *)cur;
-            method_setImplementation(mNew, (IMP)hooked_openURLOpts);
-        }
-    }
-
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    SEL selOld = @selector(openURL:);
-#pragma clang diagnostic pop
-    Method mOld = class_getInstanceMethod(cls, selOld);
-    if (mOld) {
-        IMP cur = method_getImplementation(mOld);
-        if (cur != (IMP)hooked_openURLLegacy) {
-            orig_openURLLegacy = (void *)cur;
-            method_setImplementation(mOld, (IMP)hooked_openURLLegacy);
-        }
-    }
-}
-
-#pragma mark - Ad views
+#pragma mark - 少量广告 View 折叠（不碰 UIView 根类）
 
 static void hideIfNeeded(UIView *v) {
     v.hidden = YES;
     v.alpha = 0;
     v.userInteractionEnabled = NO;
-    CGRect f = v.frame;
-    if (f.size.height > 0.5) {
-        f.size.height = 0;
-        v.frame = f;
-    }
 }
 
 static void hooked_didMove(UIView *self, SEL _cmd) {
-    static void (*uiViewDidMove)(id, SEL) = NULL;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
+    static void (*rootIMP)(id, SEL) = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
         Method root = class_getInstanceMethod([UIView class], @selector(didMoveToWindow));
-        if (root) uiViewDidMove = (void *)method_getImplementation(root);
+        if (root) rootIMP = (void *)method_getImplementation(root);
     });
-    if (uiViewDidMove) uiViewDidMove(self, _cmd);
+    if (rootIMP) rootIMP(self, _cmd);
     if (self.window) hideIfNeeded(self);
 }
 
-static void swizzleDidMoveOnClass(const char *cname) {
+static void swizzleDidMove(const char *cname) {
     Class cls = objc_getClass(cname);
     if (!cls) return;
-    // isSubclassOfClass 在构造早期 UIKit 未就绪时可能有问题，包一层
-    @try {
-        if (![cls isSubclassOfClass:[UIView class]]) return;
-    } @catch (__unused NSException *e) { return; }
+    BOOL isView = NO;
+    for (Class c = cls; c; c = class_getSuperclass(c)) {
+        if (c == [UIView class]) { isView = YES; break; }
+    }
+    if (!isView) return;
 
     SEL sel = @selector(didMoveToWindow);
     Method root = class_getInstanceMethod([UIView class], sel);
     if (!root) return;
     const char *enc = method_getTypeEncoding(root);
 
+    // 只用 class_addMethod：若子类没有自己的实现则添加；
+    // 绝不用 method_setImplementation(class_getInstanceMethod)——那会改到 UIView 父类实现，全局崩。
     if (!class_addMethod(cls, sel, (IMP)hooked_didMove, enc)) {
-        Method m = class_getInstanceMethod(cls, sel);
-        if (m && method_getImplementation(m) != (IMP)hooked_didMove) {
-            method_setImplementation(m, (IMP)hooked_didMove);
-        }
-    }
-}
-
-static const char *kAdViews[] = {
-    "NativeSplashAdView",
-    "_TtC12HiveConsumer18NativeSplashAdView",
-    "SplashAdBottomView",
-    "_TtC12HiveConsumer18SplashAdBottomView",
-    "DSPHomeAdsAlertView",
-    "_TtC12HiveConsumer19DSPHomeAdsAlertView",
-    "CashDeskTakuADCell",
-    "_TtC12HiveConsumer18CashDeskTakuADCell",
-    "SendOrderAdBannerView",
-    "_TtC12HiveConsumer21SendOrderAdBannerView",
-    "BoxMobilePickADBannerView",
-    "_TtC12HiveConsumer25BoxMobilePickADBannerView",
-    "BoxMobilePickADBannerTopView",
-    "_TtC12HiveConsumer28BoxMobilePickADBannerTopView",
-    "BoxMobilePickADBannerLeftView",
-    "_TtC12HiveConsumer29BoxMobilePickADBannerLeftView",
-    "CheckoutAdFeedBannerCell",
-    "_TtC12HiveConsumer24CheckoutAdFeedBannerCell",
-    "CheckoutAdFeedGoodsCell",
-    "_TtC12HiveConsumer23CheckoutAdFeedGoodsCell",
-    "CheckoutAdFeedMixBannerCell",
-    "_TtC12HiveConsumer27CheckoutAdFeedMixBannerCell",
-    "WashSOAdsView",
-    "_TtC12HiveConsumer13WashSOAdsView",
-    "LSOrderPayAdImageView",
-    "_TtC12HiveConsumer21LSOrderPayAdImageView",
-    "LifeServiceHomeADPopAlertView",
-    "_TtC12HiveConsumer29LifeServiceHomeADPopAlertView",
-    "HomeConfigUbixView",
-    "_TtC12HiveConsumer18HomeConfigUbixView",
-    "HomeConfigDspView",
-    "_TtC12HiveConsumer17HomeConfigDspView",
-    "HomeConfigUbixContentView",
-    "_TtC12HiveConsumer25HomeConfigUbixContentView",
-    "HomeConfigUbixMainImageView",
-    "_TtC12HiveConsumer27HomeConfigUbixMainImageView",
-    "WindMillBannerView",
-    "WindMillNativeAdView",
-    "WindSplashAdView",
-    "GDTUnifiedNativeAdView",
-    "CSJNativeExpressAdView",
-    NULL
-};
-
-static void installViewHooks(void) {
-    for (int i = 0; kAdViews[i]; i++) {
-        swizzleDidMoveOnClass(kAdViews[i]);
-    }
-}
-
-#pragma mark - Main tab (隐藏洗衣/会员，不删 VC)
-
-static void (*orig_mainTabViewDidLayoutSubviews)(id, SEL) = NULL;
-static char kMainTabButtonsKey;
-
-static BOOL classNameContains(UIView *view, const char *fragment) {
-    const char *name = class_getName(object_getClass(view));
-    return name && strstr(name, fragment);
-}
-
-static NSArray<UIView *> *sortedTabViews(NSArray<UIView *> *views) {
-    return [views sortedArrayUsingComparator:^NSComparisonResult(UIView *a, UIView *b) {
-        if (a.frame.origin.x < b.frame.origin.x) return NSOrderedAscending;
-        if (a.frame.origin.x > b.frame.origin.x) return NSOrderedDescending;
-        return NSOrderedSame;
-    }];
-}
-
-static NSArray<UIView *> *mainTabButtons(UITabBar *tabBar) {
-    NSArray<UIView *> *saved = objc_getAssociatedObject(tabBar, &kMainTabButtonsKey);
-    if (saved.count == 5) {
-        BOOL valid = YES;
-        for (UIView *button in saved) {
-            if (button.superview != tabBar) { valid = NO; break; }
-        }
-        if (valid) return saved;
-    }
-
-    NSMutableArray<UIView *> *buttons = [NSMutableArray array];
-    for (UIView *view in tabBar.subviews) {
-        if (classNameContains(view, "MainTabBarItemContentView")) {
-            [buttons addObject:view];
-        }
-    }
-    if (buttons.count != 5) {
-        [buttons removeAllObjects];
-        for (UIView *view in tabBar.subviews) {
-            const char *name = class_getName(object_getClass(view));
-            if (name && strcmp(name, "UITabBarButton") == 0) {
-                [buttons addObject:view];
+        // 子类已有自己的实现：只替换「本类 method list」里的
+        unsigned int count = 0;
+        Method *list = class_copyMethodList(cls, &count);
+        for (unsigned int i = 0; list && i < count; i++) {
+            if (method_getName(list[i]) == sel) {
+                if (method_getImplementation(list[i]) != (IMP)hooked_didMove) {
+                    method_setImplementation(list[i], (IMP)hooked_didMove);
+                }
+                break;
             }
         }
+        free(list);
     }
-    if (buttons.count != 5) return @[];
-
-    NSArray<UIView *> *sorted = sortedTabViews(buttons);
-    objc_setAssociatedObject(tabBar, &kMainTabButtonsKey, sorted, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    return sorted;
 }
 
-static void layoutThreeMainTabs(UITabBar *tabBar) {
-    NSArray<UIView *> *buttons = mainTabButtons(tabBar);
-    if (buttons.count != 5) return;
+static void installViewHooks(void) {
+    static const char *views[] = {
+        "NativeSplashAdView",
+        "_TtC12HiveConsumer18NativeSplashAdView",
+        "SplashAdBottomView",
+        "_TtC12HiveConsumer18SplashAdBottomView",
+        "DSPHomeAdsAlertView",
+        "_TtC12HiveConsumer19DSPHomeAdsAlertView",
+        "LifeServiceHomeADPopAlertView",
+        "_TtC12HiveConsumer29LifeServiceHomeADPopAlertView",
+        "WindMillBannerView",
+        "WindMillNativeAdView",
+        "WindSplashAdView",
+        NULL
+    };
+    for (int i = 0; views[i]; i++) swizzleDidMove(views[i]);
+}
 
-    CGFloat width = tabBar.bounds.size.width / 3.0;
-    NSUInteger visibleIndex = 0;
-    for (NSUInteger index = 0; index < buttons.count; index++) {
-        UIView *button = buttons[index];
-        BOOL hide = (index == 1 || index == 2);
-        button.hidden = hide;
-        button.userInteractionEnabled = !hide;
+#pragma mark - Tab：隐藏洗衣/会员（不删 VC）
+
+static void (*orig_tabLayout)(id, SEL) = NULL;
+static char kTabKey;
+
+static NSArray<UIView *> *tabButtons(UITabBar *bar) {
+    NSArray *saved = objc_getAssociatedObject(bar, &kTabKey);
+    if ([saved isKindOfClass:[NSArray class]] && saved.count == 5) {
+        BOOL ok = YES;
+        for (UIView *v in saved) {
+            if (![v isKindOfClass:[UIView class]] || v.superview != bar) { ok = NO; break; }
+        }
+        if (ok) return saved;
+    }
+
+    NSMutableArray *arr = [NSMutableArray array];
+    for (UIView *v in bar.subviews) {
+        const char *n = class_getName(object_getClass(v));
+        if (n && strstr(n, "MainTabBarItemContentView")) [arr addObject:v];
+    }
+    if (arr.count != 5) {
+        [arr removeAllObjects];
+        for (UIView *v in bar.subviews) {
+            const char *n = class_getName(object_getClass(v));
+            if (n && strcmp(n, "UITabBarButton") == 0) [arr addObject:v];
+        }
+    }
+    if (arr.count != 5) return nil;
+
+    [arr sortUsingComparator:^NSComparisonResult(UIView *a, UIView *b) {
+        CGFloat ax = a.frame.origin.x, bx = b.frame.origin.x;
+        if (ax < bx) return NSOrderedAscending;
+        if (ax > bx) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+    objc_setAssociatedObject(bar, &kTabKey, arr, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return arr;
+}
+
+static void layoutTabs(UITabBar *bar) {
+    if (!bar) return;
+    NSArray<UIView *> *btns = tabButtons(bar);
+    if (btns.count != 5) return;
+    CGFloat w = bar.bounds.size.width / 3.0;
+    if (w < 1) return;
+    NSUInteger vis = 0;
+    for (NSUInteger i = 0; i < 5; i++) {
+        UIView *b = btns[i];
+        BOOL hide = (i == 1 || i == 2);
+        b.hidden = hide;
+        b.userInteractionEnabled = !hide;
         if (hide) continue;
-        CGRect frame = button.frame;
-        frame.origin.x = width * visibleIndex;
-        frame.size.width = width;
-        button.frame = frame;
-        visibleIndex++;
+        CGRect f = b.frame;
+        f.origin.x = w * vis;
+        f.size.width = w;
+        b.frame = f;
+        vis++;
     }
 }
 
-static void hc_mainTabViewDidLayoutSubviews(UITabBarController *self, SEL cmd) {
-    if (orig_mainTabViewDidLayoutSubviews) orig_mainTabViewDidLayoutSubviews(self, cmd);
-    @try { layoutThreeMainTabs(self.tabBar); } @catch (__unused NSException *e) {}
+static void hooked_tabLayout(UITabBarController *self, SEL cmd) {
+    if (orig_tabLayout) orig_tabLayout(self, cmd);
+    @try { layoutTabs(self.tabBar); } @catch (__unused NSException *e) {}
 }
 
-static Class mainTabBarControllerClass(void) {
+static void installTabHooks(void) {
     Class cls = objc_getClass("MainTabBarController");
     if (!cls) cls = objc_getClass("_TtC12HiveConsumer20MainTabBarController");
-    return cls;
-}
-
-static void installMainTabHooks(void) {
-    Class cls = mainTabBarControllerClass();
     if (!cls) return;
-    @try {
-        if (![cls isSubclassOfClass:[UITabBarController class]]) return;
-    } @catch (__unused NSException *e) { return; }
 
-    SEL layoutSel = @selector(viewDidLayoutSubviews);
-    Method method = class_getInstanceMethod(cls, layoutSel);
-    if (!method) return;
-    IMP current = method_getImplementation(method);
-    if (current == (IMP)hc_mainTabViewDidLayoutSubviews) return;
-
-    orig_mainTabViewDidLayoutSubviews = (void *)current;
-    if (!class_addMethod(cls, layoutSel, (IMP)hc_mainTabViewDidLayoutSubviews,
-                         method_getTypeEncoding(method))) {
-        method_setImplementation(method, (IMP)hc_mainTabViewDidLayoutSubviews);
+    BOOL isTab = NO;
+    for (Class c = cls; c; c = class_getSuperclass(c)) {
+        if (c == [UITabBarController class]) { isTab = YES; break; }
     }
+    if (!isTab) return;
+
+    SEL sel = @selector(viewDidLayoutSubviews);
+    Method root = class_getInstanceMethod([UITabBarController class], sel);
+    if (!root) root = class_getInstanceMethod([UIViewController class], sel);
+    if (!root) return;
+    const char *enc = method_getTypeEncoding(root);
+
+    // 先看本类是否已有实现
+    Method own = NULL;
+    unsigned int count = 0;
+    Method *list = class_copyMethodList(cls, &count);
+    for (unsigned int i = 0; list && i < count; i++) {
+        if (method_getName(list[i]) == sel) { own = list[i]; break; }
+    }
+
+    if (own) {
+        IMP cur = method_getImplementation(own);
+        if (cur == (IMP)hooked_tabLayout) { free(list); return; }
+        orig_tabLayout = (void *)cur;
+        method_setImplementation(own, (IMP)hooked_tabLayout);
+    } else {
+        // 本类没有：add 一层，原实现走父类（UIViewController 默认）
+        orig_tabLayout = (void *)method_getImplementation(root);
+        class_addMethod(cls, sel, (IMP)hooked_tabLayout, enc);
+    }
+    free(list);
 }
 
 #pragma mark - Entry
 
 static void applyAll(const char *tag) {
+    int n = 0;
     @try {
-        int n = applyKnownHooks();
-        installMainTabHooks();
+        n = applyExactHooks();
         installViewHooks();
-        HCLog(@"%s hooks=%d", tag, n);
+        installTabHooks();
     } @catch (NSException *e) {
-        HCLog(@"%s exception %@", tag, e);
+        NSLog(@"[HiveConsumer] %@ exception %@", @(tag), e);
+        return;
     }
+    HCLog(@"%s hooks=%d", tag, n);
 }
 
 static void onForeground(void) {
-    applyAll("foreground");
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        applyAll("foreground+0.3s");
-    });
-}
-
-static void installForegroundObserver(void) {
-    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-    [nc addObserverForName:UIApplicationWillEnterForegroundNotification
-                    object:nil queue:[NSOperationQueue mainQueue]
-                usingBlock:^(__unused NSNotification *note) { onForeground(); }];
-    [nc addObserverForName:UIApplicationDidBecomeActiveNotification
-                    object:nil queue:[NSOperationQueue mainQueue]
-                usingBlock:^(__unused NSNotification *note) { applyAll("active"); }];
+    applyAll("fg");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ applyAll("fg+0.5"); });
 }
 
 __attribute__((constructor))
 static void HiveConsumerDylibInit(void) {
     @autoreleasepool {
-        // 构造期只装最安全的 present；其余放到主线程，避免 UIKit 未就绪 / ABI 问题
+        // 始终打一行，确认 dylib 已加载（非 verbose）
+        NSLog(@"[HiveConsumer] dylib loaded (v4 safe)");
+
+        // present 尽量早
         @try { installPresentHook(); } @catch (__unused NSException *e) {}
 
+        // 其余全部主线程，UIKit 就绪后
         dispatch_async(dispatch_get_main_queue(), ^{
             @try {
-                installOpenURLHooks();
-                gOpenURLHookReady = YES;
                 applyAll("main");
-                installForegroundObserver();
-            } @catch (__unused NSException *e) {}
+                [[NSNotificationCenter defaultCenter]
+                 addObserverForName:UIApplicationWillEnterForegroundNotification
+                 object:nil queue:[NSOperationQueue mainQueue]
+                 usingBlock:^(__unused NSNotification *n) { onForeground(); }];
+            } @catch (NSException *e) {
+                NSLog(@"[HiveConsumer] main init exception %@", e);
+            }
         });
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            applyAll("+1.5s");
-        });
-
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            applyAll("+5s");
-        });
+        // 懒加载类补 hook（主线程，避免后台改 method 竞态）
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ applyAll("+2s"); });
     }
 }
