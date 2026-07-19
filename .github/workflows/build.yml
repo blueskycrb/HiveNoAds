@@ -38,10 +38,10 @@ jobs:
               min_ios="14.0"
             fi
             echo "==> building $out from $src"
-            # 小红书图片保存需要 Photos
+            # 小红书图片保存需要 Photos + CoreGraphics
             EXTRA_FW=""
             if [ "$app" = "discover" ]; then
-              EXTRA_FW="-framework Photos"
+              EXTRA_FW="-framework Photos -framework CoreGraphics"
             fi
             # shellcheck disable=SC2086
             clang -dynamiclib \
