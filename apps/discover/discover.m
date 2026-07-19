@@ -1,468 +1,263 @@
 //
-// discover.dylib — 小红书图片保存/下载 (TrollFools / Substrate / ElleKit)
-// Bundle: com.xingin.discover | 进程: discover | 对照版本: 9.38.1
+// discover.dylib — 小红书：解锁「保存别人帖子的图片」
+// Bundle: com.xingin.discover | 可执行名: discover | 对照: 9.38.1
+//
+// 只做一件事：强制打开 App 自带的保存能力（disableSave / 分享面板保存入口）。
+// 不添加任何悬浮按钮、不截图、不替代原生 UI。
 //
 // 用法:
-//   越狱 Substrate: 放进 DynamicLibraries + plist
-//   TrollFools: 注入到小红书 App
-//   打开笔记 → 点右侧红色 ↓ → 保存到相册
-//   或双指长按图片区域
+//   TrollFools 注入 discover.dylib → 强杀小红书
+//   打开别人图文笔记 → 长按图片 / 分享面板 → 点「保存图片」
 //
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <Photos/Photos.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <string.h>
 #import <unistd.h>
 
-#define XHSLog(fmt, ...) NSLog(@"[XHSImageSave] " fmt, ##__VA_ARGS__)
+// 需要调试时改成 1
+static const BOOL kXHSVerbose = NO;
+#define XHSLog(fmt, ...) do { if (kXHSVerbose) NSLog(@"[XHSImageSave] " fmt, ##__VA_ARGS__); } while (0)
 
-#pragma mark - Auth / Photos
+#pragma mark - IMP stubs
 
-static void XHSAuthThen(void (^block)(BOOL granted)) {
-    void (^finish)(PHAuthorizationStatus) = ^(PHAuthorizationStatus st) {
-        BOOL g = (st == PHAuthorizationStatusAuthorized);
-        if (@available(iOS 14, *)) g = g || (st == PHAuthorizationStatusLimited);
-        dispatch_async(dispatch_get_main_queue(), ^{ if (block) block(g); });
-    };
-    if (@available(iOS 14, *)) {
-        PHAuthorizationStatus st = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelAddOnly];
-        if (st == PHAuthorizationStatusNotDetermined)
-            [PHPhotoLibrary requestAuthorizationForAccessLevel:PHAccessLevelAddOnly handler:finish];
-        else
-            finish(st);
-    } else {
-        PHAuthorizationStatus st = [PHPhotoLibrary authorizationStatus];
-        if (st == PHAuthorizationStatusNotDetermined)
-            [PHPhotoLibrary requestAuthorization:finish];
-        else
-            finish(st);
-    }
-}
-
-static void XHSSaveImage(UIImage *image, void (^done)(BOOL, NSError *)) {
-    if (!image) {
-        if (done) done(NO, [NSError errorWithDomain:@"XHSImageSave" code:1
-                              userInfo:@{NSLocalizedDescriptionKey: @"nil image"}]);
-        return;
-    }
-    XHSAuthThen(^(BOOL granted) {
-        if (!granted) {
-            if (done) done(NO, [NSError errorWithDomain:@"XHSImageSave" code:2
-                                  userInfo:@{NSLocalizedDescriptionKey: @"相册权限未开"}]);
-            return;
-        }
-        [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
-            [PHAssetChangeRequest creationRequestForAssetFromImage:image];
-        } completionHandler:^(BOOL success, NSError *error) {
-            dispatch_async(dispatch_get_main_queue(), ^{ if (done) done(success, error); });
-        }];
-    });
-}
-
-static void XHSSaveData(NSData *data, void (^done)(BOOL, NSError *)) {
-    if (data.length < 32) {
-        if (done) done(NO, [NSError errorWithDomain:@"XHSImageSave" code:3
-                              userInfo:@{NSLocalizedDescriptionKey: @"empty data"}]);
-        return;
-    }
-    UIImage *img = [UIImage imageWithData:data];
-    if (img) { XHSSaveImage(img, done); return; }
-    XHSAuthThen(^(BOOL granted) {
-        if (!granted) {
-            if (done) done(NO, [NSError errorWithDomain:@"XHSImageSave" code:2
-                                  userInfo:@{NSLocalizedDescriptionKey: @"相册权限未开"}]);
-            return;
-        }
-        NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:
-                          [NSString stringWithFormat:@"xhs_%@.img", NSUUID.UUID.UUIDString]];
-        if (![data writeToFile:path atomically:YES]) {
-            if (done) done(NO, [NSError errorWithDomain:@"XHSImageSave" code:4
-                                  userInfo:@{NSLocalizedDescriptionKey: @"write tmp fail"}]);
-            return;
-        }
-        [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
-            [PHAssetChangeRequest creationRequestForAssetFromImageAtFileURL:[NSURL fileURLWithPath:path]];
-        } completionHandler:^(BOOL success, NSError *error) {
-            [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
-            dispatch_async(dispatch_get_main_queue(), ^{ if (done) done(success, error); });
-        }];
-    });
-}
-
-static UIWindow *XHSKeyWindow(void) {
-    UIWindow *win = UIApplication.sharedApplication.keyWindow;
-    if (win) return win;
-    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
-        UIWindowScene *ws = (UIWindowScene *)sc;
-        for (UIWindow *w in ws.windows) if (w.isKeyWindow) return w;
-        if (ws.windows.count) return ws.windows.firstObject;
-    }
-    return nil;
-}
-
-static void XHSToast(NSString *msg) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *win = XHSKeyWindow();
-        if (!win) return;
-        UILabel *lab = [UILabel new];
-        lab.text = msg;
-        lab.textColor = UIColor.whiteColor;
-        lab.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.82];
-        lab.font = [UIFont boldSystemFontOfSize:14];
-        lab.textAlignment = NSTextAlignmentCenter;
-        lab.numberOfLines = 0;
-        lab.layer.cornerRadius = 10;
-        lab.clipsToBounds = YES;
-        CGSize fit = [lab sizeThatFits:CGSizeMake(win.bounds.size.width - 72, 160)];
-        lab.frame = CGRectMake(0, 0, fit.width + 28, fit.height + 16);
-        lab.center = CGPointMake(CGRectGetMidX(win.bounds), win.bounds.size.height * 0.8);
-        [win addSubview:lab];
-        [UIView animateWithDuration:0.2 delay:1.6 options:0 animations:^{ lab.alpha = 0; }
-                         completion:^(__unused BOOL f) { [lab removeFromSuperview]; }];
-    });
-}
-
-#pragma mark - URL collect / download
-
-static BOOL XHSIsImageURL(NSString *s) {
-    if (s.length < 12) return NO;
-    NSString *l = s.lowercaseString;
-    if (![l hasPrefix:@"http"]) return NO;
-    return [l containsString:@"xhscdn"] ||
-           [l containsString:@"xiaohongshu"] ||
-           [l containsString:@"sns-img"] ||
-           [l containsString:@".jpg"] ||
-           [l containsString:@".jpeg"] ||
-           [l containsString:@".png"] ||
-           [l containsString:@".webp"] ||
-           [l containsString:@".heic"] ||
-           [l containsString:@"fmt=jpeg"] ||
-           [l containsString:@"fmt=png"] ||
-           [l containsString:@"fmt=webp"] ||
-           [l containsString:@"/image"];
-}
-
-static void XHSCollect(id obj, NSMutableSet<NSString *> *out, NSInteger depth) {
-    if (!obj || depth > 5) return;
-    if ([obj isKindOfClass:[NSString class]]) {
-        if (XHSIsImageURL((NSString *)obj)) [out addObject:(NSString *)obj];
-        return;
-    }
-    if ([obj isKindOfClass:[NSURL class]]) {
-        NSString *s = [(NSURL *)obj absoluteString];
-        if (XHSIsImageURL(s)) [out addObject:s];
-        return;
-    }
-    if ([obj isKindOfClass:[NSArray class]]) {
-        for (id x in (NSArray *)obj) XHSCollect(x, out, depth + 1);
-        return;
-    }
-    if ([obj isKindOfClass:[NSDictionary class]]) {
-        [(NSDictionary *)obj enumerateKeysAndObjectsUsingBlock:^(__unused id k, id v, __unused BOOL *s) {
-            XHSCollect(v, out, depth + 1);
-        }];
-        return;
-    }
-    static NSArray<NSString *> *keys;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        keys = @[
-            @"url", @"urlString", @"imageUrl", @"imageURL", @"image_url",
-            @"originUrl", @"originalUrl", @"origin_url", @"original_url",
-            @"url_size_large", @"url_default", @"urlDefault", @"urlSizeLarge",
-            @"largeUrl", @"veryLargeImageUrl", @"originImageUrl", @"originImgUrl",
-            @"info_list", @"infoList", @"urlInfoList", @"url_info_list",
-            @"originImgInfo", @"imageInfo", @"image_list", @"url_multi",
-            @"livePhotoUrl", @"live_photo_url"
-        ];
-    });
-    for (NSString *k in keys) {
-        @try {
-            if (![obj respondsToSelector:NSSelectorFromString(k)]) continue;
-            XHSCollect([obj valueForKey:k], out, depth + 1);
-        } @catch (__unused NSException *e) {}
-    }
-}
-
-static NSInteger XHSURLScore(NSString *u) {
-    NSString *l = u.lowercaseString;
-    NSInteger s = (NSInteger)u.length / 40;
-    if ([l containsString:@"origin"] || [l containsString:@"original"]) s += 12;
-    if ([l containsString:@"url_size_large"] || [l containsString:@"size_large"]) s += 10;
-    if ([l containsString:@"large"] || [l containsString:@"1080"] || [l containsString:@"1440"]) s += 5;
-    if ([l containsString:@"thumb"] || [l containsString:@"avatar"] || [l containsString:@"icon"]) s -= 20;
-    return s;
-}
-
-static void XHSDownloadAndSave(NSString *urlString) {
-    if (!urlString.length) return;
-    XHSLog(@"GET %@", urlString);
-    XHSToast(@"正在下载图片…");
-    NSURL *url = [NSURL URLWithString:urlString];
-    if (!url) { XHSToast(@"URL 无效"); return; }
-
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
-                                                       cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
-                                                   timeoutInterval:30];
-    [req setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
-        forHTTPHeaderField:@"User-Agent"];
-    [req setValue:@"https://www.xiaohongshu.com/" forHTTPHeaderField:@"Referer"];
-    [req setValue:@"image/avif,image/webp,image/apng,image/*,*/*;q=0.8" forHTTPHeaderField:@"Accept"];
-
-    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
-    cfg.HTTPShouldSetCookies = YES;
-    cfg.HTTPCookieAcceptPolicy = NSHTTPCookieAcceptPolicyAlways;
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
-
-    [[session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-        NSHTTPURLResponse *http = (NSHTTPURLResponse *)resp;
-        XHSLog(@"resp %ld bytes=%lu err=%@", (long)http.statusCode, (unsigned long)data.length, err);
-        if (err || data.length < 64) {
-            XHSToast([NSString stringWithFormat:@"下载失败: %@", err.localizedDescription ?: @"empty"]);
-            return;
-        }
-        XHSSaveData(data, ^(BOOL ok, NSError *e) {
-            XHSToast(ok ? @"✅ 已保存到相册" :
-                     [NSString stringWithFormat:@"保存失败: %@", e.localizedDescription ?: @"?"]);
-        });
-    }] resume];
-}
-
-static void XHSForceSaveFromView(UIView *view) {
-    NSMutableSet<NSString *> *set = [NSMutableSet set];
-    UIView *v = view;
-    for (int i = 0; i < 10 && v; i++, v = v.superview) {
-        for (NSString *k in @[@"imageURL", @"imageUrl", @"url", @"currentImageURL",
-                              @"sd_imageURL", @"yy_imageURL", @"model", @"viewModel",
-                              @"note", @"imageInfo", @"noteImage", @"data", @"item", @"media"]) {
-            @try {
-                if (![v respondsToSelector:NSSelectorFromString(k)]) continue;
-                XHSCollect([v valueForKey:k], set, 0);
-            } @catch (__unused NSException *e) {}
-        }
-    }
-
-    if (set.count) {
-        NSArray *sorted = [set.allObjects sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
-            NSInteger sa = XHSURLScore(a), sb = XHSURLScore(b);
-            if (sa > sb) return NSOrderedAscending;
-            if (sa < sb) return NSOrderedDescending;
-            return NSOrderedSame;
-        }];
-        XHSLog(@"picked %@", sorted.firstObject);
-        XHSDownloadAndSave(sorted.firstObject);
-        return;
-    }
-
-    v = view;
-    for (int i = 0; i < 12 && v; i++, v = v.superview) {
-        if ([v isKindOfClass:[UIImageView class]]) {
-            UIImage *img = ((UIImageView *)v).image;
-            if (img.size.width > 48 && img.size.height > 48) {
-                XHSSaveImage(img, ^(BOOL ok, NSError *e) {
-                    XHSToast(ok ? @"✅ 已从当前画面保存" :
-                             [NSString stringWithFormat:@"保存失败: %@", e.localizedDescription ?: @"?"]);
-                });
-                return;
-            }
-        }
-    }
-
-    if (view && view.bounds.size.width > 48) {
-        if (@available(iOS 10.0, *)) {
-            UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:view.bounds.size];
-            UIImage *snap = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-                [view drawViewHierarchyInRect:view.bounds afterScreenUpdates:NO];
-            }];
-            if (snap) {
-                XHSSaveImage(snap, ^(BOOL ok, NSError *e) {
-                    XHSToast(ok ? @"✅ 已截取视图保存(非原图)" :
-                             [NSString stringWithFormat:@"保存失败: %@", e.localizedDescription ?: @"?"]);
-                });
-                return;
-            }
-        }
-    }
-    XHSToast(@"未找到可保存的图片");
-}
-
-#pragma mark - Floating UI
-
-@interface XHSFloatUI : NSObject
-+ (void)install;
-@end
-
-@implementation XHSFloatUI
-
-+ (void)install {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        __block void (^tryAttach)(void) = nil;
-        tryAttach = ^{
-            UIWindow *win = XHSKeyWindow();
-            if (!win) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), tryAttach);
-                return;
-            }
-            [self attachToWindow:win];
-        };
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), tryAttach);
-    });
-}
-
-+ (void)attachToWindow:(UIWindow *)win {
-    if (objc_getAssociatedObject(win, _cmd)) return;
-    objc_setAssociatedObject(win, _cmd, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-    CGFloat w = win.bounds.size.width, h = win.bounds.size.height;
-    UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
-    btn.frame = CGRectMake(w - 62, h * 0.52, 50, 50);
-    btn.backgroundColor = [[UIColor colorWithRed:1 green:0.2 blue:0.35 alpha:1] colorWithAlphaComponent:0.9];
-    btn.layer.cornerRadius = 25;
-    btn.layer.shadowColor = UIColor.blackColor.CGColor;
-    btn.layer.shadowOpacity = 0.35;
-    btn.layer.shadowRadius = 4;
-    btn.layer.shadowOffset = CGSizeMake(0, 2);
-    [btn setTitle:@"↓" forState:UIControlStateNormal];
-    [btn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    btn.titleLabel.font = [UIFont systemFontOfSize:24 weight:UIFontWeightBold];
-    btn.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin |
-                           UIViewAutoresizingFlexibleTopMargin |
-                           UIViewAutoresizingFlexibleBottomMargin;
-    [btn addTarget:self action:@selector(tap:) forControlEvents:UIControlEventTouchUpInside];
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)];
-    [btn addGestureRecognizer:pan];
-    [win addSubview:btn];
-
-    UILongPressGestureRecognizer *lp =
-        [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(twoFinger:)];
-    lp.numberOfTouchesRequired = 2;
-    lp.minimumPressDuration = 0.4;
-    [win addGestureRecognizer:lp];
-
-    XHSLog(@"float button ready");
-    XHSToast(@"图片保存插件已加载");
-}
-
-+ (void)pan:(UIPanGestureRecognizer *)g {
-    UIView *v = g.view;
-    CGPoint t = [g translationInView:v.superview];
-    v.center = CGPointMake(v.center.x + t.x, v.center.y + t.y);
-    [g setTranslation:CGPointZero inView:v.superview];
-}
-
-+ (void)tap:(UIButton *)sender {
-    UIWindow *win = sender.window ?: XHSKeyWindow();
-    if (!win) return;
-    CGPoint c = CGPointMake(CGRectGetMidX(win.bounds), CGRectGetMidY(win.bounds) - 60);
-    UIView *hit = [win hitTest:c withEvent:nil] ?: win;
-    UIView *img = hit;
-    while (img && ![img isKindOfClass:[UIImageView class]]) img = img.superview;
-    XHSForceSaveFromView(img ?: hit);
-}
-
-+ (void)twoFinger:(UILongPressGestureRecognizer *)g {
-    if (g.state != UIGestureRecognizerStateBegan) return;
-    CGPoint p = [g locationInView:g.view];
-    UIView *hit = [g.view hitTest:p withEvent:nil] ?: g.view;
-    UIView *img = hit;
-    while (img && ![img isKindOfClass:[UIImageView class]]) img = img.superview;
-    XHSForceSaveFromView(img ?: hit);
-}
-
-@end
-
-#pragma mark - disableSave force
-
-static BOOL XHS_retNO(id self, SEL _cmd) { (void)self; (void)_cmd; return NO; }
-static BOOL XHS_retYES(id self, SEL _cmd) { (void)self; (void)_cmd; return YES; }
-static void XHS_setDrop(id self, SEL _cmd, BOOL v) {
+static BOOL XHS_retNO(id self, SEL _cmd) {
     (void)self; (void)_cmd;
-    if (v) XHSLog(@"drop setDisable*:YES");
+    return NO;
 }
-static id XHS_retYesNumber(id self, SEL _cmd) { (void)self; (void)_cmd; return @YES; }
+static BOOL XHS_retYES(id self, SEL _cmd) {
+    (void)self; (void)_cmd;
+    return YES;
+}
+static id XHS_retYesNumber(id self, SEL _cmd) {
+    (void)self; (void)_cmd;
+    return @YES;
+}
+// 吞掉 setDisableSave:YES 等，始终当成允许保存
+static void XHS_setBoolIgnored(id self, SEL _cmd, BOOL v) {
+    (void)self; (void)_cmd; (void)v;
+    XHSLog(@"ignore %s %d", sel_getName(_cmd), (int)v);
+}
+static void XHS_setIdForceNo(id self, SEL _cmd, id v) {
+    (void)self; (void)_cmd; (void)v;
+    // 若原 setter 期望 NSNumber，尽量不崩：不调原实现即可（字段保持默认/已有值）
+    XHSLog(@"ignore id setter %s", sel_getName(_cmd));
+}
 
 static void XHSReplaceBoolGetter(Class cls, SEL sel, BOOL value) {
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) return;
     const char *t = method_getTypeEncoding(m);
-    if (!t || (t[0] != 'B' && t[0] != 'c')) return;
-    method_setImplementation(m, value ? (IMP)XHS_retYES : (IMP)XHS_retNO);
-    XHSLog(@"patch %s -%s -> %d", class_getName(cls), sel_getName(sel), value);
+    if (!t) return;
+    if (t[0] == 'B' || t[0] == 'c') {
+        method_setImplementation(m, value ? (IMP)XHS_retYES : (IMP)XHS_retNO);
+        XHSLog(@"BOOL %s -%s -> %d", class_getName(cls), sel_getName(sel), (int)value);
+    }
+}
+
+static void XHSReplaceIdGetterYes(Class cls, SEL sel) {
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    const char *t = method_getTypeEncoding(m);
+    if (!t) return;
+    if (t[0] == '@') {
+        method_setImplementation(m, (IMP)XHS_retYesNumber);
+        XHSLog(@"id %s -%s -> @YES", class_getName(cls), sel_getName(sel));
+    } else if (t[0] == 'B' || t[0] == 'c') {
+        method_setImplementation(m, (IMP)XHS_retYES);
+        XHSLog(@"BOOL %s -%s -> YES", class_getName(cls), sel_getName(sel));
+    }
 }
 
 static void XHSBlockBoolSetter(Class cls, SEL sel) {
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) return;
-    method_setImplementation(m, (IMP)XHS_setDrop);
+    const char *t = method_getTypeEncoding(m);
+    if (!t) return;
+    // 常见: v24@0:8B16 或 v24@0:8c16
+    method_setImplementation(m, (IMP)XHS_setBoolIgnored);
 }
 
-static void XHSPatchClass(Class cls) {
+static void XHSBlockIdSetter(Class cls, SEL sel) {
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    method_setImplementation(m, (IMP)XHS_setIdForceNo);
+}
+
+#pragma mark - Per-class patch
+
+static void XHSPatchSaveFlagsOnClass(Class cls) {
     if (!cls) return;
+
+    // 核心：禁止保存 → 永远允许
     XHSReplaceBoolGetter(cls, sel_registerName("disableSave"), NO);
     XHSReplaceBoolGetter(cls, sel_registerName("isDisableSave"), NO);
     XHSReplaceBoolGetter(cls, sel_registerName("forbidCopy"), NO);
+    XHSReplaceBoolGetter(cls, sel_registerName("isForbidCopy"), NO);
     XHSReplaceBoolGetter(cls, sel_registerName("disableCopy"), NO);
     XHSReplaceBoolGetter(cls, sel_registerName("disableCopyAction"), NO);
+
+    // 保存时尽量不强制水印（字段语义：disableWatermark=YES 表示关闭水印）
     XHSReplaceBoolGetter(cls, sel_registerName("disableWatermark"), YES);
     XHSReplaceBoolGetter(cls, sel_registerName("disableWatermarkWhenSavingAlbum"), YES);
 
     XHSBlockBoolSetter(cls, sel_registerName("setDisableSave:"));
     XHSBlockBoolSetter(cls, sel_registerName("setForbidCopy:"));
     XHSBlockBoolSetter(cls, sel_registerName("setDisableCopy:"));
+    XHSBlockBoolSetter(cls, sel_registerName("setDisableCopyAction:"));
 
-    Method share = class_getInstanceMethod(cls, sel_registerName("shareImageSaveEnable"));
-    if (share) {
-        const char *t = method_getTypeEncoding(share);
-        if (t && t[0] == '@') method_setImplementation(share, (IMP)XHS_retYesNumber);
-        else if (t && (t[0] == 'B' || t[0] == 'c')) method_setImplementation(share, (IMP)XHS_retYES);
-    }
+    // 分享面板「保存图片」开关（可能是 BOOL 或 NSNumber）
+    XHSReplaceIdGetterYes(cls, sel_registerName("shareImageSaveEnable"));
+    XHSBlockIdSetter(cls, sel_registerName("setShareImageSaveEnable:"));
+    XHSBlockBoolSetter(cls, sel_registerName("setShareImageSaveEnable:"));
 
     const char *name = class_getName(cls);
-    if (name && (strstr(name, "SaveProvider") || strstr(name, "ImageSave") ||
-                 strstr(name, "SaveImage") || strstr(name, "NegativeFeedback"))) {
-        Method en = class_getInstanceMethod(cls, sel_registerName("enable"));
-        if (en) {
-            const char *t = method_getTypeEncoding(en);
-            if (t && (t[0] == 'B' || t[0] == 'c'))
-                method_setImplementation(en, (IMP)XHS_retYES);
-        }
+    if (!name) return;
+
+    // SaveProvider.enable / 负反馈面板保存入口
+    if (strstr(name, "SaveProvider") ||
+        strstr(name, "NegativeFeedback") ||
+        strstr(name, "ImageSave") ||
+        strstr(name, "SaveImage") ||
+        strstr(name, "NoteSave") ||
+        strstr(name, "MediaSave")) {
+        XHSReplaceBoolGetter(cls, sel_registerName("enable"), YES);
+        XHSReplaceBoolGetter(cls, sel_registerName("isEnable"), YES);
+        XHSReplaceBoolGetter(cls, sel_registerName("isEnabled"), YES);
+        XHSReplaceIdGetterYes(cls, sel_registerName("enable"));
     }
 }
 
-static void XHSScanClasses(void) {
+static BOOL XHSClassNameInteresting(const char *name) {
+    if (!name) return NO;
+    return strstr(name, "MediaSave") ||
+           strstr(name, "ImageSave") ||
+           strstr(name, "SaveConfig") ||
+           strstr(name, "SaveProvider") ||
+           strstr(name, "NoteImage") ||
+           strstr(name, "XYPHNote") ||
+           strstr(name, "XYPHMedia") ||
+           strstr(name, "NegativeFeedback") ||
+           strstr(name, "NoteSave") ||
+           strstr(name, "ShareInfo") ||
+           strstr(name, "SaveCell") ||
+           strstr(name, "SaveImageService") ||
+           strstr(name, "ImageSaveService");
+}
+
+static void XHSScanAndPatch(void) {
+    // 已知 ObjC 类优先
+    XHSPatchSaveFlagsOnClass(objc_getClass("XYPHMediaSaveConfig"));
+
     unsigned int n = 0;
     Class *list = objc_copyClassList(&n);
     if (!list) return;
     for (unsigned int i = 0; i < n; i++) {
         Class cls = list[i];
         const char *name = class_getName(cls);
-        if (!name) continue;
-        BOOL byName =
-            strstr(name, "MediaSave") ||
-            strstr(name, "ImageSave") ||
-            strstr(name, "SaveConfig") ||
-            strstr(name, "SaveProvider") ||
-            strstr(name, "NoteImage") ||
-            strstr(name, "XYPHNote") ||
-            strstr(name, "NegativeFeedback") ||
-            strstr(name, "NoteSave");
+        BOOL byName = XHSClassNameInteresting(name);
         BOOL bySel =
             class_getInstanceMethod(cls, sel_registerName("disableSave")) ||
             class_getInstanceMethod(cls, sel_registerName("setDisableSave:")) ||
-            class_getInstanceMethod(cls, sel_registerName("shareImageSaveEnable"));
-        if (byName || bySel) XHSPatchClass(cls);
+            class_getInstanceMethod(cls, sel_registerName("shareImageSaveEnable")) ||
+            class_getInstanceMethod(cls, sel_registerName("mediaSaveConfig"));
+        if (byName || bySel) {
+            XHSPatchSaveFlagsOnClass(cls);
+        }
     }
     free(list);
-    // always try known class
-    XHSPatchClass(objc_getClass("XYPHMediaSaveConfig"));
-    XHSLog(@"class scan done (%u)", n);
+    XHSLog(@"scan done classes=%u", n);
+}
+
+#pragma mark - KVC soft filter on XYPHMediaSaveConfig only
+
+static void (*orig_setValue_forKey)(id, SEL, id, NSString *);
+static void hook_setValue_forKey(id self, SEL _cmd, id value, NSString *key) {
+    if ([key isEqualToString:@"disableSave"] ||
+        [key isEqualToString:@"disable_save"] ||
+        [key isEqualToString:@"forbidCopy"] ||
+        [key isEqualToString:@"forbid_copy"]) {
+        value = @NO;
+    } else if ([key isEqualToString:@"shareImageSaveEnable"] ||
+               [key isEqualToString:@"share_image_save_enable"]) {
+        value = @YES;
+    } else if ([key isEqualToString:@"disableWatermark"] ||
+               [key isEqualToString:@"disable_watermark"] ||
+               [key isEqualToString:@"disableWatermarkWhenSavingAlbum"]) {
+        value = @YES;
+    }
+    if (orig_setValue_forKey) {
+        orig_setValue_forKey(self, _cmd, value, key);
+    } else {
+        struct objc_super sup = { self, class_getSuperclass(object_getClass(self)) };
+        ((void (*)(struct objc_super *, SEL, id, NSString *))objc_msgSendSuper)(&sup, _cmd, value, key);
+    }
+}
+
+static void XHSTryHookConfigKVC(void) {
+    Class cls = objc_getClass("XYPHMediaSaveConfig");
+    if (!cls) return;
+    Method m = class_getInstanceMethod(cls, @selector(setValue:forKey:));
+    if (!m) return;
+    // 只替换该类自己的实现；若与 NSObject 相同则用 class_addMethod 覆盖
+    IMP old = method_getImplementation(m);
+    if (!orig_setValue_forKey) {
+        orig_setValue_forKey = (void *)old;
+    }
+    // 用 class_replaceMethod 保证子类/本类走我们的逻辑
+    class_replaceMethod(cls, @selector(setValue:forKey:),
+                        (IMP)hook_setValue_forKey,
+                        method_getTypeEncoding(m));
+    XHSLog(@"KVC hook on XYPHMediaSaveConfig");
+}
+
+#pragma mark - mediaSaveConfig 访问：拿到配置后立刻把 disableSave 打掉
+
+static id (*orig_mediaSaveConfig)(id, SEL);
+static id hook_mediaSaveConfig(id self, SEL _cmd) {
+    id cfg = orig_mediaSaveConfig ? orig_mediaSaveConfig(self, _cmd) : nil;
+    if (cfg) {
+        XHSPatchSaveFlagsOnClass(object_getClass(cfg));
+        @try {
+            if ([cfg respondsToSelector:sel_registerName("setDisableSave:")]) {
+                ((void (*)(id, SEL, BOOL))objc_msgSend)(cfg, sel_registerName("setDisableSave:"), NO);
+            }
+        } @catch (__unused NSException *e) {}
+    }
+    return cfg;
+}
+
+static void XHSHookMediaSaveConfigAccessors(void) {
+    unsigned int n = 0;
+    Class *list = objc_copyClassList(&n);
+    if (!list) return;
+    for (unsigned int i = 0; i < n; i++) {
+        Class cls = list[i];
+        Method m = class_getInstanceMethod(cls, sel_registerName("mediaSaveConfig"));
+        if (!m) continue;
+        const char *t = method_getTypeEncoding(m);
+        if (!t || t[0] != '@') continue;
+        // 只 hook 一次全局 orig 即可（多类共用同一 hook 函数，orig 取第一个）
+        IMP prev = method_getImplementation(m);
+        if (!orig_mediaSaveConfig) orig_mediaSaveConfig = (void *)prev;
+        method_setImplementation(m, (IMP)hook_mediaSaveConfig);
+        XHSLog(@"hook -mediaSaveConfig on %s", class_getName(cls));
+    }
+    free(list);
+}
+
+#pragma mark - 目标进程判断
+
+static BOOL XHSIsTarget(void) {
+    NSString *bid = [NSBundle mainBundle].bundleIdentifier ?: @"";
+    if ([bid isEqualToString:@"com.xingin.discover"]) return YES;
+    NSString *exe = [[NSBundle mainBundle].executablePath lastPathComponent] ?: @"";
+    if ([exe isEqualToString:@"discover"]) return YES;
+    // 空 bid 的极早构造阶段：先装 hook，无害
+    if (bid.length == 0) return YES;
+    return NO;
 }
 
 #pragma mark - Constructor
@@ -470,25 +265,24 @@ static void XHSScanClasses(void) {
 __attribute__((constructor))
 static void XHSImageSaveInit(void) {
     @autoreleasepool {
-        NSString *bid = [NSBundle mainBundle].bundleIdentifier ?: @"";
-        // Allow injection into discover; also tolerate missing bid during early load
-        if (bid.length && ![bid isEqualToString:@"com.xingin.discover"]) {
-            // still allow if executable is discover (TrollFools injects into app)
-            NSString *exe = [NSBundle mainBundle].executablePath.lastPathComponent ?: @"";
-            if (![exe isEqualToString:@"discover"]) {
-                return;
-            }
-        }
-        XHSLog(@"loaded bid=%@ pid=%d", bid, getpid());
-        XHSScanClasses();
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+        if (!XHSIsTarget()) return;
+        XHSLog(@"loaded pid=%d bid=%@", getpid(), [NSBundle mainBundle].bundleIdentifier);
+
+        XHSScanAndPatch();
+        XHSTryHookConfigKVC();
+        XHSHookMediaSaveConfigAccessors();
+
+        // Swift / 懒加载模块稍晚再补两刀（无 UI、无 toast）
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            XHSScanClasses();
-            [XHSFloatUI install];
+            XHSScanAndPatch();
+            XHSTryHookConfigKVC();
+            XHSHookMediaSaveConfigAccessors();
         });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            XHSScanClasses();
+            XHSScanAndPatch();
+            XHSHookMediaSaveConfigAccessors();
         });
     }
 }
