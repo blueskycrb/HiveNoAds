@@ -18,7 +18,7 @@
 | **Volunteer.dylib** | 志愿汇 | 可执行名 `Volunteer`（分析版本 5.8.4） | 去广告 |
 | **mCloud_iPhone.dylib** | 中国移动云盘 | `com.chinamobile.mcloud` / `mCloud_iPhone`（分析版本 13.0.0） | 去广告 |
 | **ChinaRadio.dylib** | 中国广电 / ChinaRadio | `com.cbn.app` / `ChinaRadio`（分析版本 2.0.8） | 去广告 |
-| **discover.dylib** | 小红书 | `com.xingin.discover` / `discover`（分析版本 9.38.1） | **图片保存/下载** |
+| **discover.dylib** | 小红书 | `com.xingin.discover` / `discover`（分析版本 9.38.1） | **图片+视频保存解锁** |
 
 ## 使用 (TrollFools)
 
@@ -78,17 +78,22 @@ apps/
 
 需要去广告的新 App：丢解密包 / IPA 里主二进制，或说明 Bundle ID，我按同样结构加 `apps/新名字/`。
 
-## 小红书 `discover.dylib`（解锁保存别人帖子图片）
+## 小红书 `discover.dylib`（解锁保存别人帖子图片 / 视频）
 
 **没有悬浮按钮、不会截图。** 只打开 App 自带的保存能力。
 
 1. 下载 [Releases](../../releases) 里的 **`discover.dylib`**
 2. TrollFools → 选 **小红书** → 注入（若已注入旧版，先移除再注新版）
 3. **彻底划掉**小红书再打开
-4. 打开别人图文笔记 → **长按图片** 或点分享 → 用系统/App 的 **「保存图片」**
-5. 设置 → 小红书 → 照片 → **允许添加**
+4. **图片**：别人图文笔记 → 长按图片 / 分享 → **保存图片**
+5. **视频**：别人视频笔记 → 分享 / 更多 → **保存视频**（走 App 原生下载）
+6. 设置 → 小红书 → 照片 → **允许添加**
 
-原理：强制 `XYPHMediaSaveConfig.disableSave = NO` 等开关。不破解付费图墙。
+原理：
+- 图片：`XYPHMediaSaveConfig.disableSave = NO`
+- 视频：`notAllowDownloadMyVideos = NO`、相关 allow/download 开关强制打开
+
+不破解付费图/视频墙；若服务端硬性禁止，入口可能仍不出现。
 
 ## 本地编译 (macOS)
 
