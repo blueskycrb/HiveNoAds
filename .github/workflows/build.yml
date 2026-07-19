@@ -93,12 +93,12 @@ jobs:
             3. 彻底杀掉 App 后冷启动
 
             ## 小红书 `discover.dylib`（无悬浮按钮、不截图）
-            - 强制 `disableSave=NO`，恢复原生「保存图片」
-            - 强制 `notAllowDownloadMyVideos=NO` 等，尽量恢复原生「保存视频」
-            - 图文：长按图片 / 分享 → 保存图片
-            - 视频：分享 / 更多 → 保存视频
+            - 强制 `disableSave=NO` + 作者隐私下载开关：
+              `hitUserNoteDownloadSwitch` / `userNoteDownloadSwitch` / `isFlowDownloadSwitchOn`
+            - 屏蔽 `checkShowCloseNoteDownloadSwitchToast` 及「作者关闭下载」类 toast
+            - 图文/视频走 App 原生「保存图片/保存视频」
             - 设置 → 小红书 → 照片 → 允许添加
-            - 不破解付费墙；若作者侧服务端硬拦，入口仍可能不出现
+            - 不破解付费墙；服务端硬拦时入口仍可能不出现
 
             ## v2 性能（去广告类）
             - 取消全进程类扫描（各 App 按自身实现）
