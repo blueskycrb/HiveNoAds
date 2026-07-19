@@ -79,10 +79,10 @@ jobs:
 
             | 文件 | 注入目标 | 功能 |
             |------|----------|------|
-            | `HiveConsumer.dylib` | 丰巢 (`com.fcbox.hiveconsumer`) | 去广告 |
+            | `HiveConsumer.dylib` | 蜜罐 (`com.fcbox.hiveconsumer`) | 去广告 |
             | `Cainiao4iPhone.dylib` | 菜鸟 (`com.cainiao.cnwireless`) | 去广告 |
             | `QTL.dylib` | 掌上英雄联盟 (`com.tencent.ied.app.lolbible`) | 去广告 |
-            | `Volunteer.dylib` | 志愿汇 (`Volunteer` 5.8.4) | 去广告 |
+            | `Volunteer.dylib` | 愿者汇 (`Volunteer` 5.8.4) | 去广告 |
             | `mCloud_iPhone.dylib` | 中国移动云盘 (`com.chinamobile.mcloud` / 13.0.0) | 去广告 |
             | `ChinaRadio.dylib` | 中国广电 (`com.cbn.app` / ChinaRadio 2.0.8) | 去广告 |
             | **`discover.dylib`** | **小红书** (`com.xingin.discover` / `discover` 9.38.1) | **解锁保存别人帖子图片/视频** |
@@ -92,10 +92,12 @@ jobs:
             2. TrollFools → 选择 App → 注入
             3. 彻底杀掉 App 后冷启动
 
-            ## 小红书 `discover.dylib`（无悬浮按钮、不截图）
+            ## 小红书 `discover.dylib`（无悬浮按钮、不截图，v4）
             - 强制 `disableSave=NO` + 作者隐私下载开关：
               `hitUserNoteDownloadSwitch` / `userNoteDownloadSwitch` / `isFlowDownloadSwitchOn`
-            - 屏蔽 `checkShowCloseNoteDownloadSwitchToast` 及「作者关闭下载」类 toast
+            - 屏蔽 `checkShowCloseNoteDownloadSwitchToast` 等「作者关闭下载」类 toast
+            - **NSJSONSerialization** + JSON 字节替换改写笔记响应下载开关
+            - `mediaSaveConfig` getter/setter 按类保存原 IMP，访问时强制允许保存
             - 图文/视频走 App 原生「保存图片/保存视频」
             - 设置 → 小红书 → 照片 → 允许添加
             - 不破解付费墙；服务端硬拦时入口仍可能不出现
@@ -104,6 +106,7 @@ jobs:
             - 取消全进程类扫描（各 App 按自身实现）
             - 取消 UIView 全局 swizzle
             - 默认关闭日志
+
           files: dist/*.dylib
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

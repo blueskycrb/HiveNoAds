@@ -89,9 +89,14 @@ apps/
 5. **视频**：别人视频笔记 → 分享 / 更多 → **保存视频**（走 App 原生下载）
 6. 设置 → 小红书 → 照片 → **允许添加**
 
-原理：
+### v4 原理（性能优先）
 - 图片：`XYPHMediaSaveConfig.disableSave = NO`
+- 作者隐私下载开关：`hitUserNoteDownloadSwitch` / `userNoteDownloadSwitch` / `isFlowDownloadSwitchOn`
 - 视频：`notAllowDownloadMyVideos = NO`、相关 allow/download 开关强制打开
+- 屏蔽 `checkShowCloseNoteDownloadSwitchToast` 等「作者已关闭下载」类 toast
+- **NSJSONSerialization** 解析结果 + 轻量 JSON 字节替换，改写笔记响应里的 `disable_save` / 下载开关
+- `mediaSaveConfig` getter/setter 按类保存原 IMP，访问时强制 config 允许保存
+- **不**做 NSObject 全局 KVC、**不**全表 toast 扫描（避免卡顿）
 
 不破解付费图/视频墙；若服务端硬性禁止，入口可能仍不出现。
 

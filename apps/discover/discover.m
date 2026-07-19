@@ -2,48 +2,49 @@
 // discover.dylib — 小红书：解锁别人帖子图片/视频保存（性能优先）
 // Bundle: com.xingin.discover | 可执行名: discover | 对照: 9.38.1
 //
-// v3 重要变更（修卡顿 + 仍下不了）:
-//   - 删除 NSObject 全局 setValue:forKey:（这是卡死滑动的主因）
-//   - 删除全 class list 扫 toast / 多次全量重扫
-//   - 启动只做一次轻量定点 hook
-//   - 在 NSURLSession 回调里改写笔记 JSON：disable_save / 下载开关
-//   - 用户点「保存」时若仍被拦，尽量放行已知保存入口
+// v4:
+//   - 继续避免 NSObject 全局 KVC / 全量 toast 扫描（卡顿主因）
+//   - NSJSONSerialization 解析结果改写下载开关（比只 hook NSURLSession block 更稳）
+//   - 保留轻量 JSON 字节替换，兜住不走 NSJSONSerialization 的响应
+//   - mediaSaveConfig getter/setter 按类保存原 IMP，定点强制 disableSave=NO
+//   - 仅对 XYPHMediaSaveConfig 做 KVC 拦截
+//   - 无悬浮按钮、不截图，走 App 原生「保存图片 / 保存视频」
 //
-// 无悬浮按钮、不截图。
-//
-
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <string.h>
 #import <pthread.h>
+#import <unistd.h>
 
 static const BOOL kVerbose = NO;
 #define LOG(fmt, ...) do { if (kVerbose) NSLog(@"[XHSMediaSave] " fmt, ##__VA_ARGS__); } while (0)
 
-#pragma mark - tiny helpers
+#pragma mark - target
 
 static BOOL XHSIsTarget(void) {
     static int cached = -1;
-    if (cached >= 0) return cached;
+    if (cached >= 0) return cached != 0;
     NSString *bid = [NSBundle mainBundle].bundleIdentifier ?: @"";
     NSString *exe = [[NSBundle mainBundle].executablePath lastPathComponent] ?: @"";
     cached = ([bid isEqualToString:@"com.xingin.discover"] ||
               [exe isEqualToString:@"discover"] ||
               bid.length == 0) ? 1 : 0;
-    return cached;
+    return cached != 0;
 }
 
-static BOOL XHS_retNO(id s, SEL c) { (void)s;(void)c; return NO; }
-static BOOL XHS_retYES(id s, SEL c) { (void)s;(void)c; return YES; }
-static id   XHS_retYesObj(id s, SEL c) { (void)s;(void)c; return @YES; }
-static id   XHS_retNoObj(id s, SEL c) { (void)s;(void)c; return @NO; }
-static void XHS_void0(id s, SEL c) { (void)s;(void)c; }
-static void XHS_setBoolDrop(id s, SEL c, BOOL v) { (void)s;(void)c;(void)v; }
+#pragma mark - bool / void stubs
+
+static BOOL XHS_retNO(id s, SEL c) { (void)s; (void)c; return NO; }
+static BOOL XHS_retYES(id s, SEL c) { (void)s; (void)c; return YES; }
+static id   XHS_retYesObj(id s, SEL c) { (void)s; (void)c; return @YES; }
+static id   XHS_retNoObj(id s, SEL c) { (void)s; (void)c; return @NO; }
+static void XHS_void0(id s, SEL c) { (void)s; (void)c; }
+static void XHS_setBoolDrop(id s, SEL c, BOOL v) { (void)s; (void)c; (void)v; }
 
 static void XHSPatchBool(Class cls, const char *selName, BOOL value) {
-    if (!cls) return;
+    if (!cls || !selName) return;
     SEL sel = sel_registerName(selName);
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) return;
@@ -59,7 +60,7 @@ static void XHSPatchBool(Class cls, const char *selName, BOOL value) {
 }
 
 static void XHSPatchVoid(Class cls, const char *selName) {
-    if (!cls) return;
+    if (!cls || !selName) return;
     Method m = class_getInstanceMethod(cls, sel_registerName(selName));
     if (!m) return;
     if (method_getNumberOfArguments(m) == 2) {
@@ -69,23 +70,71 @@ static void XHSPatchVoid(Class cls, const char *selName) {
 }
 
 static void XHSPatchSetterDrop(Class cls, const char *selName) {
-    if (!cls) return;
+    if (!cls || !selName) return;
     Method m = class_getInstanceMethod(cls, sel_registerName(selName));
     if (!m) return;
     method_setImplementation(m, (IMP)XHS_setBoolDrop);
 }
 
+static BOOL XHSNameLooksSaveProvider(const char *name) {
+    if (!name) return NO;
+    return strstr(name, "SaveProvider") ||
+           strstr(name, "ImageSave") ||
+           strstr(name, "SaveImage") ||
+           strstr(name, "NegativeFeedback") ||
+           strstr(name, "MediaSave");
+}
+
+static void XHSPatchKnownClass(Class cls);
+
+static void XHSForceConfigObject(id cfg) {
+    if (!cfg) return;
+    XHSPatchKnownClass(object_getClass(cfg));
+    @try {
+        SEL s = sel_registerName("setDisableSave:");
+        if ([cfg respondsToSelector:s]) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(cfg, s, NO);
+        }
+    } @catch (__unused NSException *e) {}
+    @try {
+        SEL s = sel_registerName("setForbidCopy:");
+        if ([cfg respondsToSelector:s]) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(cfg, s, NO);
+        }
+    } @catch (__unused NSException *e) {}
+    @try {
+        SEL s = sel_registerName("setDisableWatermark:");
+        if ([cfg respondsToSelector:s]) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(cfg, s, YES);
+        }
+    } @catch (__unused NSException *e) {}
+    @try {
+        if ([cfg respondsToSelector:@selector(setValue:forKey:)]) {
+            [cfg setValue:@NO forKey:@"disableSave"];
+            [cfg setValue:@NO forKey:@"disable_save"];
+            [cfg setValue:@NO forKey:@"forbidCopy"];
+            [cfg setValue:@YES forKey:@"disableWatermark"];
+        }
+    } @catch (__unused NSException *e) {}
+}
+
 static void XHSPatchKnownClass(Class cls) {
     if (!cls) return;
-    // 禁止保存 → 允许
+
+    // disableSave -> allow
     XHSPatchBool(cls, "disableSave", NO);
     XHSPatchBool(cls, "isDisableSave", NO);
     XHSPatchBool(cls, "forbidCopy", NO);
     XHSPatchBool(cls, "disableCopy", NO);
+    XHSPatchBool(cls, "disableCopyAction", NO);
+    // author download switch
+    XHSPatchBool(cls, "disableWatermark", YES);
+    XHSPatchBool(cls, "disableWatermarkWhenSavingAlbum", YES);
     XHSPatchSetterDrop(cls, "setDisableSave:");
     XHSPatchSetterDrop(cls, "setForbidCopy:");
+    XHSPatchSetterDrop(cls, "setDisableCopy:");
 
-    // 作者关闭下载相关（命中=NO，开关=YES）
+    // watermark-related flags if present
     XHSPatchBool(cls, "hitUserNoteDownloadSwitch", NO);
     XHSPatchBool(cls, "hitRacingUserNoteDownloadSwitch", NO);
     XHSPatchBool(cls, "userNoteDownloadSwitch", YES);
@@ -96,32 +145,41 @@ static void XHSPatchKnownClass(Class cls) {
     XHSPatchBool(cls, "shareVideoSaveEnable", YES);
     XHSPatchBool(cls, "userVideoDownloadSwitch", YES);
     XHSPatchBool(cls, "videoDownloadSwitch", YES);
-    XHSPatchBool(cls, "enable", YES); // SaveProvider 等
+    XHSPatchBool(cls, "mobileDownloadSwitch", YES);
+    XHSPatchBool(cls, "enableSave", YES);
+    XHSPatchBool(cls, "saveEnable", YES);
+
+    // enable only for save-related classes
+    if (XHSNameLooksSaveProvider(class_getName(cls))) {
+        XHSPatchBool(cls, "enable", YES);
+    }
 
     XHSPatchVoid(cls, "checkShowCloseNoteDownloadSwitchToast");
     XHSPatchSetterDrop(cls, "setNotAllowDownloadMyVideos:");
+    XHSPatchSetterDrop(cls, "setHitUserNoteDownloadSwitch:");
+    XHSPatchSetterDrop(cls, "setHitRacingUserNoteDownloadSwitch:");
 }
 
-#pragma mark - 一次定点 hook（不反复全表扫描）
+#pragma mark - once class hooks
 
 static void XHSInstallClassHooks(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        // 1) 已知类名直接 hook
         const char *known[] = {
             "XYPHMediaSaveConfig",
             "XYVFVideoDownloaderManager",
             "XYNoteFeedbackFloatingConfig",
             "_TtC18XYNegativeFeedback12SaveProvider",
             "SaveProvider",
+            "_TtC12XYNoteModule16ImageSaveService",
+            "ImageSaveService",
             NULL
         };
         for (const char **p = known; *p; p++) {
             XHSPatchKnownClass(objc_getClass(*p));
         }
 
-        // 2) 单次扫描：只处理「带关键 selector」的类，做完即停
-        //    不做 toast 全表 hook，不重复扫
+        // one-shot scan for key selectors
         unsigned int n = 0;
         Class *list = objc_copyClassList(&n);
         if (!list) return;
@@ -135,11 +193,10 @@ static void XHSInstallClassHooks(void) {
                 class_getInstanceMethod(cls, sel_registerName("userNoteDownloadSwitch")) ||
                 class_getInstanceMethod(cls, sel_registerName("checkShowCloseNoteDownloadSwitchToast")) ||
                 class_getInstanceMethod(cls, sel_registerName("notAllowDownloadMyVideos")) ||
-                class_getInstanceMethod(cls, sel_registerName("shareImageSaveEnable"))) {
+                class_getInstanceMethod(cls, sel_registerName("shareImageSaveEnable")) ||
+                class_getInstanceMethod(cls, sel_registerName("shareVideoSaveEnable"))) {
                 XHSPatchKnownClass(cls);
-                patched++;
-                // 安全上限，避免异常环境扫爆
-                if (patched > 80) break;
+                if (++patched > 100) break;
             }
         }
         free(list);
@@ -147,44 +204,182 @@ static void XHSInstallClassHooks(void) {
     });
 }
 
-#pragma mark - JSON 响应改写（真正让「作者关闭下载」字段变允许）
+#pragma mark - object tree rewrite (NSJSONSerialization path)
 
-// 仅做 ASCII 子串替换，避免解析整棵 JSON 树（快）
-static NSData *XHSPatchNoteJSON(NSData *data) {
-    if (data.length < 32 || data.length > 8 * 1024 * 1024) return data;
+static BOOL XHSLooksTruthy(id v) {
+    if (!v || v == [NSNull null]) return NO;
+    if ([v isKindOfClass:[NSNumber class]]) return [(NSNumber *)v boolValue];
+    if ([v isKindOfClass:[NSString class]]) {
+        NSString *s = [(NSString *)v lowercaseString];
+        return [s isEqualToString:@"1"] || [s isEqualToString:@"true"] || [s isEqualToString:@"yes"];
+    }
+    return NO;
+}
 
-    // 快速过滤：不像笔记/保存相关响应就跳过
-    static NSData *k1, *k2, *k3, *k4, *k5, *k6, *k7, *k8;
-    static dispatch_once_t onceKeys;
-    dispatch_once(&onceKeys, ^{
-        k1 = [@"disable_save" dataUsingEncoding:NSUTF8StringEncoding];
-        k2 = [@"disableSave" dataUsingEncoding:NSUTF8StringEncoding];
-        k3 = [@"media_save_config" dataUsingEncoding:NSUTF8StringEncoding];
-        k4 = [@"user_video_download_switch" dataUsingEncoding:NSUTF8StringEncoding];
-        k5 = [@"userNoteDownloadSwitch" dataUsingEncoding:NSUTF8StringEncoding];
-        k6 = [@"hitUserNoteDownloadSwitch" dataUsingEncoding:NSUTF8StringEncoding];
-        k7 = [@"notAllowDownloadMyVideos" dataUsingEncoding:NSUTF8StringEncoding];
-        k8 = [@"shareImageSaveEnable" dataUsingEncoding:NSUTF8StringEncoding];
-    });
-    NSRange full = NSMakeRange(0, data.length);
-    if ([data rangeOfData:k1 options:0 range:full].location == NSNotFound &&
-        [data rangeOfData:k2 options:0 range:full].location == NSNotFound &&
-        [data rangeOfData:k3 options:0 range:full].location == NSNotFound &&
-        [data rangeOfData:k4 options:0 range:full].location == NSNotFound &&
-        [data rangeOfData:k5 options:0 range:full].location == NSNotFound &&
-        [data rangeOfData:k6 options:0 range:full].location == NSNotFound &&
-        [data rangeOfData:k7 options:0 range:full].location == NSNotFound &&
-        [data rangeOfData:k8 options:0 range:full].location == NSNotFound) {
-        return data;
+static BOOL XHSLooksFalsey(id v) {
+    if (!v || v == [NSNull null]) return YES;
+    if ([v isKindOfClass:[NSNumber class]]) return ![(NSNumber *)v boolValue];
+    if ([v isKindOfClass:[NSString class]]) {
+        NSString *s = [(NSString *)v lowercaseString];
+        return [s isEqualToString:@"0"] || [s isEqualToString:@"false"] || [s isEqualToString:@"no"] || s.length == 0;
+    }
+    return NO;
+}
+
+static BOOL XHSPatchObjectTree(id obj, NSInteger depth) {
+    if (!obj || depth > 8) return NO;
+    BOOL changed = NO;
+
+    if ([obj isKindOfClass:[NSMutableDictionary class]]) {
+        NSMutableDictionary *md = (NSMutableDictionary *)obj;
+        static NSSet<NSString *> *forceFalse;
+        static NSSet<NSString *> *forceTrue;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            forceFalse = [NSSet setWithArray:@[
+                @"disable_save", @"disableSave",
+                @"forbid_copy", @"forbidCopy",
+                @"hitUserNoteDownloadSwitch", @"hit_user_note_download_switch",
+                @"hitRacingUserNoteDownloadSwitch", @"hit_racing_user_note_download_switch",
+                @"notAllowDownloadMyVideos", @"not_allow_download_my_videos",
+            ]];
+            forceTrue = [NSSet setWithArray:@[
+                @"userNoteDownloadSwitch", @"user_note_download_switch",
+                @"userVideoDownloadSwitch", @"user_video_download_switch",
+                @"isFlowDownloadSwitchOn", @"is_flow_download_switch_on",
+                @"shareImageSaveEnable", @"share_image_save_enable",
+                @"shareVideoSaveEnable", @"share_video_save_enable",
+                @"allowDownload", @"allow_download",
+                @"mobile_download_switch", @"mobileDownloadSwitch",
+                @"videoDownloadSwitch", @"video_download_switch",
+                @"disable_watermark", @"disableWatermark",
+                @"disableWatermarkWhenSavingAlbum",
+                @"enableSave", @"saveEnable",
+            ]];
+        });
+
+        NSArray *keys = md.allKeys;
+        for (id key in keys) {
+            if (![key isKindOfClass:[NSString class]]) continue;
+            NSString *k = (NSString *)key;
+            id val = md[k];
+
+            if ([forceFalse containsObject:k] && XHSLooksTruthy(val)) {
+                md[k] = @NO;
+                changed = YES;
+            } else if ([forceTrue containsObject:k] && XHSLooksFalsey(val)) {
+                md[k] = @YES;
+                changed = YES;
+            } else if ([val isKindOfClass:[NSDictionary class]] ||
+                       [val isKindOfClass:[NSArray class]]) {
+                if ([val isKindOfClass:[NSDictionary class]] &&
+                    ![val isKindOfClass:[NSMutableDictionary class]]) {
+                    NSMutableDictionary *child = [val mutableCopy];
+                    if (XHSPatchObjectTree(child, depth + 1)) {
+                        md[k] = child;
+                        changed = YES;
+                    }
+                } else if ([val isKindOfClass:[NSArray class]] &&
+                           ![val isKindOfClass:[NSMutableArray class]]) {
+                    NSMutableArray *child = [val mutableCopy];
+                    if (XHSPatchObjectTree(child, depth + 1)) {
+                        md[k] = child;
+                        changed = YES;
+                    }
+                } else {
+                    if (XHSPatchObjectTree(val, depth + 1)) changed = YES;
+                }
+            }
+        }
+        return changed;
     }
 
-    NSMutableData *md = [data mutableCopy];
-    NSString *s = [[NSString alloc] initWithData:md encoding:NSUTF8StringEncoding];
+    if ([obj isKindOfClass:[NSMutableArray class]]) {
+        NSMutableArray *ma = (NSMutableArray *)obj;
+        for (NSUInteger i = 0; i < ma.count; i++) {
+            id val = ma[i];
+            if ([val isKindOfClass:[NSDictionary class]] &&
+                ![val isKindOfClass:[NSMutableDictionary class]]) {
+                NSMutableDictionary *child = [val mutableCopy];
+                if (XHSPatchObjectTree(child, depth + 1)) {
+                    ma[i] = child;
+                    changed = YES;
+                }
+            } else if ([val isKindOfClass:[NSArray class]] &&
+                       ![val isKindOfClass:[NSMutableArray class]]) {
+                NSMutableArray *child = [val mutableCopy];
+                if (XHSPatchObjectTree(child, depth + 1)) {
+                    ma[i] = child;
+                    changed = YES;
+                }
+            } else if ([val isKindOfClass:[NSMutableDictionary class]] ||
+                       [val isKindOfClass:[NSMutableArray class]]) {
+                if (XHSPatchObjectTree(val, depth + 1)) changed = YES;
+            }
+        }
+        return changed;
+    }
+
+    return NO;
+}
+
+static id XHSMaybePatchJSONObject(id obj) {
+    if (!obj) return obj;
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *md = [obj mutableCopy];
+        if (XHSPatchObjectTree(md, 0)) {
+            LOG(@"json object dict patched");
+            return md;
+        }
+        return obj;
+    }
+    if ([obj isKindOfClass:[NSArray class]]) {
+        NSMutableArray *ma = [obj mutableCopy];
+        if (XHSPatchObjectTree(ma, 0)) {
+            LOG(@"json object array patched");
+            return ma;
+        }
+        return obj;
+    }
+    return obj;
+}
+
+#pragma mark - raw JSON bytes patch (fallback)
+
+static BOOL XHSDataLooksRelated(NSData *data) {
+    if (data.length < 32 || data.length > 8 * 1024 * 1024) return NO;
+    static NSArray<NSData *> *needles;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        needles = @[
+            [@"disable_save" dataUsingEncoding:NSUTF8StringEncoding],
+            [@"disableSave" dataUsingEncoding:NSUTF8StringEncoding],
+            [@"media_save_config" dataUsingEncoding:NSUTF8StringEncoding],
+            [@"mediaSaveConfig" dataUsingEncoding:NSUTF8StringEncoding],
+            [@"user_video_download_switch" dataUsingEncoding:NSUTF8StringEncoding],
+            [@"userNoteDownloadSwitch" dataUsingEncoding:NSUTF8StringEncoding],
+            [@"hitUserNoteDownloadSwitch" dataUsingEncoding:NSUTF8StringEncoding],
+            [@"notAllowDownloadMyVideos" dataUsingEncoding:NSUTF8StringEncoding],
+            [@"shareImageSaveEnable" dataUsingEncoding:NSUTF8StringEncoding],
+            [@"share_image_save_enable" dataUsingEncoding:NSUTF8StringEncoding],
+            [@"allow_download" dataUsingEncoding:NSUTF8StringEncoding],
+            [@"capa_allow_download" dataUsingEncoding:NSUTF8StringEncoding],
+        ];
+    });
+    NSRange full = NSMakeRange(0, data.length);
+    for (NSData *n in needles) {
+        if ([data rangeOfData:n options:0 range:full].location != NSNotFound) return YES;
+    }
+    return NO;
+}
+
+static NSData *XHSPatchNoteJSONBytes(NSData *data) {
+    if (!XHSDataLooksRelated(data)) return data;
+
+    NSString *s = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     if (!s) return data;
 
-    // 布尔 true/false 与 1/0 都改
     NSArray<NSArray<NSString *> *> *pairs = @[
-        // 禁止 → 允许
         @[@"\"disable_save\":true",  @"\"disable_save\":false"],
         @[@"\"disable_save\": true", @"\"disable_save\": false"],
         @[@"\"disableSave\":true",   @"\"disableSave\":false"],
@@ -194,19 +389,18 @@ static NSData *XHSPatchNoteJSON(NSData *data) {
 
         @[@"\"forbid_copy\":true",   @"\"forbid_copy\":false"],
         @[@"\"forbidCopy\":true",    @"\"forbidCopy\":false"],
+        @[@"\"forbidCopy\": true",   @"\"forbidCopy\": false"],
 
-        // 命中「关闭下载」→ 未命中
         @[@"\"hitUserNoteDownloadSwitch\":true",  @"\"hitUserNoteDownloadSwitch\":false"],
         @[@"\"hitUserNoteDownloadSwitch\": true", @"\"hitUserNoteDownloadSwitch\": false"],
         @[@"\"hitRacingUserNoteDownloadSwitch\":true",  @"\"hitRacingUserNoteDownloadSwitch\":false"],
         @[@"\"hitRacingUserNoteDownloadSwitch\": true", @"\"hitRacingUserNoteDownloadSwitch\": false"],
 
-        // 不允许下载我的视频 → 允许
         @[@"\"notAllowDownloadMyVideos\":true",  @"\"notAllowDownloadMyVideos\":false"],
+        @[@"\"notAllowDownloadMyVideos\": true", @"\"notAllowDownloadMyVideos\": false"],
         @[@"\"not_allow_download_my_videos\":true", @"\"not_allow_download_my_videos\":false"],
         @[@"\"notAllowDownloadMyVideos\":1", @"\"notAllowDownloadMyVideos\":0"],
 
-        // 开关类：强制开
         @[@"\"userNoteDownloadSwitch\":false",  @"\"userNoteDownloadSwitch\":true"],
         @[@"\"userNoteDownloadSwitch\": false", @"\"userNoteDownloadSwitch\": true"],
         @[@"\"user_note_download_switch\":false", @"\"user_note_download_switch\":true"],
@@ -216,9 +410,14 @@ static NSData *XHSPatchNoteJSON(NSData *data) {
         @[@"\"isFlowDownloadSwitchOn\":false", @"\"isFlowDownloadSwitchOn\":true"],
         @[@"\"shareImageSaveEnable\":false", @"\"shareImageSaveEnable\":true"],
         @[@"\"share_image_save_enable\":false", @"\"share_image_save_enable\":true"],
+        @[@"\"shareVideoSaveEnable\":false", @"\"shareVideoSaveEnable\":true"],
         @[@"\"allowDownload\":false", @"\"allowDownload\":true"],
         @[@"\"allow_download\":false", @"\"allow_download\":true"],
         @[@"\"mobile_download_switch\":false", @"\"mobile_download_switch\":true"],
+        @[@"\"disable_watermark\":false", @"\"disable_watermark\":true"],
+        @[@"\"disableWatermark\":false", @"\"disableWatermark\":true"],
+        @[@"\"enableSave\":false", @"\"enableSave\":true"],
+        @[@"\"saveEnable\":false", @"\"saveEnable\":true"],
     ];
 
     NSString *out = s;
@@ -230,29 +429,57 @@ static NSData *XHSPatchNoteJSON(NSData *data) {
         }
     }
     if (!changed) return data;
-
     NSData *nd = [out dataUsingEncoding:NSUTF8StringEncoding];
-    LOG(@"json patched %lu -> %lu", (unsigned long)data.length, (unsigned long)nd.length);
+    LOG(@"json bytes patched %lu -> %lu", (unsigned long)data.length, (unsigned long)nd.length);
     return nd ?: data;
 }
 
-#pragma mark - NSURLSession data task hook（轻量）
+#pragma mark - NSJSONSerialization hook
 
-// 只 hook -[NSURLSession dataTaskWithRequest:completionHandler:]
-// 在 completion 里改 data，不影响主线程滑动
+static id (*orig_JSONObjectWithData)(id, SEL, NSData *, NSJSONReadingOptions, NSError **);
+
+static id hook_JSONObjectWithData(id self, SEL _cmd, NSData *data, NSJSONReadingOptions opt, NSError **err) {
+    NSData *use = data;
+    if (data.length) {
+        @try { use = XHSPatchNoteJSONBytes(data); }
+        @catch (__unused NSException *e) { use = data; }
+    }
+    NSJSONReadingOptions o2 = opt | NSJSONReadingMutableContainers;
+    id obj = orig_JSONObjectWithData ? orig_JSONObjectWithData(self, _cmd, use, o2, err) : nil;
+    if (!obj) return obj;
+    @try {
+        id patched = XHSMaybePatchJSONObject(obj);
+        return patched ?: obj;
+    } @catch (__unused NSException *e) {
+        return obj;
+    }
+}
+
+static void XHSInstallJSONHook(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class cls = objc_getClass("NSJSONSerialization");
+        if (!cls) return;
+        SEL sel = @selector(JSONObjectWithData:options:error:);
+        Method m = class_getClassMethod(cls, sel);
+        if (!m) return;
+        orig_JSONObjectWithData = (void *)method_getImplementation(m);
+        method_setImplementation(m, (IMP)hook_JSONObjectWithData);
+        LOG(@"NSJSONSerialization hooked");
+    });
+}
+
+#pragma mark - NSURLSession dataTask completion (secondary)
 
 typedef void (^XHSDataCompletion)(NSData *, NSURLResponse *, NSError *);
-
 static id (*orig_dataTask)(id, SEL, NSURLRequest *, XHSDataCompletion);
 
 static id hook_dataTask(id self, SEL _cmd, NSURLRequest *req, XHSDataCompletion completion) {
-    if (!completion) {
-        return orig_dataTask(self, _cmd, req, completion);
-    }
+    if (!completion) return orig_dataTask(self, _cmd, req, completion);
     XHSDataCompletion wrapped = ^(NSData *data, NSURLResponse *resp, NSError *err) {
         NSData *patched = data;
         if (!err && data.length) {
-            @try { patched = XHSPatchNoteJSON(data); }
+            @try { patched = XHSPatchNoteJSONBytes(data); }
             @catch (__unused NSException *e) { patched = data; }
         }
         completion(patched, resp, err);
@@ -274,80 +501,135 @@ static void XHSInstallSessionHook(void) {
     });
 }
 
-// 部分请求走 dataTaskWithRequest: 无 block，或 ephemeral 子类
-// 再 hook NSConcreteURLSession 若存在
-static void XHSInstallSessionHookSubclasses(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        // __NSCFURLSession 等
-        unsigned int n = 0;
-        Class *list = objc_copyClassList(&n);
-        if (!list) return;
-        SEL sel = @selector(dataTaskWithRequest:completionHandler:);
-        unsigned hooked = 0;
-        for (unsigned int i = 0; i < n && hooked < 6; i++) {
-            Class cls = list[i];
-            const char *name = class_getName(cls);
-            if (!name) continue;
-            if (!strstr(name, "URLSession") && !strstr(name, "NSURLSession")) continue;
-            Method m = class_getInstanceMethod(cls, sel);
-            if (!m) continue;
-            // 若实现与已 hook 的相同则跳过
-            IMP cur = method_getImplementation(m);
-            if (cur == (IMP)hook_dataTask) continue;
-            // 只在还没保存 orig 时用第一个；子类若有自己的 IMP 也包一层
-            if (!orig_dataTask) orig_dataTask = (void *)cur;
-            // 子类独立 orig：用关联存储太重；统一走到 hook_dataTask 再调 orig_dataTask
-            // 若子类 IMP != orig，需要各自保存 — 简化：只 hook NSURLSession 基类即可覆盖多数
-            if (cls == [NSURLSession class] || strstr(name, "NSURLSession")) {
-                method_setImplementation(m, (IMP)hook_dataTask);
-                hooked++;
-            }
-        }
-        free(list);
-        LOG(@"session subclasses hooked=%u", hooked);
-    });
+#pragma mark - mediaSaveConfig getter / setter
+
+static const void *kXHSOrigGetKey = &kXHSOrigGetKey;
+static const void *kXHSOrigSetKey = &kXHSOrigSetKey;
+
+static IMP XHSLoadOrigIMP(Class cls, const void *key) {
+    if (!cls) return NULL;
+    NSValue *v = objc_getAssociatedObject((id)cls, key);
+    return v ? (IMP)v.pointerValue : NULL;
 }
 
-#pragma mark - mediaSaveConfig 访问时强制清 disableSave（定点）
+static void XHSStoreOrigIMP(Class cls, const void *key, IMP imp) {
+    if (!cls || !imp) return;
+    objc_setAssociatedObject((id)cls, key, [NSValue valueWithPointer:imp], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
 
-static id (*orig_msc)(id, SEL);
-static id hook_msc(id self, SEL _cmd) {
-    id cfg = orig_msc ? orig_msc(self, _cmd) : nil;
-    if (!cfg) return cfg;
-    Class c = object_getClass(cfg);
-    XHSPatchKnownClass(c);
-    @try {
-        SEL s = sel_registerName("setDisableSave:");
-        if ([cfg respondsToSelector:s]) {
-            ((void (*)(id, SEL, BOOL))objc_msgSend)(cfg, s, NO);
-        }
-    } @catch (__unused NSException *e) {}
+static id hook_msc_get(id self, SEL _cmd) {
+    Class cls = object_getClass(self);
+    IMP orig = XHSLoadOrigIMP(cls, kXHSOrigGetKey);
+    // walk superclass chain if subclass has no stored IMP
+    while (!orig && cls) {
+        cls = class_getSuperclass(cls);
+        orig = XHSLoadOrigIMP(cls, kXHSOrigGetKey);
+    }
+    id cfg = orig ? ((id (*)(id, SEL))orig)(self, _cmd) : nil;
+    XHSForceConfigObject(cfg);
     return cfg;
 }
 
-static void XHSInstallMediaSaveConfigGetter(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        // 只 hook 几个名字像 Note / Video 的类上的 mediaSaveConfig
-        unsigned int n = 0;
-        Class *list = objc_copyClassList(&n);
-        if (!list) return;
-        unsigned hooked = 0;
-        for (unsigned int i = 0; i < n && hooked < 30; i++) {
-            Class cls = list[i];
-            Method m = class_getInstanceMethod(cls, sel_registerName("mediaSaveConfig"));
-            if (!m) continue;
-            const char *t = method_getTypeEncoding(m);
-            if (!t || t[0] != '@') continue;
-            IMP prev = method_getImplementation(m);
-            if (!orig_msc) orig_msc = (void *)prev;
-            method_setImplementation(m, (IMP)hook_msc);
-            hooked++;
+static void hook_msc_set(id self, SEL _cmd, id cfg) {
+    XHSForceConfigObject(cfg);
+    Class cls = object_getClass(self);
+    IMP orig = XHSLoadOrigIMP(cls, kXHSOrigSetKey);
+    while (!orig && cls) {
+        cls = class_getSuperclass(cls);
+        orig = XHSLoadOrigIMP(cls, kXHSOrigSetKey);
+    }
+    if (orig) {
+        ((void (*)(id, SEL, id))orig)(self, _cmd, cfg);
+    }
+}
+
+// XYPHMediaSaveConfig KVC: force disableSave=NO
+static void (*orig_cfg_setValue)(id, SEL, id, NSString *);
+static void hook_cfg_setValue(id self, SEL _cmd, id value, NSString *key) {
+    if ([key isKindOfClass:[NSString class]]) {
+        NSString *k = key.lowercaseString;
+        if ([k isEqualToString:@"disablesave"] ||
+            [k isEqualToString:@"disable_save"] ||
+            [k isEqualToString:@"forbidcopy"] ||
+            [k isEqualToString:@"forbid_copy"]) {
+            value = @NO;
         }
-        free(list);
-        LOG(@"mediaSaveConfig getters=%u", hooked);
-    });
+        if ([k containsString:@"hitusernotedownloadswitch"] ||
+            [k containsString:@"notallowdownload"]) {
+            value = @NO;
+        }
+        if ([k containsString:@"usernotedownloadswitch"] ||
+            [k containsString:@"shareimagesaveenable"] ||
+            [k containsString:@"allowdownload"] ||
+            [k containsString:@"disablewatermark"] ||
+            [k isEqualToString:@"isflowdownloadswitchon"]) {
+            value = @YES;
+        }
+    }
+    if (orig_cfg_setValue) orig_cfg_setValue(self, _cmd, value, key);
+}
+
+static BOOL XHSNameLooksNoteMedia(const char *name) {
+    if (!name) return NO;
+    return strstr(name, "Note") || strstr(name, "Video") || strstr(name, "Feed") ||
+           strstr(name, "XYPH") || strstr(name, "XYVF") || strstr(name, "Share") ||
+           strstr(name, "Media") || strstr(name, "ImageSave");
+}
+
+static void XHSInstallMediaSaveConfigHooks(void) {
+    Class cfgCls = objc_getClass("XYPHMediaSaveConfig");
+    if (cfgCls) {
+        XHSPatchKnownClass(cfgCls);
+        Method m = class_getInstanceMethod(cfgCls, @selector(setValue:forKey:));
+        if (m) {
+            IMP cur = method_getImplementation(m);
+            if (cur != (IMP)hook_cfg_setValue) {
+                orig_cfg_setValue = (void *)cur;
+                method_setImplementation(m, (IMP)hook_cfg_setValue);
+                LOG(@"XYPHMediaSaveConfig setValue:forKey: hooked");
+            }
+        }
+    }
+
+    unsigned int n = 0;
+    Class *list = objc_copyClassList(&n);
+    if (!list) return;
+    unsigned g = 0, s = 0;
+    for (unsigned int i = 0; i < n && (g < 32 || s < 32); i++) {
+        Class cls = list[i];
+        const char *name = class_getName(cls);
+        if (!XHSNameLooksNoteMedia(name)) continue;
+
+        Method gm = class_getInstanceMethod(cls, sel_registerName("mediaSaveConfig"));
+        if (gm && g < 32) {
+            const char *enc = method_getTypeEncoding(gm);
+            IMP prev = method_getImplementation(gm);
+            if (enc && enc[0] == '@' && prev && prev != (IMP)hook_msc_get) {
+                Method superM = class_getInstanceMethod(class_getSuperclass(cls), sel_registerName("mediaSaveConfig"));
+                if (!superM || method_getImplementation(gm) != method_getImplementation(superM) || class_getSuperclass(cls) == Nil) {
+                    XHSStoreOrigIMP(cls, kXHSOrigGetKey, prev);
+                    method_setImplementation(gm, (IMP)hook_msc_get);
+                    g++;
+                }
+            }
+        }
+
+        Method sm = class_getInstanceMethod(cls, sel_registerName("setMediaSaveConfig:"));
+        if (sm && s < 32) {
+            const char *enc = method_getTypeEncoding(sm);
+            IMP prev = method_getImplementation(sm);
+            if (enc && enc[0] == 'v' && prev && prev != (IMP)hook_msc_set) {
+                Method superM = class_getInstanceMethod(class_getSuperclass(cls), sel_registerName("setMediaSaveConfig:"));
+                if (!superM || method_getImplementation(sm) != method_getImplementation(superM) || class_getSuperclass(cls) == Nil) {
+                    XHSStoreOrigIMP(cls, kXHSOrigSetKey, prev);
+                    method_setImplementation(sm, (IMP)hook_msc_set);
+                    s++;
+                }
+            }
+        }
+    }
+    free(list);
+    LOG(@"mediaSaveConfig get=%u set=%u", g, s);
 }
 
 #pragma mark - ctor
@@ -356,22 +638,21 @@ __attribute__((constructor))
 static void XHSInit(void) {
     @autoreleasepool {
         if (!XHSIsTarget()) return;
-        LOG(@"v3 load pid=%d", getpid());
+        LOG(@"v4 load pid=%d", getpid());
 
-        // 全部 once，不在滑动路径上反复扫
         XHSInstallClassHooks();
+        XHSInstallJSONHook();
         XHSInstallSessionHook();
-        XHSInstallSessionHookSubclasses();
-        XHSInstallMediaSaveConfigGetter();
+        XHSInstallMediaSaveConfigHooks();
 
-        // 仅一次延迟补丁：等 Swift 类注册（不扫 toast、不 hook NSObject）
+        // one delayed pass after Swift classes register
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            // 再试已知类（once 内已保护 class hooks；这里只补 known 名）
             XHSPatchKnownClass(objc_getClass("XYPHMediaSaveConfig"));
             XHSPatchKnownClass(objc_getClass("_TtC18XYNegativeFeedback12SaveProvider"));
-            XHSInstallMediaSaveConfigGetter();
-            LOG(@"v3 delayed patch");
+            XHSPatchKnownClass(objc_getClass("_TtC12XYNoteModule16ImageSaveService"));
+            XHSInstallMediaSaveConfigHooks();
+            LOG(@"v4 delayed patch");
         });
     }
 }
