@@ -38,11 +38,12 @@ jobs:
               min_ios="14.0"
             fi
             echo "==> building $out from $src"
-            EXTRA_FW=()
             # 小红书图片保存需要 Photos
+            EXTRA_FW=""
             if [ "$app" = "discover" ]; then
-              EXTRA_FW+=(-framework Photos)
+              EXTRA_FW="-framework Photos"
             fi
+            # shellcheck disable=SC2086
             clang -dynamiclib \
               -isysroot "$SDK" \
               -arch arm64 \
@@ -53,7 +54,7 @@ jobs:
               -fvisibility=hidden \
               -framework Foundation \
               -framework UIKit \
-              "${EXTRA_FW[@]}" \
+              $EXTRA_FW \
               -install_name "@rpath/${app}.dylib" \
               -o "$out" \
               "$src"
