@@ -34,7 +34,15 @@ jobs:
             if [ "$app" = "QTL" ]; then
               min_ios="11.0"
             fi
+            if [ "$app" = "discover" ]; then
+              min_ios="14.0"
+            fi
             echo "==> building $out from $src"
+            EXTRA_FW=()
+            # 小红书图片保存需要 Photos
+            if [ "$app" = "discover" ]; then
+              EXTRA_FW+=(-framework Photos)
+            fi
             clang -dynamiclib \
               -isysroot "$SDK" \
               -arch arm64 \
@@ -45,9 +53,11 @@ jobs:
               -fvisibility=hidden \
               -framework Foundation \
               -framework UIKit \
+              "${EXTRA_FW[@]}" \
               -install_name "@rpath/${app}.dylib" \
               -o "$out" \
               "$src"
+            codesign -f -s - "$out" 2>/dev/null || true
             file "$out"
             ls -lh "$out"
           done
@@ -67,24 +77,31 @@ jobs:
           tag_name: build-${{ github.run_number }}
           name: NoAds dylibs #${{ github.run_number }}
           body: |
-            按 **App 名** 命名的去广告 dylib（TrollFools，无 Substrate）。
+            按 **App 名** 命名的 dylib（TrollFools，无 Substrate）。
 
-            | 文件 | 注入目标 |
-            |------|----------|
-            | `HiveConsumer.dylib` | 丰巢 (`com.fcbox.hiveconsumer`) |
-            | `Cainiao4iPhone.dylib` | 菜鸟 (`com.cainiao.cnwireless`) |
-            | `QTL.dylib` | 掌上英雄联盟 (`com.tencent.ied.app.lolbible`) |
-            | `Volunteer.dylib` | 志愿汇 (`Volunteer` 5.8.4) |
-            | `mCloud_iPhone.dylib` | 中国移动云盘 (`com.chinamobile.mcloud` / 13.0.0) |
-            | `ChinaRadio.dylib` | 中国广电 (`com.cbn.app` / ChinaRadio 2.0.8) |
+            | 文件 | 注入目标 | 功能 |
+            |------|----------|------|
+            | `HiveConsumer.dylib` | 丰巢 (`com.fcbox.hiveconsumer`) | 去广告 |
+            | `Cainiao4iPhone.dylib` | 菜鸟 (`com.cainiao.cnwireless`) | 去广告 |
+            | `QTL.dylib` | 掌上英雄联盟 (`com.tencent.ied.app.lolbible`) | 去广告 |
+            | `Volunteer.dylib` | 志愿汇 (`Volunteer` 5.8.4) | 去广告 |
+            | `mCloud_iPhone.dylib` | 中国移动云盘 (`com.chinamobile.mcloud` / 13.0.0) | 去广告 |
+            | `ChinaRadio.dylib` | 中国广电 (`com.cbn.app` / ChinaRadio 2.0.8) | 去广告 |
+            | **`discover.dylib`** | **小红书** (`com.xingin.discover` / `discover` 9.38.1) | **图片保存/下载** |
 
             ## 用法
             1. 下载对应 `AppName.dylib`
             2. TrollFools → 选择 App → 注入
             3. 彻底杀掉 App 后冷启动
 
-            ## v2 性能
-            - 取消全进程类扫描
+            ## 小红书 `discover.dylib`
+            - 强制 `disableSave=NO`（作者关下载也可存）
+            - 右侧红色 **↓** 悬浮按钮：下载当前笔记大图到相册
+            - 双指长按图片区域同样触发
+            - 设置 → 小红书 → 照片 → 允许添加
+
+            ## v2 性能（去广告类）
+            - 取消全进程类扫描（各 App 按自身实现）
             - 取消 UIView 全局 swizzle
             - 默认关闭日志
           files: dist/*.dylib

@@ -1,6 +1,6 @@
-# NoAds dylibs (TrollFools)
+# NoAds / Tools dylibs (TrollFools)
 
-按 **App 可执行文件名 / 产品名** 命名的去广告动态库，专供 [TrollFools](https://github.com/Lessica/TrollFools) 注入。  
+按 **App 可执行文件名 / 产品名** 命名的动态库，专供 [TrollFools](https://github.com/Lessica/TrollFools) 注入。  
 **不依赖** MobileSubstrate / 越狱。
 
 ## 下载
@@ -10,14 +10,15 @@
 
 ## 已支持
 
-| dylib | App | Bundle ID / 可执行名 |
-|-------|-----|----------------------|
-| **HiveConsumer.dylib** | 丰巢 | `com.fcbox.hiveconsumer` |
-| **Cainiao4iPhone.dylib** | 菜鸟 | `com.cainiao.cnwireless` |
-| **QTL.dylib** | 掌上英雄联盟 | `com.tencent.ied.app.lolbible` |
-| **Volunteer.dylib** | 志愿汇 | 可执行名 `Volunteer`（分析版本 5.8.4） |
-| **mCloud_iPhone.dylib** | 中国移动云盘 | `com.chinamobile.mcloud` / `mCloud_iPhone`（分析版本 13.0.0） |
-| **ChinaRadio.dylib** | 中国广电 / ChinaRadio | `com.cbn.app` / `ChinaRadio`（分析版本 2.0.8） |
+| dylib | App | Bundle ID / 可执行名 | 功能 |
+|-------|-----|----------------------|------|
+| **HiveConsumer.dylib** | 丰巢 | `com.fcbox.hiveconsumer` | 去广告 |
+| **Cainiao4iPhone.dylib** | 菜鸟 | `com.cainiao.cnwireless` | 去广告 |
+| **QTL.dylib** | 掌上英雄联盟 | `com.tencent.ied.app.lolbible` | 去广告 |
+| **Volunteer.dylib** | 志愿汇 | 可执行名 `Volunteer`（分析版本 5.8.4） | 去广告 |
+| **mCloud_iPhone.dylib** | 中国移动云盘 | `com.chinamobile.mcloud` / `mCloud_iPhone`（分析版本 13.0.0） | 去广告 |
+| **ChinaRadio.dylib** | 中国广电 / ChinaRadio | `com.cbn.app` / `ChinaRadio`（分析版本 2.0.8） | 去广告 |
+| **discover.dylib** | 小红书 | `com.xingin.discover` / `discover`（分析版本 9.38.1） | **图片保存/下载** |
 
 ## 使用 (TrollFools)
 
@@ -61,6 +62,8 @@ apps/
     mCloud_iPhone.m     → 编译为 mCloud_iPhone.dylib（移动云盘）
   ChinaRadio/
     ChinaRadio.m        → 编译为 ChinaRadio.dylib（中国广电）
+  discover/
+    discover.m          → 编译为 discover.dylib（小红书图片保存）
   # 下一个 App:
   # SomeApp/
   #   SomeApp.m         → SomeApp.dylib
@@ -74,6 +77,16 @@ apps/
 - push 到 `main` 即构建全部 dylib 并发 Release  
 
 需要去广告的新 App：丢解密包 / IPA 里主二进制，或说明 Bundle ID，我按同样结构加 `apps/新名字/`。
+
+## 小红书 `discover.dylib`（图片保存）
+
+1. 下载 [Releases](../../releases) 里的 **`discover.dylib`**
+2. TrollFools → 选 **小红书** → 注入
+3. 强杀小红书后重开，应看到 toast「图片保存插件已加载」和右侧红色 **↓**
+4. 进图文笔记点 **↓**，或 **双指长按** 图片区域 → 保存到相册
+5. 系统设置 → 小红书 → 照片 → **允许添加**
+
+能力：强制 `disableSave=NO` + CDN 大图下载兜底。不破解付费图墙。
 
 ## 本地编译 (macOS)
 
