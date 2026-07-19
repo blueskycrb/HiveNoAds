@@ -92,10 +92,12 @@ jobs:
             2. TrollFools → 选择 App → 注入
             3. 彻底杀掉 App 后冷启动
 
-            ## 小红书 `discover.dylib`（无悬浮按钮、不截图，v4）
+            ## 小红书 `discover.dylib`（无悬浮按钮、不截图，v5）
             - 强制 `disableSave=NO` + 作者隐私下载开关：
               `hitUserNoteDownloadSwitch` / `userNoteDownloadSwitch` / `isFlowDownloadSwitchOn`
-            - 屏蔽 `checkShowCloseNoteDownloadSwitchToast` 等「作者关闭下载」类 toast
+            - `SaveProvider.enable` / SaveCell / SaveImageService 分享面板入口强制打开
+            - `NSUserDefaults` 隐私下载 key 读路径强制允许
+            - 轻量 toast 过滤「作者关闭下载权限」/ `capa_allow_download_account_toast`
             - **NSJSONSerialization** + JSON 字节替换改写笔记响应下载开关
             - `mediaSaveConfig` getter/setter 按类保存原 IMP，访问时强制允许保存
             - 图文/视频走 App 原生「保存图片/保存视频」

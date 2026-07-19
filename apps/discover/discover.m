@@ -2,12 +2,14 @@
 // discover.dylib — 小红书：解锁别人帖子图片/视频保存（性能优先）
 // Bundle: com.xingin.discover | 可执行名: discover | 对照: 9.38.1
 //
-// v4:
+// v5:
 //   - 继续避免 NSObject 全局 KVC / 全量 toast 扫描（卡顿主因）
-//   - NSJSONSerialization 解析结果改写下载开关（比只 hook NSURLSession block 更稳）
-//   - 保留轻量 JSON 字节替换，兜住不走 NSJSONSerialization 的响应
+//   - SaveProvider.enable / SaveCell / SaveImageService 分享面板入口更强力强制
+//   - XYPHMediaSaveConfig 同时 hook valueForKey: + setValue:forKey:
+//   - NSUserDefaults 隐私下载 key 读路径强制允许
+//   - 轻量 toast 过滤：只拦「作者关闭下载权限」类文案/key
+//   - NSJSONSerialization 解析结果改写 + 轻量 JSON 字节替换
 //   - mediaSaveConfig getter/setter 按类保存原 IMP，定点强制 disableSave=NO
-//   - 仅对 XYPHMediaSaveConfig 做 KVC 拦截
 //   - 无悬浮按钮、不截图，走 App 原生「保存图片 / 保存视频」
 //
 #import <Foundation/Foundation.h>
@@ -79,10 +81,12 @@ static void XHSPatchSetterDrop(Class cls, const char *selName) {
 static BOOL XHSNameLooksSaveProvider(const char *name) {
     if (!name) return NO;
     return strstr(name, "SaveProvider") ||
+           strstr(name, "SaveCell") ||
            strstr(name, "ImageSave") ||
            strstr(name, "SaveImage") ||
            strstr(name, "NegativeFeedback") ||
-           strstr(name, "MediaSave");
+           strstr(name, "MediaSave") ||
+           strstr(name, "NotePaidDownload");
 }
 
 static void XHSPatchKnownClass(Class cls);
@@ -114,6 +118,8 @@ static void XHSForceConfigObject(id cfg) {
             [cfg setValue:@NO forKey:@"disable_save"];
             [cfg setValue:@NO forKey:@"forbidCopy"];
             [cfg setValue:@YES forKey:@"disableWatermark"];
+            [cfg setValue:@YES forKey:@"shareImageSaveEnable"];
+            [cfg setValue:@YES forKey:@"share_image_save_enable"];
         }
     } @catch (__unused NSException *e) {}
 }
@@ -140,6 +146,7 @@ static void XHSPatchKnownClass(Class cls) {
     XHSPatchBool(cls, "userNoteDownloadSwitch", YES);
     XHSPatchBool(cls, "isFlowDownloadSwitchOn", YES);
     XHSPatchBool(cls, "notAllowDownloadMyVideos", NO);
+    XHSPatchBool(cls, "notAllowDownloadMyVideosSwitchOn", NO);
     XHSPatchBool(cls, "allowDownload", YES);
     XHSPatchBool(cls, "shareImageSaveEnable", YES);
     XHSPatchBool(cls, "shareVideoSaveEnable", YES);
@@ -148,14 +155,20 @@ static void XHSPatchKnownClass(Class cls) {
     XHSPatchBool(cls, "mobileDownloadSwitch", YES);
     XHSPatchBool(cls, "enableSave", YES);
     XHSPatchBool(cls, "saveEnable", YES);
+    XHSPatchBool(cls, "hasSaveNotAllowDownloadMyVideosKey", NO);
+    XHSPatchBool(cls, "isShowedAdvanceOptionNoteDownloadTips", YES);
 
     // enable only for save-related classes
     if (XHSNameLooksSaveProvider(class_getName(cls))) {
         XHSPatchBool(cls, "enable", YES);
+        XHSPatchBool(cls, "isEnabled", YES);
+        // 仅避免误判成付费图入口；不破解付费接口
+        XHSPatchBool(cls, "isPaidImageNote", NO);
     }
 
     XHSPatchVoid(cls, "checkShowCloseNoteDownloadSwitchToast");
     XHSPatchSetterDrop(cls, "setNotAllowDownloadMyVideos:");
+    XHSPatchSetterDrop(cls, "setNotAllowDownloadMyVideosSwitchOn:");
     XHSPatchSetterDrop(cls, "setHitUserNoteDownloadSwitch:");
     XHSPatchSetterDrop(cls, "setHitRacingUserNoteDownloadSwitch:");
 }
@@ -169,10 +182,16 @@ static void XHSInstallClassHooks(void) {
             "XYPHMediaSaveConfig",
             "XYVFVideoDownloaderManager",
             "XYNoteFeedbackFloatingConfig",
+            "NoteFeedbackFloatingConfig",
             "_TtC18XYNegativeFeedback12SaveProvider",
             "SaveProvider",
+            "_TtC18XYNegativeFeedback18SaveCellController",
+            "SaveCellController",
+            "_TtC18XYNegativeFeedback16SaveImageService",
+            "SaveImageService",
             "_TtC12XYNoteModule16ImageSaveService",
             "ImageSaveService",
+            "_TtC18XYNegativeFeedback24NotePaidDownloadProvider",
             NULL
         };
         for (const char **p = known; *p; p++) {
@@ -193,10 +212,12 @@ static void XHSInstallClassHooks(void) {
                 class_getInstanceMethod(cls, sel_registerName("userNoteDownloadSwitch")) ||
                 class_getInstanceMethod(cls, sel_registerName("checkShowCloseNoteDownloadSwitchToast")) ||
                 class_getInstanceMethod(cls, sel_registerName("notAllowDownloadMyVideos")) ||
+                class_getInstanceMethod(cls, sel_registerName("notAllowDownloadMyVideosSwitchOn")) ||
                 class_getInstanceMethod(cls, sel_registerName("shareImageSaveEnable")) ||
-                class_getInstanceMethod(cls, sel_registerName("shareVideoSaveEnable"))) {
+                class_getInstanceMethod(cls, sel_registerName("shareVideoSaveEnable")) ||
+                class_getInstanceMethod(cls, sel_registerName("isPaidImageNote"))) {
                 XHSPatchKnownClass(cls);
-                if (++patched > 100) break;
+                if (++patched > 120) break;
             }
         }
         free(list);
@@ -242,6 +263,8 @@ static BOOL XHSPatchObjectTree(id obj, NSInteger depth) {
                 @"hitUserNoteDownloadSwitch", @"hit_user_note_download_switch",
                 @"hitRacingUserNoteDownloadSwitch", @"hit_racing_user_note_download_switch",
                 @"notAllowDownloadMyVideos", @"not_allow_download_my_videos",
+                @"notAllowDownloadMyVideosSwitchOn",
+                @"privacyCloseNoteDownload", @"privacy_close_note_download",
             ]];
             forceTrue = [NSSet setWithArray:@[
                 @"userNoteDownloadSwitch", @"user_note_download_switch",
@@ -255,6 +278,7 @@ static BOOL XHSPatchObjectTree(id obj, NSInteger depth) {
                 @"disable_watermark", @"disableWatermark",
                 @"disableWatermarkWhenSavingAlbum",
                 @"enableSave", @"saveEnable",
+                @"enable_save_photo_default",
             ]];
         });
 
@@ -364,6 +388,7 @@ static BOOL XHSDataLooksRelated(NSData *data) {
             [@"share_image_save_enable" dataUsingEncoding:NSUTF8StringEncoding],
             [@"allow_download" dataUsingEncoding:NSUTF8StringEncoding],
             [@"capa_allow_download" dataUsingEncoding:NSUTF8StringEncoding],
+            [@"privacyCloseNoteDownload" dataUsingEncoding:NSUTF8StringEncoding],
         ];
     });
     NSRange full = NSMakeRange(0, data.length);
@@ -418,6 +443,8 @@ static NSData *XHSPatchNoteJSONBytes(NSData *data) {
         @[@"\"disableWatermark\":false", @"\"disableWatermark\":true"],
         @[@"\"enableSave\":false", @"\"enableSave\":true"],
         @[@"\"saveEnable\":false", @"\"saveEnable\":true"],
+        @[@"\"notAllowDownloadMyVideosSwitchOn\":true", @"\"notAllowDownloadMyVideosSwitchOn\":false"],
+        @[@"\"enable_save_photo_default\":false", @"\"enable_save_photo_default\":true"],
     ];
 
     NSString *out = s;
@@ -543,50 +570,87 @@ static void hook_msc_set(id self, SEL _cmd, id cfg) {
     }
 }
 
-// XYPHMediaSaveConfig KVC: force disableSave=NO
+static BOOL XHSIsBlockedSaveKey(NSString *key) {
+    if (![key isKindOfClass:[NSString class]] || key.length == 0) return NO;
+    NSString *k = key.lowercaseString;
+    if ([k isEqualToString:@"disablesave"] ||
+        [k isEqualToString:@"disable_save"] ||
+        [k isEqualToString:@"forbidcopy"] ||
+        [k isEqualToString:@"forbid_copy"]) {
+        return YES;
+    }
+    if ([k containsString:@"hitusernotedownloadswitch"] ||
+        [k containsString:@"hitracingusernotedownloadswitch"] ||
+        [k containsString:@"notallowdownload"] ||
+        [k containsString:@"privacyclosenotedownload"]) {
+        return YES;
+    }
+    return NO;
+}
+
+static BOOL XHSIsForcedAllowKey(NSString *key) {
+    if (![key isKindOfClass:[NSString class]] || key.length == 0) return NO;
+    NSString *k = key.lowercaseString;
+    if ([k containsString:@"usernotedownloadswitch"] ||
+        [k containsString:@"uservideodownloadswitch"] ||
+        [k containsString:@"shareimagesaveenable"] ||
+        [k containsString:@"sharevideosaveenable"] ||
+        [k containsString:@"allowdownload"] ||
+        [k containsString:@"disablewatermark"] ||
+        [k isEqualToString:@"isflowdownloadswitchon"] ||
+        [k containsString:@"enable_save_photo"] ||
+        [k isEqualToString:@"enablesave"] ||
+        [k isEqualToString:@"saveenable"]) {
+        return YES;
+    }
+    return NO;
+}
+
+// XYPHMediaSaveConfig KVC: force disableSave=NO / allow flags
 static void (*orig_cfg_setValue)(id, SEL, id, NSString *);
 static void hook_cfg_setValue(id self, SEL _cmd, id value, NSString *key) {
-    if ([key isKindOfClass:[NSString class]]) {
-        NSString *k = key.lowercaseString;
-        if ([k isEqualToString:@"disablesave"] ||
-            [k isEqualToString:@"disable_save"] ||
-            [k isEqualToString:@"forbidcopy"] ||
-            [k isEqualToString:@"forbid_copy"]) {
-            value = @NO;
-        }
-        if ([k containsString:@"hitusernotedownloadswitch"] ||
-            [k containsString:@"notallowdownload"]) {
-            value = @NO;
-        }
-        if ([k containsString:@"usernotedownloadswitch"] ||
-            [k containsString:@"shareimagesaveenable"] ||
-            [k containsString:@"allowdownload"] ||
-            [k containsString:@"disablewatermark"] ||
-            [k isEqualToString:@"isflowdownloadswitchon"]) {
-            value = @YES;
-        }
+    if (XHSIsBlockedSaveKey(key)) {
+        value = @NO;
+    } else if (XHSIsForcedAllowKey(key)) {
+        value = @YES;
     }
     if (orig_cfg_setValue) orig_cfg_setValue(self, _cmd, value, key);
+}
+
+static id (*orig_cfg_valueForKey)(id, SEL, NSString *);
+static id hook_cfg_valueForKey(id self, SEL _cmd, NSString *key) {
+    if (XHSIsBlockedSaveKey(key)) return @NO;
+    if (XHSIsForcedAllowKey(key)) return @YES;
+    return orig_cfg_valueForKey ? orig_cfg_valueForKey(self, _cmd, key) : nil;
 }
 
 static BOOL XHSNameLooksNoteMedia(const char *name) {
     if (!name) return NO;
     return strstr(name, "Note") || strstr(name, "Video") || strstr(name, "Feed") ||
            strstr(name, "XYPH") || strstr(name, "XYVF") || strstr(name, "Share") ||
-           strstr(name, "Media") || strstr(name, "ImageSave");
+           strstr(name, "Media") || strstr(name, "ImageSave") || strstr(name, "NegativeFeedback");
 }
 
 static void XHSInstallMediaSaveConfigHooks(void) {
     Class cfgCls = objc_getClass("XYPHMediaSaveConfig");
     if (cfgCls) {
         XHSPatchKnownClass(cfgCls);
-        Method m = class_getInstanceMethod(cfgCls, @selector(setValue:forKey:));
-        if (m) {
-            IMP cur = method_getImplementation(m);
+        Method setM = class_getInstanceMethod(cfgCls, @selector(setValue:forKey:));
+        if (setM) {
+            IMP cur = method_getImplementation(setM);
             if (cur != (IMP)hook_cfg_setValue) {
                 orig_cfg_setValue = (void *)cur;
-                method_setImplementation(m, (IMP)hook_cfg_setValue);
+                method_setImplementation(setM, (IMP)hook_cfg_setValue);
                 LOG(@"XYPHMediaSaveConfig setValue:forKey: hooked");
+            }
+        }
+        Method getM = class_getInstanceMethod(cfgCls, @selector(valueForKey:));
+        if (getM) {
+            IMP cur = method_getImplementation(getM);
+            if (cur != (IMP)hook_cfg_valueForKey) {
+                orig_cfg_valueForKey = (void *)cur;
+                method_setImplementation(getM, (IMP)hook_cfg_valueForKey);
+                LOG(@"XYPHMediaSaveConfig valueForKey: hooked");
             }
         }
     }
@@ -595,13 +659,13 @@ static void XHSInstallMediaSaveConfigHooks(void) {
     Class *list = objc_copyClassList(&n);
     if (!list) return;
     unsigned g = 0, s = 0;
-    for (unsigned int i = 0; i < n && (g < 32 || s < 32); i++) {
+    for (unsigned int i = 0; i < n && (g < 40 || s < 40); i++) {
         Class cls = list[i];
         const char *name = class_getName(cls);
         if (!XHSNameLooksNoteMedia(name)) continue;
 
         Method gm = class_getInstanceMethod(cls, sel_registerName("mediaSaveConfig"));
-        if (gm && g < 32) {
+        if (gm && g < 40) {
             const char *enc = method_getTypeEncoding(gm);
             IMP prev = method_getImplementation(gm);
             if (enc && enc[0] == '@' && prev && prev != (IMP)hook_msc_get) {
@@ -615,7 +679,7 @@ static void XHSInstallMediaSaveConfigHooks(void) {
         }
 
         Method sm = class_getInstanceMethod(cls, sel_registerName("setMediaSaveConfig:"));
-        if (sm && s < 32) {
+        if (sm && s < 40) {
             const char *enc = method_getTypeEncoding(sm);
             IMP prev = method_getImplementation(sm);
             if (enc && enc[0] == 'v' && prev && prev != (IMP)hook_msc_set) {
@@ -632,27 +696,236 @@ static void XHSInstallMediaSaveConfigHooks(void) {
     LOG(@"mediaSaveConfig get=%u set=%u", g, s);
 }
 
+
+#pragma mark - NSUserDefaults privacy keys
+
+static BOOL XHSIsPrivacyDownloadKey(NSString *key) {
+    if (![key isKindOfClass:[NSString class]] || key.length == 0) return NO;
+    NSString *k = key.lowercaseString;
+    if ([k containsString:@"privacyclosenotedownload"] ||
+        [k containsString:@"hassavenotallowdownloadmyvideos"] ||
+        [k containsString:@"ios_profile_privacy_user_note_download"] ||
+        [k containsString:@"usernotedownload"] ||
+        [k containsString:@"user_note_download"] ||
+        [k containsString:@"user_video_download_switch"] ||
+        [k containsString:@"uservideodownload"] ||
+        [k containsString:@"notallowdownloadmyvideos"] ||
+        [k containsString:@"hitusernotedownload"] ||
+        [k containsString:@"capa_allow_download"]) {
+        return YES;
+    }
+    return NO;
+}
+
+static BOOL XHSPrivacyKeyShouldAllow(NSString *key) {
+    // true = force YES/allow download; false = force NO/disable block flag
+    NSString *k = key.lowercaseString;
+    if ([k containsString:@"notallow"] ||
+        [k containsString:@"privacyclose"] ||
+        [k containsString:@"hitusernote"] ||
+        [k containsString:@"hitracing"]) {
+        return NO;
+    }
+    return YES;
+}
+
+static BOOL (*orig_ud_boolForKey)(id, SEL, NSString *);
+static BOOL hook_ud_boolForKey(id self, SEL _cmd, NSString *key) {
+    if (XHSIsPrivacyDownloadKey(key)) {
+        BOOL allow = XHSPrivacyKeyShouldAllow(key);
+        LOG(@"NSUserDefaults boolForKey:%@ => %d", key, (int)allow);
+        return allow;
+    }
+    return orig_ud_boolForKey ? orig_ud_boolForKey(self, _cmd, key) : NO;
+}
+
+static id (*orig_ud_objectForKey)(id, SEL, NSString *);
+static id hook_ud_objectForKey(id self, SEL _cmd, NSString *key) {
+    if (XHSIsPrivacyDownloadKey(key)) {
+        BOOL allow = XHSPrivacyKeyShouldAllow(key);
+        LOG(@"NSUserDefaults objectForKey:%@ => %d", key, (int)allow);
+        return allow ? @YES : @NO;
+    }
+    return orig_ud_objectForKey ? orig_ud_objectForKey(self, _cmd, key) : nil;
+}
+
+static void XHSInstallUserDefaultsHooks(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class cls = objc_getClass("NSUserDefaults");
+        if (!cls) return;
+        Method b = class_getInstanceMethod(cls, @selector(boolForKey:));
+        if (b) {
+            orig_ud_boolForKey = (void *)method_getImplementation(b);
+            method_setImplementation(b, (IMP)hook_ud_boolForKey);
+        }
+        Method o = class_getInstanceMethod(cls, @selector(objectForKey:));
+        if (o) {
+            orig_ud_objectForKey = (void *)method_getImplementation(o);
+            method_setImplementation(o, (IMP)hook_ud_objectForKey);
+        }
+        LOG(@"NSUserDefaults privacy keys hooked");
+    });
+}
+
+#pragma mark - toast filter (download permission only)
+
+static BOOL XHSIsBlockedDownloadToastText(id text) {
+    if (!text) return NO;
+    NSString *s = nil;
+    if ([text isKindOfClass:[NSString class]]) s = (NSString *)text;
+    else if ([text respondsToSelector:@selector(description)]) s = [text description];
+    if (s.length == 0) return NO;
+
+    if ([s containsString:@"capa_allow_download_account_toast"] ||
+        [s containsString:@"capa_allow_download_account"]) {
+        return YES;
+    }
+    if ([s containsString:@"下载权限"] ||
+        [s containsString:@"关闭下载"] ||
+        [s containsString:@"作者已关闭"] ||
+        ([s containsString:@"无法保存"] && [s containsString:@"下载"])) {
+        return YES;
+    }
+    return NO;
+}
+
+static void (*orig_toast_msg1)(id, SEL, id);
+static void hook_toast_msg1(id self, SEL _cmd, id msg) {
+    if (XHSIsBlockedDownloadToastText(msg)) {
+        LOG(@"drop toast1: %@", msg);
+        return;
+    }
+    if (orig_toast_msg1) orig_toast_msg1(self, _cmd, msg);
+}
+
+static void (*orig_toast_msg2)(id, SEL, id, id);
+static void hook_toast_msg2(id self, SEL _cmd, id a, id b) {
+    if (XHSIsBlockedDownloadToastText(a) || XHSIsBlockedDownloadToastText(b)) {
+        LOG(@"drop toast2");
+        return;
+    }
+    if (orig_toast_msg2) orig_toast_msg2(self, _cmd, a, b);
+}
+
+static void (*orig_toast_inview)(id, SEL, id, id);
+static void hook_toast_inview(id self, SEL _cmd, id view, id msg) {
+    if (XHSIsBlockedDownloadToastText(msg)) {
+        LOG(@"drop toastInView: %@", msg);
+        return;
+    }
+    if (orig_toast_inview) orig_toast_inview(self, _cmd, view, msg);
+}
+
+static BOOL XHSNameLooksToastHost(const char *name) {
+    if (!name) return NO;
+    return strstr(name, "Toast") ||
+           strstr(name, "Alert") ||
+           strstr(name, "Tip") ||
+           strstr(name, "HUD") ||
+           strstr(name, "XYPH") ||
+           strstr(name, "XYUI");
+}
+
+static void XHSTryHookToastMethod(Class cls, const char *selName, IMP hook, IMP *origOut, unsigned *count, unsigned maxCount) {
+    if (!cls || !selName || !hook || !count || *count >= maxCount) return;
+    Method m = class_getInstanceMethod(cls, sel_registerName(selName));
+    if (!m) m = class_getClassMethod(cls, sel_registerName(selName));
+    if (!m) return;
+    IMP cur = method_getImplementation(m);
+    if (cur == hook) return;
+    if (origOut && !*origOut) *origOut = cur;
+    method_setImplementation(m, hook);
+    (*count)++;
+    LOG(@"toast hook %s %s", class_getName(cls), selName);
+}
+
+static void XHSInstallToastFilters(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *known[] = {
+            "XYAlertUtils",
+            "XYAlert",
+            "XYAlertTextHUD",
+            "XYTipsManager",
+            "XYTipsView",
+            "XYToastEventHandler",
+            "XYPHToast",
+            "XYHUD",
+            NULL
+        };
+        unsigned c1 = 0, c2 = 0, cv = 0;
+        for (const char **p = known; *p; p++) {
+            Class cls = objc_getClass(*p);
+            if (!cls) continue;
+            XHSTryHookToastMethod(cls, "showToastWithMessage:", (IMP)hook_toast_msg1, (IMP *)&orig_toast_msg1, &c1, 8);
+            XHSTryHookToastMethod(cls, "showToast:", (IMP)hook_toast_msg1, (IMP *)&orig_toast_msg1, &c1, 8);
+            XHSTryHookToastMethod(cls, "showToastOnMainThread:", (IMP)hook_toast_msg1, (IMP *)&orig_toast_msg1, &c1, 8);
+            XHSTryHookToastMethod(cls, "showToastWithTitle:", (IMP)hook_toast_msg1, (IMP *)&orig_toast_msg1, &c1, 8);
+            XHSTryHookToastMethod(cls, "showTextToastOnMiddle:", (IMP)hook_toast_msg1, (IMP *)&orig_toast_msg1, &c1, 8);
+            XHSTryHookToastMethod(cls, "showToast:msg:", (IMP)hook_toast_msg2, (IMP *)&orig_toast_msg2, &c2, 8);
+            XHSTryHookToastMethod(cls, "showToastInView:message:", (IMP)hook_toast_inview, (IMP *)&orig_toast_inview, &cv, 8);
+        }
+
+        // limited one-shot scan: toast-looking classes only
+        unsigned int n = 0;
+        Class *list = objc_copyClassList(&n);
+        if (list) {
+            for (unsigned int i = 0; i < n && (c1 < 12 || cv < 8); i++) {
+                Class cls = list[i];
+                const char *name = class_getName(cls);
+                if (!XHSNameLooksToastHost(name)) continue;
+                if (class_getInstanceMethod(cls, sel_registerName("showToastWithMessage:")) ||
+                    class_getInstanceMethod(cls, sel_registerName("showToast:")) ||
+                    class_getInstanceMethod(cls, sel_registerName("showToastInView:message:"))) {
+                    XHSTryHookToastMethod(cls, "showToastWithMessage:", (IMP)hook_toast_msg1, (IMP *)&orig_toast_msg1, &c1, 12);
+                    XHSTryHookToastMethod(cls, "showToast:", (IMP)hook_toast_msg1, (IMP *)&orig_toast_msg1, &c1, 12);
+                    XHSTryHookToastMethod(cls, "showToastInView:message:", (IMP)hook_toast_inview, (IMP *)&orig_toast_inview, &cv, 8);
+                }
+            }
+            free(list);
+        }
+        LOG(@"toast filters c1=%u c2=%u cv=%u", c1, c2, cv);
+    });
+}
+
+#pragma mark - delayed re-patch
+
+static void XHSRepatchCore(void) {
+    XHSPatchKnownClass(objc_getClass("XYPHMediaSaveConfig"));
+    XHSPatchKnownClass(objc_getClass("XYNoteFeedbackFloatingConfig"));
+    XHSPatchKnownClass(objc_getClass("_TtC18XYNegativeFeedback12SaveProvider"));
+    XHSPatchKnownClass(objc_getClass("_TtC18XYNegativeFeedback18SaveCellController"));
+    XHSPatchKnownClass(objc_getClass("_TtC18XYNegativeFeedback16SaveImageService"));
+    XHSPatchKnownClass(objc_getClass("_TtC12XYNoteModule16ImageSaveService"));
+    XHSInstallMediaSaveConfigHooks();
+}
+
 #pragma mark - ctor
 
 __attribute__((constructor))
 static void XHSInit(void) {
     @autoreleasepool {
         if (!XHSIsTarget()) return;
-        LOG(@"v4 load pid=%d", getpid());
+        LOG(@"v5 load pid=%d", getpid());
 
         XHSInstallClassHooks();
         XHSInstallJSONHook();
         XHSInstallSessionHook();
         XHSInstallMediaSaveConfigHooks();
+        XHSInstallUserDefaultsHooks();
+        XHSInstallToastFilters();
 
-        // one delayed pass after Swift classes register
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+        // Swift 类注册后再补几次（轻量，不定时轮询）
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            XHSPatchKnownClass(objc_getClass("XYPHMediaSaveConfig"));
-            XHSPatchKnownClass(objc_getClass("_TtC18XYNegativeFeedback12SaveProvider"));
-            XHSPatchKnownClass(objc_getClass("_TtC12XYNoteModule16ImageSaveService"));
-            XHSInstallMediaSaveConfigHooks();
-            LOG(@"v4 delayed patch");
+            XHSRepatchCore();
+            LOG(@"v5 delayed patch 0.8s");
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            XHSRepatchCore();
+            LOG(@"v5 delayed patch 2.5s");
         });
     }
 }
