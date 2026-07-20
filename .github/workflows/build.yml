@@ -1,4 +1,4 @@
-﻿name: Build ad-block dylibs
+name: Build ad-block dylibs
 
 on:
   push:
@@ -28,7 +28,7 @@ jobs:
           fi
           for src in "${srcs[@]}"; do
             app=$(basename "$(dirname "$src")")
-            # dylib 涓?App 鍚屽悕: apps/HiveConsumer/HiveConsumer.m 鈫?HiveConsumer.dylib
+            # dylib 与 App 同名: apps/HiveConsumer/HiveConsumer.m -> HiveConsumer.dylib
             out="dist/${app}.dylib"
             min_ios="13.0"
             if [ "$app" = "QTL" ]; then
@@ -79,39 +79,38 @@ jobs:
           tag_name: build-${{ github.run_number }}
           name: NoAds dylibs #${{ github.run_number }}
           body: |
-            鎸?**App 鍚?* 鍛藉悕鐨?dylib锛圱rollFools锛屾棤 Substrate锛夈€?
+            按 **App 名** 命名的 dylib（TrollFools，无 Substrate）。
 
-            | 鏂囦欢 | 娉ㄥ叆鐩爣 | 鍔熻兘 |
+            | 文件 | 注入目标 | 功能 |
             |------|----------|------|
-            | `HiveConsumer.dylib` | 铚滅綈 (`com.fcbox.hiveconsumer`) | 鍘诲箍鍛?|
-            | `Cainiao4iPhone.dylib` | 鑿滈笩 (`com.cainiao.cnwireless`) | 鍘诲箍鍛?|
-            | `QTL.dylib` | 鎺屼笂鑻遍泟鑱旂洘 (`com.tencent.ied.app.lolbible`) | 鍘诲箍鍛?|
-            | `Volunteer.dylib` | 鎰胯€呮眹 (`Volunteer` 5.8.4) | 鍘诲箍鍛?|
-            | `mCloud_iPhone.dylib` | 涓浗绉诲姩浜戠洏 (`com.chinamobile.mcloud` / 13.0.0) | 鍘诲箍鍛?|
-            | `ChinaRadio.dylib` | 涓浗骞跨數 (`com.cbn.app` / ChinaRadio 2.0.8) | 鍘诲箍鍛?|
-            | **`discover.dylib`** | **灏忕孩涔?* (`com.xingin.discover` / `discover` 9.38.1) | **瑙ｉ攣淇濆瓨鍒汉甯栧瓙鍥剧墖/瑙嗛** |
+            | `HiveConsumer.dylib` | 蜜罐 (`com.fcbox.hiveconsumer`) | 去广告 |
+            | `Cainiao4iPhone.dylib` | 菜鸟 (`com.cainiao.cnwireless`) | 去广告 |
+            | `QTL.dylib` | 掌上英雄联盟 (`com.tencent.ied.app.lolbible`) | 去广告 |
+            | `Volunteer.dylib` | 愿者汇 (`Volunteer` 5.8.4) | 去广告 |
+            | `mCloud_iPhone.dylib` | 中国移动云盘 (`com.chinamobile.mcloud` / 13.0.0) | 去广告 |
+            | `ChinaRadio.dylib` | 中国广电 (`com.cbn.app` / ChinaRadio 2.0.8) | 去广告 |
+            | **`discover.dylib`** | **小红书** (`com.xingin.discover` / `discover` 9.38.1) | **解锁保存别人帖子图片/视频** |
 
-            ## 鐢ㄦ硶
-            1. 涓嬭浇瀵瑰簲 `AppName.dylib`
-            2. TrollFools 鈫?閫夋嫨 App 鈫?娉ㄥ叆
-            3. 褰诲簳鏉€鎺?App 鍚庡喎鍚姩
+            ## 用法
+            1. 下载对应 `AppName.dylib`
+            2. TrollFools → 选择 App → 注入
+            3. 彻底杀掉 App 后冷启动
 
-            ## 灏忕孩涔?`discover.dylib`锛坴10锛氬浘鐗?+ 瑙嗛鎮诞鍏滃簳锛?
-            - 淇濇寔 v8/v9 杞婚噺鍚姩锛氭棤 NSBundle 鍏ㄥ眬 hook銆佹棤 ctor 鍏ㄧ被鎵弿銆佹棤 session 鍖呰
-            - 鍘熺敓闂ㄦ帶锛歚disableSave=NO` / `SaveProvider.enable` / capa toast 杩囨护 / JSON 闄愭祦鏀瑰啓
-            - **鍥剧墖鍏滃簳**锛氬彸渚у崐閫忔槑 鈫?+ 鍙屾寚闀挎寜锛屾姄 CDN 鍘熷浘 URL 鎴栧綋鍓?UIImage 鍐欑浉鍐?
-            - **瑙嗛鍏滃簳**锛氭姄 `master_url` / `videoURL` / `sns-video` 绛?CDN锛宒ownloadTask 鍚庡啓鍏ョ浉鍐岋紙m3u8 鏆備笉鏀寔锛?
-            - 浣跨敤锛歍rollFools 绉婚櫎鏃?dylib 鍚庨噸娉紱鍐峰惎鍔?鈫?鎵撳紑閿佷笅杞界瑪璁?鈫?鐐?鈫?鎴栧弻鎸囬暱鎸?
-            - 璁剧疆 鈫?灏忕孩涔?鈫?鐓х墖 鈫?鍏佽娣诲姞
-            - 涓嶇牬瑙ｄ粯璐瑰锛涙湇鍔＄纭嫤鏃跺師鐢熷叆鍙ｄ粛鍙兘涓嶅嚭鐜帮紝鐢ㄦ偓娴寜閽?
+            ## 小红书 `discover.dylib`（v10.2：图片 + 视频悬浮兜底）
+            - 保持 v8/v9 轻量启动：无 NSBundle 全局 hook、无 ctor 全类扫描、无 session 包装
+            - 原生门控：`disableSave=NO` / `SaveProvider.enable` / capa toast 过滤 / JSON 限流改写
+            - **图片兜底**：右侧半透明 ↓ + 双指长按，抓 CDN 原图 URL 或当前 UIImage 写相册
+            - **视频兜底**：抓 `master_url` / `videoURL` / `sns-video` 等 CDN；下载后用 AVFoundation 重编码再写相册，避免 PHPhotosErrorDomain 3302
+            - 使用：TrollFools 移除旧 dylib 后重注；冷启动 → 打开锁下载笔记 → 点 ↓ 或双指长按
+            - 设置 → 小红书 → 照片 → 允许添加
+            - 不破解付费墙；服务端硬拦时原生入口仍可能不出现，用悬浮按钮
 
 
-            ## v2 鎬ц兘锛堝幓骞垮憡绫伙級
-            - 鍙栨秷鍏ㄨ繘绋嬬被鎵弿锛堝悇 App 鎸夎嚜韬疄鐜帮級
-            - 鍙栨秷 UIView 鍏ㄥ眬 swizzle
-            - 榛樿鍏抽棴鏃ュ織
+            ## v2 性能（去广告类）
+            - 取消全进程类扫描（各 App 按自身实现）
+            - 取消 UIView 全局 swizzle
+            - 默认关闭日志
 
           files: dist/*.dylib
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
