@@ -2,6 +2,11 @@
 // discover.dylib - Xiaohongshu unlock native image/video save (perf-first)
 // Bundle: com.xingin.discover | executable: discover | analyzed: 9.38.1
 //
+// v10.2 (video re-export):
+//   - CDN fMP4 often rejected by Photos (PHPhotos 3302)
+//   - Re-export via AVAssetExportSession to standard mp4 before album write
+//   - Detect m3u8 playlist bytes; force .mp4 temp ext; grab AVPlayerItem URL
+//
 // v10.1 (fix false video detect):
 //   - HEIC/AVIF also use ISO BMFF ftyp; naive ftyp==video caused PHPhotos 3302
 //   - Prefer real image decode first; only treat as video when content looks video
@@ -37,6 +42,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <Photos/Photos.h>
+#import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <string.h>
@@ -1728,6 +1734,20 @@ static void XHSFallbackCollect(id obj, NSMutableSet<NSString *> *out, NSInteger 
         if (XHSFallbackIsMediaURL(s)) [out addObject:s];
         return;
     }
+    // live player asset -> real stream URL / local cache file
+    if ([obj isKindOfClass:[AVURLAsset class]]) {
+        NSString *s = [(AVURLAsset *)obj URL].absoluteString;
+        if (XHSFallbackIsMediaURL(s) || [s hasPrefix:@"file:"]) [out addObject:s];
+        return;
+    }
+    if ([obj isKindOfClass:[AVPlayerItem class]]) {
+        XHSFallbackCollect([(AVPlayerItem *)obj asset], out, depth + 1);
+        return;
+    }
+    if ([obj isKindOfClass:[AVPlayer class]]) {
+        XHSFallbackCollect([(AVPlayer *)obj currentItem], out, depth + 1);
+        return;
+    }
     if ([obj isKindOfClass:[NSArray class]]) {
         for (id x in (NSArray *)obj) XHSFallbackCollect(x, out, depth + 1);
         return;
@@ -1788,23 +1808,180 @@ static NSInteger XHSFallbackURLScore(NSString *u) {
     return s;
 }
 
+static BOOL XHSFallbackDataLooksPlaylist(NSData *data) {
+    if (data.length < 7) return NO;
+    NSUInteger n = MIN((NSUInteger)data.length, (NSUInteger)96);
+    NSString *head = [[NSString alloc] initWithBytes:data.bytes length:n encoding:NSUTF8StringEncoding];
+    if (!head) return NO;
+    NSString *t = [head stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return [t hasPrefix:@"#EXTM3U"] || [t containsString:@"#EXT-X-"];
+}
+
+static void XHSFallbackPhotosWriteVideo(NSString *path, void (^done)(BOOL, NSError *)) {
+    [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
+        NSURL *u = [NSURL fileURLWithPath:path];
+        // Prefer creation request; also works better after re-export to progressive mp4
+        [PHAssetChangeRequest creationRequestForAssetFromVideoAtFileURL:u];
+    } completionHandler:^(BOOL success, NSError *error) {
+        if (success) {
+            dispatch_async(dispatch_get_main_queue(), ^{ if (done) done(YES, nil); });
+            return;
+        }
+        // Secondary path: resource API (sometimes accepts more containers)
+        [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
+            PHAssetCreationRequest *req = [PHAssetCreationRequest creationRequestForAsset];
+            [req addResourceWithType:PHAssetResourceTypeVideo
+                             fileURL:[NSURL fileURLWithPath:path]
+                             options:nil];
+        } completionHandler:^(BOOL ok2, NSError *e2) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (done) done(ok2, ok2 ? nil : (e2 ?: error));
+            });
+        }];
+    }];
+}
+
+static void XHSFallbackUISaveVideo(NSString *path, void (^done)(BOOL, NSError *)) {
+    if (!UIVideoAtPathIsCompatibleWithSavedPhotosAlbum(path)) {
+        if (done) done(NO, [NSError errorWithDomain:@"XHSMediaSave" code:7
+                              userInfo:@{NSLocalizedDescriptionKey: @"UIVideo incompatible"}]);
+        return;
+    }
+    // Use Photos path after ensuring compatibility; UISave lacks clean block API in pure C
+    XHSFallbackPhotosWriteVideo(path, done);
+}
+
+static void XHSFallbackExportVideoThen(NSString *path, void (^done)(NSString *outPath, NSError *err)) {
+    NSURL *inURL = [NSURL fileURLWithPath:path];
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:inURL options:@{
+        AVURLAssetPreferPreciseDurationAndTimingKey: @YES
+    }];
+    NSArray *presets = [AVAssetExportSession exportPresetsCompatibleWithAsset:asset];
+    NSString *preset = nil;
+    for (NSString *p in @[AVAssetExportPresetHighestQuality,
+                          AVAssetExportPreset1920x1080,
+                          AVAssetExportPresetMediumQuality,
+                          AVAssetExportPreset1280x720,
+                          AVAssetExportPresetPassthrough,
+                          AVAssetExportPresetLowQuality]) {
+        if ([presets containsObject:p]) { preset = p; break; }
+    }
+    if (!preset && presets.count) preset = presets.firstObject;
+    if (!preset) {
+        if (done) done(nil, [NSError errorWithDomain:@"XHSMediaSave" code:8
+                               userInfo:@{NSLocalizedDescriptionKey: @"no export preset"}]);
+        return;
+    }
+    AVAssetExportSession *ex = [AVAssetExportSession exportSessionWithAsset:asset presetName:preset];
+    if (!ex) {
+        if (done) done(nil, [NSError errorWithDomain:@"XHSMediaSave" code:9
+                               userInfo:@{NSLocalizedDescriptionKey: @"export session nil"}]);
+        return;
+    }
+    BOOL pass = [preset isEqualToString:AVAssetExportPresetPassthrough];
+    NSString *ext = pass ? (path.pathExtension.length ? path.pathExtension : @"mp4") : @"mp4";
+    NSString *outPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                         [NSString stringWithFormat:@"xhs_exp_%@.%@", NSUUID.UUID.UUIDString, ext]];
+    [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
+    ex.outputURL = [NSURL fileURLWithPath:outPath];
+    NSArray *types = ex.supportedFileTypes;
+    if ([types containsObject:AVFileTypeMPEG4]) {
+        ex.outputFileType = AVFileTypeMPEG4;
+    } else if ([types containsObject:AVFileTypeQuickTimeMovie]) {
+        ex.outputFileType = AVFileTypeQuickTimeMovie;
+    } else if (types.count) {
+        ex.outputFileType = types.firstObject;
+    } else {
+        if (done) done(nil, [NSError errorWithDomain:@"XHSMediaSave" code:10
+                               userInfo:@{NSLocalizedDescriptionKey: @"no export file type"}]);
+        return;
+    }
+    ex.shouldOptimizeForNetworkUse = YES;
+    NSLog(@"[XHSMediaSave] export start preset=%@ types=%@", preset, types);
+    [ex exportAsynchronouslyWithCompletionHandler:^{
+        if (ex.status == AVAssetExportSessionStatusCompleted &&
+            [[NSFileManager defaultManager] fileExistsAtPath:outPath]) {
+            NSLog(@"[XHSMediaSave] export ok %@", outPath);
+            if (done) done(outPath, nil);
+            return;
+        }
+        NSLog(@"[XHSMediaSave] export fail status=%ld err=%@", (long)ex.status, ex.error);
+        [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
+        if (done) done(nil, ex.error ?: [NSError errorWithDomain:@"XHSMediaSave" code:11
+            userInfo:@{NSLocalizedDescriptionKey: @"export failed"}]);
+    }];
+}
+
 static void XHSFallbackSaveVideoFile(NSString *path, void (^done)(BOOL, NSError *)) {
     if (path.length == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:path]) {
         if (done) done(NO, [NSError errorWithDomain:@"XHSMediaSave" code:5
                               userInfo:@{NSLocalizedDescriptionKey: @"video file missing"}]);
         return;
     }
+    unsigned long long sz = [[[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil] fileSize];
+    NSData *head = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
+    if (head.length >= 7 && XHSFallbackDataLooksPlaylist(head)) {
+        if (done) done(NO, [NSError errorWithDomain:@"XHSMediaSave" code:12
+                              userInfo:@{NSLocalizedDescriptionKey: @"HLS m3u8 playlist (need mp4)"}]);
+        return;
+    }
+    // tiny / empty
+    if (sz < 1024) {
+        if (done) done(NO, [NSError errorWithDomain:@"XHSMediaSave" code:6
+                              userInfo:@{NSLocalizedDescriptionKey: @"video too small"}]);
+        return;
+    }
+    // ensure extension Photos likes
+    NSString *usePath = path;
+    NSString *ext = path.pathExtension.lowercaseString;
+    NSString *fixed = nil;
+    if (!( [ext isEqualToString:@"mp4"] || [ext isEqualToString:@"mov"] || [ext isEqualToString:@"m4v"] )) {
+        fixed = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                 [NSString stringWithFormat:@"xhs_vidfix_%@.mp4", NSUUID.UUID.UUIDString]];
+        [[NSFileManager defaultManager] removeItemAtPath:fixed error:nil];
+        if ([[NSFileManager defaultManager] copyItemAtPath:path toPath:fixed error:nil]) {
+            usePath = fixed;
+        }
+    }
+
     XHSFallbackAuthThen(^(BOOL granted) {
         if (!granted) {
+            if (fixed) [[NSFileManager defaultManager] removeItemAtPath:fixed error:nil];
             if (done) done(NO, [NSError errorWithDomain:@"XHSMediaSave" code:2
                                   userInfo:@{NSLocalizedDescriptionKey: @"album permission denied"}]);
             return;
         }
-        [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
-            [PHAssetChangeRequest creationRequestForAssetFromVideoAtFileURL:[NSURL fileURLWithPath:path]];
-        } completionHandler:^(BOOL success, NSError *error) {
-            dispatch_async(dispatch_get_main_queue(), ^{ if (done) done(success, error); });
-        }];
+
+        void (^finish)(BOOL, NSError *) = ^(BOOL ok, NSError *e) {
+            if (fixed) [[NSFileManager defaultManager] removeItemAtPath:fixed error:nil];
+            if (done) done(ok, e);
+        };
+
+        // Path A: re-export to progressive mp4 (fixes most 3302 from CDN fMP4)
+        XHSFallbackToast(@"\u6b63\u5728\u8f6c\u7801\u89c6\u9891\u2026");
+        XHSFallbackExportVideoThen(usePath, ^(NSString *outPath, NSError *expErr) {
+            if (outPath.length) {
+                XHSFallbackPhotosWriteVideo(outPath, ^(BOOL ok, NSError *e) {
+                    [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
+                    if (ok) { finish(YES, nil); return; }
+                    NSLog(@"[XHSMediaSave] photos after export failed: %@", e);
+                    // Path B: original file direct
+                    XHSFallbackPhotosWriteVideo(usePath, ^(BOOL ok2, NSError *e2) {
+                        if (ok2) { finish(YES, nil); return; }
+                        XHSFallbackUISaveVideo(usePath, finish);
+                    });
+                });
+                return;
+            }
+            NSLog(@"[XHSMediaSave] export unavailable: %@", expErr);
+            // Path B/C without export
+            XHSFallbackPhotosWriteVideo(usePath, ^(BOOL ok, NSError *e) {
+                if (ok) { finish(YES, nil); return; }
+                XHSFallbackUISaveVideo(usePath, ^(BOOL ok2, NSError *e2) {
+                    finish(ok2, ok2 ? nil : (e2 ?: e ?: expErr));
+                });
+            });
+        });
     });
 }
 
@@ -1934,13 +2111,22 @@ forHTTPHeaderField:@"Accept"];
                                   err.localizedDescription ?: @"empty"]);
                 return;
             }
-            NSString *ext = location.pathExtension.length ? location.pathExtension : @"mp4";
-            if ([ext.lowercaseString isEqualToString:@"m3u8"]) {
+            NSString *ext = location.pathExtension.lowercaseString;
+            if (ext.length == 0 ||
+                !([ext isEqualToString:@"mp4"] || [ext isEqualToString:@"mov"] ||
+                  [ext isEqualToString:@"m4v"] || [ext isEqualToString:@"m3u8"])) {
+                ext = @"mp4";
+            }
+            if ([ext isEqualToString:@"m3u8"]) {
                 XHSFallbackToast(@"\u6682\u4e0d\u652f\u6301 HLS(m3u8) \u89c6\u9891");
                 return;
             }
             // Probe first: HEIC/AVIF mislabeled as video URL must go image path
             NSData *probe = [NSData dataWithContentsOfURL:location options:NSDataReadingMappedIfSafe error:nil];
+            if (probe.length >= 7 && XHSFallbackDataLooksPlaylist(probe)) {
+                XHSFallbackToast(@"\u6682\u4e0d\u652f\u6301 HLS(m3u8) \u89c6\u9891");
+                return;
+            }
             if (probe.length >= 64 && !XHSFallbackDataLooksVideo(probe, urlString, mime)) {
                 NSLog(@"[XHSMediaSave] video URL was actually image mime=%@ bytes=%lu",
                       mime, (unsigned long)probe.length);
@@ -1951,6 +2137,9 @@ forHTTPHeaderField:@"Accept"];
                 });
                 return;
             }
+            NSLog(@"[XHSMediaSave] video download probe bytes=%lu mime=%@ head=%@",
+                  (unsigned long)probe.length, mime,
+                  probe.length >= 12 ? [[NSString alloc] initWithBytes:probe.bytes length:12 encoding:NSASCIIStringEncoding] : @"?");
             NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
                              [NSString stringWithFormat:@"xhs_vid_%@.%@", NSUUID.UUID.UUIDString, ext]];
             NSError *moveErr = nil;
@@ -2337,7 +2526,7 @@ static void XHSDeferredHeavyInstall(void) {
                 XHSScanToastFilters();
                 XHSScanI18nFilters();
                 XHSScanAuthorityPatches();
-                LOG(@"v10.1 deferred heavy install done");
+                LOG(@"v10.2 deferred heavy install done");
             }
         });
     });
@@ -2349,8 +2538,8 @@ __attribute__((constructor))
 static void XHSInit(void) {
     @autoreleasepool {
         if (!XHSIsTarget()) return;
-        LOG(@"v10.1 load pid=%d", getpid());
-        NSLog(@"[XHSMediaSave] v10.1 load pid=%d", getpid());
+        LOG(@"v10.2 load pid=%d", getpid());
+        NSLog(@"[XHSMediaSave] v10.2 load pid=%d", getpid());
 
         // known-class only; no objc_copyClassList / no NSBundle / no session wrap
         XHSInstallClassHooks();
@@ -2368,7 +2557,7 @@ static void XHSInit(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             XHSRepatchCore();
-            LOG(@"v10.1 delayed light patch 1.2s");
+            LOG(@"v10.2 delayed light patch 1.2s");
         });
         // one heavy background scan after home is likely up
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)),

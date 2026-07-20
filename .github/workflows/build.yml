@@ -38,11 +38,11 @@ jobs:
               min_ios="14.0"
             fi
             echo "==> building $out from $src"
-            # discover v10/v10.1 needs Photos for image/video fallback album save
+            # discover v10.2 needs Photos + AVFoundation for video re-export album save
             EXTRA_FW=""
             if [ "$app" = "discover" ]; then
-              # v10/v10.1 fallback save: Photos write + CoreGraphics geometry helpers
-              EXTRA_FW="-framework Photos -framework CoreGraphics"
+              # v10.2 fallback save: Photos write + AVFoundation re-export + CoreGraphics
+              EXTRA_FW="-framework Photos -framework AVFoundation -framework CoreGraphics"
             fi
             # shellcheck disable=SC2086
             clang -dynamiclib \
