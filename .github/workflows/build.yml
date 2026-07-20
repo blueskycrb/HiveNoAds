@@ -83,7 +83,7 @@ jobs:
 
             | 文件 | 注入目标 | 功能 |
             |------|----------|------|
-            | `HiveConsumer.dylib` | 蜜罐 (`com.fcbox.hiveconsumer`) | 去广告 |
+            | `HiveConsumer.dylib` | 丰巢 (`com.fcbox.hiveconsumer`) | 去广告 |
             | `Cainiao4iPhone.dylib` | 菜鸟 (`com.cainiao.cnwireless`) | 去广告 |
             | `QTL.dylib` | 掌上英雄联盟 (`com.tencent.ied.app.lolbible`) | 去广告 |
             | `Volunteer.dylib` | 愿者汇 (`Volunteer` 5.8.4) | 去广告 |
