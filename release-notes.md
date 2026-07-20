@@ -1,0 +1,32 @@
+按 **注入目标（App 产品名）** 命名的 dylib（TrollFools，无 Substrate）。
+
+| 文件 | 注入目标 | 功能 |
+|------|----------|------|
+| `丰巢.dylib` | 丰巢 (`com.fcbox.hiveconsumer`) | 去广告 |
+| `菜鸟.dylib` | 菜鸟 (`com.cainiao.cnwireless`) | 去广告 |
+| `掌上英雄联盟.dylib` | 掌上英雄联盟 (`com.tencent.ied.app.lolbible`) | 去广告 |
+| `志愿汇.dylib` | 志愿汇 (`Volunteer` 5.8.4) | 去广告 |
+| `中国移动云盘.dylib` | 中国移动云盘 (`com.chinamobile.mcloud` / 13.0.0) | 去广告 |
+| `中国广电.dylib` | 中国广电 (`com.cbn.app` / ChinaRadio 2.0.8) | 去广告 |
+| **`小红书.dylib`** | **小红书** (`com.xingin.discover` / `discover` 9.38.1) | **解锁保存别人帖子图片/视频** |
+
+> 旧名（`HiveConsumer.dylib` / `discover.dylib` 等）请先移除再注入新产品名文件。
+
+## 用法
+1. 下载对应 `产品名.dylib`
+2. TrollFools → 选择 App → 注入
+3. 彻底杀掉 App 后冷启动
+
+## 小红书 `小红书.dylib`（v10.2：图片 + 视频悬浮兜底）
+- 保持 v8/v9 轻量启动：无 NSBundle 全局 hook、无 ctor 全类扫描、无 session 包装
+- 原生门控：`disableSave=NO` / `SaveProvider.enable` / capa toast 过滤 / JSON 限流改写
+- **图片兜底**：右侧半透明 ↓ + 双指长按，抓 CDN 原图 URL 或当前 UIImage 写相册
+- **视频兜底**：抓 `master_url` / `videoURL` / `sns-video` 等 CDN；下载后用 AVFoundation 重编码再写相册，避免 PHPhotosErrorDomain 3302
+- 使用：TrollFools 移除旧 dylib 后重注；冷启动 → 打开锁下载笔记 → 点 ↓ 或双指长按
+- 设置 → 小红书 → 照片 → 允许添加
+- 不破解付费墙；服务端硬拦时原生入口仍可能不出现，用悬浮按钮
+
+## v2 性能（去广告类）
+- 取消全进程类扫描（各 App 按自身实现）
+- 取消 UIView 全局 swizzle
+- 默认关闭日志
