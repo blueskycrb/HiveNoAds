@@ -28,19 +28,19 @@ jobs:
           fi
           for src in "${srcs[@]}"; do
             app=$(basename "$(dirname "$src")")
-            # dylib 与注入目标产品名同名: apps/丰巢/丰巢.m -> 丰巢.dylib
+            # dylib named by product (injection target): apps/Fengchao/Fengchao.m -> Fengchao.dylib
             out="dist/${app}.dylib"
             min_ios="13.0"
-            if [ "$app" = "掌上英雄联盟" ]; then
+            if [ "$app" = "LoLMobile" ]; then
               min_ios="11.0"
             fi
-            if [ "$app" = "小红书" ]; then
+            if [ "$app" = "Xiaohongshu" ]; then
               min_ios="14.0"
             fi
             echo "==> building $out from $src"
-            # 小红书 v10.2 needs Photos + AVFoundation for video re-export album save
+            # Xiaohongshu v10.2 needs Photos + AVFoundation for video re-export album save
             EXTRA_FW=""
-            if [ "$app" = "小红书" ]; then
+            if [ "$app" = "Xiaohongshu" ]; then
               # v10.2 fallback save: Photos write + AVFoundation re-export + CoreGraphics
               EXTRA_FW="-framework Photos -framework AVFoundation -framework CoreGraphics"
             fi
@@ -81,7 +81,7 @@ jobs:
           TAG="build-${{ github.run_number }}"
           TITLE="NoAds dylibs #${{ github.run_number }}"
           # softprops/action-gh-release breaks on non-ASCII asset names.
-          # gh CLI upload handles UTF-8 filenames (丰巢.dylib / 小红书.dylib).
+          # Product-name dylibs (ASCII) for GitHub Releases compatibility.
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG exists"
             gh release edit "$TAG" --title "$TITLE" --notes-file release-notes.md --draft=false

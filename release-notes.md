@@ -1,23 +1,25 @@
 按 **注入目标（App 产品名）** 命名的 dylib（TrollFools，无 Substrate）。
 
+> GitHub Release 资源名使用 **产品名拼音/英文**（中文文件名会被 GitHub 改成 default.dylib）。
+
 | 文件 | 注入目标 | 功能 |
 |------|----------|------|
-| `丰巢.dylib` | 丰巢 (`com.fcbox.hiveconsumer`) | 去广告 |
-| `菜鸟.dylib` | 菜鸟 (`com.cainiao.cnwireless`) | 去广告 |
-| `掌上英雄联盟.dylib` | 掌上英雄联盟 (`com.tencent.ied.app.lolbible`) | 去广告 |
-| `志愿汇.dylib` | 志愿汇 (`Volunteer` 5.8.4) | 去广告 |
-| `中国移动云盘.dylib` | 中国移动云盘 (`com.chinamobile.mcloud` / 13.0.0) | 去广告 |
-| `中国广电.dylib` | 中国广电 (`com.cbn.app` / ChinaRadio 2.0.8) | 去广告 |
-| **`小红书.dylib`** | **小红书** (`com.xingin.discover` / `discover` 9.38.1) | **解锁保存别人帖子图片/视频** |
+| `Fengchao.dylib` | 丰巢 (`com.fcbox.hiveconsumer` / `HiveConsumer`) | 去广告 |
+| `Cainiao.dylib` | 菜鸟 (`com.cainiao.cnwireless` / `Cainiao4iPhone`) | 去广告 |
+| `LoLMobile.dylib` | 掌上英雄联盟 (`com.tencent.ied.app.lolbible` / `QTL`) | 去广告 |
+| `Zhiyuanhui.dylib` | 志愿汇 (`Volunteer` 5.8.4) | 去广告 |
+| `ChinaMobileCloud.dylib` | 中国移动云盘 (`com.chinamobile.mcloud` / `mCloud_iPhone`) | 去广告 |
+| `ChinaRadio.dylib` | 中国广电 (`com.cbn.app` / `ChinaRadio`) | 去广告 |
+| **`Xiaohongshu.dylib`** | **小红书** (`com.xingin.discover` / `discover`) | **解锁保存别人帖子图片/视频** |
 
-> 旧名（`HiveConsumer.dylib` / `discover.dylib` 等）请先移除再注入新产品名文件。
+> 旧名请先移除再注入：`HiveConsumer.dylib` → `Fengchao.dylib`，`discover.dylib` → `Xiaohongshu.dylib` 等。
 
 ## 用法
-1. 下载对应 `产品名.dylib`
-2. TrollFools → 选择 App → 注入
+1. 下载对应产品名 `*.dylib`（见上表）
+2. TrollFools → 选择对应 App → 注入
 3. 彻底杀掉 App 后冷启动
 
-## 小红书 `小红书.dylib`（v10.2：图片 + 视频悬浮兜底）
+## 小红书 `Xiaohongshu.dylib`（v10.2：图片 + 视频悬浮兜底）
 - 保持 v8/v9 轻量启动：无 NSBundle 全局 hook、无 ctor 全类扫描、无 session 包装
 - 原生门控：`disableSave=NO` / `SaveProvider.enable` / capa toast 过滤 / JSON 限流改写
 - **图片兜底**：右侧半透明 ↓ + 双指长按，抓 CDN 原图 URL 或当前 UIImage 写相册
