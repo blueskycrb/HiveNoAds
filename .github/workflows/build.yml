@@ -28,19 +28,19 @@ jobs:
           fi
           for src in "${srcs[@]}"; do
             app=$(basename "$(dirname "$src")")
-            # dylib 与 App 同名: apps/HiveConsumer/HiveConsumer.m -> HiveConsumer.dylib
+            # dylib 与注入目标产品名同名: apps/丰巢/丰巢.m -> 丰巢.dylib
             out="dist/${app}.dylib"
             min_ios="13.0"
-            if [ "$app" = "QTL" ]; then
+            if [ "$app" = "掌上英雄联盟" ]; then
               min_ios="11.0"
             fi
-            if [ "$app" = "discover" ]; then
+            if [ "$app" = "小红书" ]; then
               min_ios="14.0"
             fi
             echo "==> building $out from $src"
-            # discover v10.2 needs Photos + AVFoundation for video re-export album save
+            # 小红书 v10.2 needs Photos + AVFoundation for video re-export album save
             EXTRA_FW=""
-            if [ "$app" = "discover" ]; then
+            if [ "$app" = "小红书" ]; then
               # v10.2 fallback save: Photos write + AVFoundation re-export + CoreGraphics
               EXTRA_FW="-framework Photos -framework AVFoundation -framework CoreGraphics"
             fi
@@ -79,24 +79,24 @@ jobs:
           tag_name: build-${{ github.run_number }}
           name: NoAds dylibs #${{ github.run_number }}
           body: |
-            按 **App 名** 命名的 dylib（TrollFools，无 Substrate）。
+            按 **注入目标（App 产品名）** 命名的 dylib（TrollFools，无 Substrate）。
 
             | 文件 | 注入目标 | 功能 |
             |------|----------|------|
-            | `HiveConsumer.dylib` | 丰巢 (`com.fcbox.hiveconsumer`) | 去广告 |
-            | `Cainiao4iPhone.dylib` | 菜鸟 (`com.cainiao.cnwireless`) | 去广告 |
-            | `QTL.dylib` | 掌上英雄联盟 (`com.tencent.ied.app.lolbible`) | 去广告 |
-            | `Volunteer.dylib` | 愿者汇 (`Volunteer` 5.8.4) | 去广告 |
-            | `mCloud_iPhone.dylib` | 中国移动云盘 (`com.chinamobile.mcloud` / 13.0.0) | 去广告 |
-            | `ChinaRadio.dylib` | 中国广电 (`com.cbn.app` / ChinaRadio 2.0.8) | 去广告 |
-            | **`discover.dylib`** | **小红书** (`com.xingin.discover` / `discover` 9.38.1) | **解锁保存别人帖子图片/视频** |
+            | `丰巢.dylib` | 丰巢 (`com.fcbox.hiveconsumer`) | 去广告 |
+            | `菜鸟.dylib` | 菜鸟 (`com.cainiao.cnwireless`) | 去广告 |
+            | `掌上英雄联盟.dylib` | 掌上英雄联盟 (`com.tencent.ied.app.lolbible`) | 去广告 |
+            | `志愿汇.dylib` | 志愿汇 (`Volunteer` 5.8.4) | 去广告 |
+            | `中国移动云盘.dylib` | 中国移动云盘 (`com.chinamobile.mcloud` / 13.0.0) | 去广告 |
+            | `中国广电.dylib` | 中国广电 (`com.cbn.app` / ChinaRadio 2.0.8) | 去广告 |
+            | **`小红书.dylib`** | **小红书** (`com.xingin.discover` / `discover` 9.38.1) | **解锁保存别人帖子图片/视频** |
 
             ## 用法
-            1. 下载对应 `AppName.dylib`
+            1. 下载对应 `产品名.dylib`
             2. TrollFools → 选择 App → 注入
             3. 彻底杀掉 App 后冷启动
 
-            ## 小红书 `discover.dylib`（v10.2：图片 + 视频悬浮兜底）
+            ## 小红书 `小红书.dylib`（v10.2：图片 + 视频悬浮兜底）
             - 保持 v8/v9 轻量启动：无 NSBundle 全局 hook、无 ctor 全类扫描、无 session 包装
             - 原生门控：`disableSave=NO` / `SaveProvider.enable` / capa toast 过滤 / JSON 限流改写
             - **图片兜底**：右侧半透明 ↓ + 双指长按，抓 CDN 原图 URL 或当前 UIImage 写相册

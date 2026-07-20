@@ -1,32 +1,32 @@
 # NoAds / Tools dylibs (TrollFools)
 
-按 **App 可执行文件名 / 产品名** 命名的动态库，专供 [TrollFools](https://github.com/Lessica/TrollFools) 注入。  
+按 **注入目标（App 产品名）** 命名的动态库，专供 [TrollFools](https://github.com/Lessica/TrollFools) 注入。  
 **不依赖** MobileSubstrate / 越狱。
 
 ## 下载
 
-- [Releases](../../releases) 里每个 `AppName.dylib`
+- [Releases](../../releases) 里每个 `产品名.dylib`（如 `丰巢.dylib`、`小红书.dylib`）
 - 或 [Actions](../../actions) 最新成功 run 的 artifact `noads-dylibs`
 
 ## 已支持
 
 | dylib | App | Bundle ID / 可执行名 | 功能 |
 |-------|-----|----------------------|------|
-| **HiveConsumer.dylib** | 丰巢 | `com.fcbox.hiveconsumer` | 去广告 |
-| **Cainiao4iPhone.dylib** | 菜鸟 | `com.cainiao.cnwireless` | 去广告 |
-| **QTL.dylib** | 掌上英雄联盟 | `com.tencent.ied.app.lolbible` | 去广告 |
-| **Volunteer.dylib** | 志愿汇 | 可执行名 `Volunteer`（分析版本 5.8.4） | 去广告 |
-| **mCloud_iPhone.dylib** | 中国移动云盘 | `com.chinamobile.mcloud` / `mCloud_iPhone`（分析版本 13.0.0） | 去广告 |
-| **ChinaRadio.dylib** | 中国广电 / ChinaRadio | `com.cbn.app` / `ChinaRadio`（分析版本 2.0.8） | 去广告 |
-| **discover.dylib** | 小红书 | `com.xingin.discover` / `discover`（分析版本 9.38.1） | **图片+视频保存解锁** |
+| **丰巢.dylib** | 丰巢 | `com.fcbox.hiveconsumer` / `HiveConsumer` | 去广告 |
+| **菜鸟.dylib** | 菜鸟 | `com.cainiao.cnwireless` / `Cainiao4iPhone` | 去广告 |
+| **掌上英雄联盟.dylib** | 掌上英雄联盟 | `com.tencent.ied.app.lolbible` / `QTL` | 去广告 |
+| **志愿汇.dylib** | 志愿汇 | `Volunteer`（分析版本 5.8.4） | 去广告 |
+| **中国移动云盘.dylib** | 中国移动云盘 | `com.chinamobile.mcloud` / `mCloud_iPhone`（分析版本 13.0.0） | 去广告 |
+| **中国广电.dylib** | 中国广电 | `com.cbn.app` / `ChinaRadio`（分析版本 2.0.8） | 去广告 |
+| **小红书.dylib** | 小红书 | `com.xingin.discover` / `discover`（分析版本 9.38.1） | **图片+视频保存解锁** |
 
 ## 使用 (TrollFools)
 
-1. 下载与 App 同名的 dylib（如 `HiveConsumer.dylib`）
+1. 下载与注入目标同名的 dylib（如 `丰巢.dylib`、`小红书.dylib`）
 2. TrollFools → 选对应 App → 注入
 3. **彻底划掉** App 再打开
 
-若之前注入过旧的 `HiveNoAds.dylib`，请先在 TrollFools 里 **移除旧插件**，再注入新的 `HiveConsumer.dylib`。
+若之前注入过旧名（如 `HiveConsumer.dylib` / `discover.dylib` / `HiveNoAds.dylib`），请先在 TrollFools 里 **移除旧插件**，再注入新的产品名 dylib（如 `丰巢.dylib`、`小红书.dylib`）。
 
 ## 启动变慢？(已优化)
 
@@ -37,7 +37,7 @@
 3. 默认 `NSLog` 很吵  
 4. 2s / 3s / 6s 多次全量重扫  
 
-**当前 `HiveConsumer.dylib`（v2）：**
+**当前 `丰巢.dylib`（v2）：**
 
 - 只 hook 白名单里的广告类  
 - 只给广告 View 子类装 `didMoveToWindow`  
@@ -50,20 +50,20 @@
 
 ```
 apps/
-  HiveConsumer/
-    HiveConsumer.m      → 编译为 HiveConsumer.dylib
-  Cainiao4iPhone/
-    Cainiao4iPhone.m    → 编译为 Cainiao4iPhone.dylib
-  QTL/
-    QTL.m               → 编译为 QTL.dylib（掌上英雄联盟）
-  Volunteer/
-    Volunteer.m         → 编译为 Volunteer.dylib
-  mCloud_iPhone/
-    mCloud_iPhone.m     → 编译为 mCloud_iPhone.dylib（移动云盘）
-  ChinaRadio/
-    ChinaRadio.m        → 编译为 ChinaRadio.dylib（中国广电）
-  discover/
-    discover.m          → 编译为 discover.dylib（小红书图片/视频保存）
+  丰巢/
+    丰巢.m              → 丰巢.dylib
+  菜鸟/
+    菜鸟.m              → 菜鸟.dylib
+  掌上英雄联盟/
+    掌上英雄联盟.m    → 掌上英雄联盟.dylib
+  志愿汇/
+    志愿汇.m            → 志愿汇.dylib
+  中国移动云盘/
+    中国移动云盘.m      → 中国移动云盘.dylib
+  中国广电/
+    中国广电.m          → 中国广电.dylib
+  小红书/
+    小红书.m            → 小红书.dylib（图片/视频保存）
   # 下一个 App:
   # SomeApp/
   #   SomeApp.m         → SomeApp.dylib
@@ -72,17 +72,17 @@ apps/
 
 约定：
 
-- 目录名 = dylib 名 = 建议与 App 可执行文件名一致  
+- 目录名 = dylib 名 = 注入目标 App 产品名（可执行名只作参考）  
 - 每个 App 一个 `.m`，互不依赖  
 - push 到 `main` 即构建全部 dylib 并发 Release  
 
 需要去广告的新 App：丢解密包 / IPA 里主二进制，或说明 Bundle ID，我按同样结构加 `apps/新名字/`。
 
-## 小红书 `discover.dylib`（解锁保存别人帖子图片 / 视频）
+## 小红书 `小红书.dylib`（解锁保存别人帖子图片 / 视频）
 
 **优先原生保存**；若作者关闭下载权限仍拦，用右侧 **↓** 悬浮按钮或双指长按兜底保存。
 
-1. 下载 [Releases](../../releases) 里的 **`discover.dylib`**
+1. 下载 [Releases](../../releases) 里的 **`小红书.dylib`**
 2. TrollFools → 选 **小红书** → 注入（若已注入旧版，先移除再注新版）
 3. **彻底划掉**小红书再打开
 4. **图片**：别人图文笔记 → 长按图片 / 分享 → **保存图片**
@@ -114,7 +114,7 @@ apps/
 - **悬浮按钮约 2.4s 后挂载**，不在 ctor 里做 UI / 全类扫描
 
 ### 使用（重新注入后）
-1. TrollFools 先 **移除旧 discover.dylib**，再注入新构建
+1. TrollFools 先 **移除旧 `小红书.dylib` / `discover.dylib`**，再注入新构建
 2. 冷启动应流畅；打开关闭下载权限的图文 / 视频笔记
 3. 先试原生保存/分享里的“保存图片 / 保存视频”
 4. 若仍提示作者关闭下载：点右侧 **↓**，或双指长按媒体
@@ -133,22 +133,22 @@ apps/
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 clang -dynamiclib -isysroot "$SDK" -arch arm64 -miphoneos-version-min=13.0 \
   -fobjc-arc -O2 -framework Foundation -framework UIKit \
-  -o HiveConsumer.dylib apps/HiveConsumer/HiveConsumer.m
+  -o 丰巢.dylib apps/丰巢/丰巢.m
 
-# discover 需要 Photos + CoreGraphics:
+# 小红书 需要 Photos + AVFoundation + CoreGraphics:
 # clang ... -framework Foundation -framework UIKit -framework Photos -framework CoreGraphics \
-#   -o discover.dylib apps/discover/discover.m
+#   -o 小红书.dylib apps/小红书/小红书.m
 ```
 
 ## 调试
 
-把 `apps/HiveConsumer/HiveConsumer.m` 顶部：
+把 `apps/丰巢/丰巢.m` 顶部：
 
 ```objc
 static const BOOL kVerbose = YES;
 ```
 
-再推送构建。Console 过滤 `HiveConsumer`。
+再推送构建。Console 过滤 `HiveConsumer` / `丰巢`。
 
 ## 说明
 
