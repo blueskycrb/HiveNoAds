@@ -1596,8 +1596,6 @@ static void XHSFallbackSaveData(NSData *data, void (^done)(BOOL, NSError *)) {
 }
 
 static UIWindow *XHSFallbackKeyWindow(void) {
-    UIWindow *win = UIApplication.sharedApplication.keyWindow;
-    if (win) return win;
     for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
         if (![sc isKindOfClass:[UIWindowScene class]]) continue;
         UIWindowScene *ws = (UIWindowScene *)sc;
@@ -1610,7 +1608,11 @@ static UIWindow *XHSFallbackKeyWindow(void) {
         }
         if (ws.windows.count) return ws.windows.firstObject;
     }
-    return nil;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    UIWindow *legacy = UIApplication.sharedApplication.keyWindow;
+#pragma clang diagnostic pop
+    return legacy;
 }
 
 static void XHSFallbackToast(NSString *msg) {
@@ -1900,16 +1902,19 @@ static void XHSFallbackForceSaveFromView(UIView *view) {
 + (void)install {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        __block void (^tryAttach)(void) = nil;
-        tryAttach = ^{
+        __block __weak void (^weakTryAttach)(void) = nil;
+        void (^tryAttach)(void) = ^{
+            void (^strongTry)(void) = weakTryAttach;
             UIWindow *win = XHSFallbackKeyWindow();
             if (!win) {
+                if (!strongTry) return;
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), tryAttach);
+                               dispatch_get_main_queue(), strongTry);
                 return;
             }
             [self attachToWindow:win];
         };
+        weakTryAttach = tryAttach;
         // wait until home/window exists; do not run at ctor
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.4 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), tryAttach);

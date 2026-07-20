@@ -41,8 +41,8 @@ jobs:
             # discover v9 needs Photos for fallback album save
             EXTRA_FW=""
             if [ "$app" = "discover" ]; then
-              # v9 fallback save writes Photos; link Photos framework
-              EXTRA_FW="-framework Photos"
+              # v9 fallback save: Photos write + CoreGraphics geometry helpers
+              EXTRA_FW="-framework Photos -framework CoreGraphics"
             fi
             # shellcheck disable=SC2086
             clang -dynamiclib \
