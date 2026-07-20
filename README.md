@@ -80,7 +80,7 @@ apps/
 
 ## 小红书 `discover.dylib`（解锁保存别人帖子图片 / 视频）
 
-**没有悬浮按钮、不会截图。** 只打开 App 自带的保存能力。
+**优先原生保存**；若作者关闭下载权限仍拦，用右侧 **↓** 悬浮按钮或双指长按兜底保存。
 
 1. 下载 [Releases](../../releases) 里的 **`discover.dylib`**
 2. TrollFools → 选 **小红书** → 注入（若已注入旧版，先移除再注新版）
@@ -89,18 +89,41 @@ apps/
 5. **视频**：别人视频笔记 → 分享 / 更多 → **保存视频**（走 App 原生下载）
 6. 设置 → 小红书 → 照片 → **允许添加**
 
-### v8 原理（稳定优先 / 修启动卡死）
+### v9 原理（稳定 + 真正能保存）
+
+作者关下载权限时，客户端常只是把 `disableSave` / `SaveProvider.enable` 等开关关掉，**原生按钮仍可能不可用**。v9 做两件事：
+
+1. **原生门控解锁（轻量）**
+   - `XYPHMediaSaveConfig.disableSave = NO`、`shareImageSaveEnable = YES`
+   - `SaveProvider.enable = YES`（仅保存相关类）
+   - capa 下载权限 toast / i18n key 过滤
+   - 相关 JSON 限流改写（<=512KB）
+
+2. **兜底保存（关键，参考可工作插件）**
+   - 屏幕右侧半透明 **↓** 悬浮按钮（可拖动）
+   - 或 **双指长按** 图片区域
+   - 优先抓当前笔记 CDN 原图 URL（`origin` / `url_size_large`）下载写入相册
+   - 失败再落盘当前 `UIImage` / 截图
+
+### v9 稳定性（继承 v8）
 - **启动期只 hook 已知类**：构造函数里不做 `objc_copyClassList` 全量扫描
 - **去掉 `NSBundle localizedStringForKey:` 全局 hook**（v7 启动卡死主因）
 - **去掉 `NSURLSession dataTask` 包装**（避免首页网络/打开笔记卡顿）
-- **JSON 改写限流**：仅相关且 <=512KB 的 payload 才 rewrite，不再对所有 JSON 强制 mutable
+- **JSON 改写限流**：仅相关且 <=512KB 的 payload 才 rewrite
 - **toast / i18n / mediaSaveConfig / authority**：加载时 known-only，约 1.8s 后后台一次延迟扫描
-- 仍保留 v7 能力：capa 下载权限 toast 文本/key 过滤、SaveProvider 解锁、`mediaSaveConfig` 强制允许保存
+- **悬浮按钮约 2.4s 后挂载**，不在 ctor 里做 UI / 全类扫描
 
-### v7 说明（已由 v8 取代）
-- 图片：`XYPHMediaSaveConfig.disableSave = NO`，并 hook `valueForKey:` / `setValue:forKey:`
-- capa toast：`capa_allow_download_account_toast` / 真实文案过滤
-- 但 v7 在 ctor 扫全类 + hook NSBundle，可能导致一进 app 卡住 / 开帖闪退
+### 使用（重新注入后）
+1. TrollFools 先 **移除旧 discover.dylib**，再注入新构建
+2. 冷启动应流畅；打开关闭下载权限的图文笔记
+3. 先试原生保存/分享里的“保存图片”
+4. 若仍提示作者关闭下载：点右侧 **↓**，或双指长按图片
+5. 首次会弹相册权限，请允许
+6. Console 可过滤 `[XHSMediaSave]`
+
+### v8 / v7 说明
+- v8 修好了卡死，但仅靠原生开关仍可能保存不了
+- v7 在 ctor 扫全类 + hook NSBundle，易卡死/闪退
 
 ## 本地编译 (macOS)
 
@@ -109,6 +132,10 @@ SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 clang -dynamiclib -isysroot "$SDK" -arch arm64 -miphoneos-version-min=13.0 \
   -fobjc-arc -O2 -framework Foundation -framework UIKit \
   -o HiveConsumer.dylib apps/HiveConsumer/HiveConsumer.m
+
+# discover 需要 Photos:
+# clang ... -framework Foundation -framework UIKit -framework Photos \
+#   -o discover.dylib apps/discover/discover.m
 ```
 
 ## 调试

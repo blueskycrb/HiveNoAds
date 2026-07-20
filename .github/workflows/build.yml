@@ -38,8 +38,12 @@ jobs:
               min_ios="14.0"
             fi
             echo "==> building $out from $src"
-            # discover 仅 runtime swizzle，Foundation+UIKit 足够
+            # discover v9 needs Photos for fallback album save
             EXTRA_FW=""
+            if [ "$app" = "discover" ]; then
+              # v9 fallback save writes Photos; link Photos framework
+              EXTRA_FW="-framework Photos"
+            fi
             # shellcheck disable=SC2086
             clang -dynamiclib \
               -isysroot "$SDK" \
@@ -92,17 +96,14 @@ jobs:
             2. TrollFools → 选择 App → 注入
             3. 彻底杀掉 App 后冷启动
 
-            ## 小红书 `discover.dylib`（无悬浮按钮、不截图，v5）
-            - 强制 `disableSave=NO` + 作者隐私下载开关：
-              `hitUserNoteDownloadSwitch` / `userNoteDownloadSwitch` / `isFlowDownloadSwitchOn`
-            - `SaveProvider.enable` / SaveCell / SaveImageService 分享面板入口强制打开
-            - `NSUserDefaults` 隐私下载 key 读路径强制允许
-            - 轻量 toast 过滤「作者关闭下载权限」/ `capa_allow_download_account_toast`
-            - **NSJSONSerialization** + JSON 字节替换改写笔记响应下载开关
-            - `mediaSaveConfig` getter/setter 按类保存原 IMP，访问时强制允许保存
-            - 图文/视频走 App 原生「保存图片/保存视频」
+            ## 小红书 `discover.dylib`（v9：原生解锁 + 悬浮兜底保存）
+            - 保持 v8 轻量启动：无 NSBundle 全局 hook、无 ctor 全类扫描、无 session 包装
+            - 原生门控：`disableSave=NO` / `SaveProvider.enable` / capa toast 过滤 / JSON 限流改写
+            - **兜底**：右侧半透明 ↓ 悬浮按钮 + 双指长按，抓 CDN 原图 URL 或当前 UIImage 写入相册
+            - 使用：TrollFools 移除旧 dylib 后重注；冷启动 → 打开锁下载笔记 → 点 ↓ 或双指长按
             - 设置 → 小红书 → 照片 → 允许添加
-            - 不破解付费墙；服务端硬拦时入口仍可能不出现
+            - 不破解付费墙；服务端硬拦时原生入口仍可能不出现，用悬浮按钮
+
 
             ## v2 性能（去广告类）
             - 取消全进程类扫描（各 App 按自身实现）

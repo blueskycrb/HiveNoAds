@@ -2,6 +2,13 @@
 // discover.dylib - Xiaohongshu unlock native image/video save (perf-first)
 // Bundle: com.xingin.discover | executable: discover | analyzed: 9.38.1
 //
+// v9 (real save path):
+//   - Keep v8 light startup (no NSBundle / no ctor class-scan / no session wrap)
+//   - Native gate unlock retained (disableSave / SaveProvider / toast / JSON)
+//   - NEW fallback: floating save button + 2-finger long press
+//     grabs CDN URL (origin/large first) or on-screen UIImage -> Photos
+//   - Author "download closed" often only flips client flags; CDN may still be fetchable
+//
 // v8 (perf/stability fix):
 //   - REMOVE NSBundle localizedStringForKey global hook (launch hang)
 //   - NO class-list scans in constructor; known-class only at load
@@ -19,6 +26,7 @@
 //
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <Photos/Photos.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <string.h>
@@ -1503,6 +1511,482 @@ static void XHSInstallAuthorityPatches(void) {
     });
 }
 
+
+#pragma mark - fallback save (float button / 2-finger long press)
+
+// Native flag flips alone are not enough on 9.38.1 when author closes download.
+// Fallback grabs current image URL / UIImage and writes Photos itself.
+
+static void XHSFallbackAuthThen(void (^block)(BOOL granted)) {
+    void (^finish)(PHAuthorizationStatus) = ^(PHAuthorizationStatus st) {
+        BOOL g = (st == PHAuthorizationStatusAuthorized);
+        if (@available(iOS 14, *)) {
+            g = g || (st == PHAuthorizationStatusLimited);
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{ if (block) block(g); });
+    };
+    if (@available(iOS 14, *)) {
+        PHAuthorizationStatus st = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelAddOnly];
+        if (st == PHAuthorizationStatusNotDetermined) {
+            [PHPhotoLibrary requestAuthorizationForAccessLevel:PHAccessLevelAddOnly handler:finish];
+        } else {
+            finish(st);
+        }
+    } else {
+        PHAuthorizationStatus st = [PHPhotoLibrary authorizationStatus];
+        if (st == PHAuthorizationStatusNotDetermined) {
+            [PHPhotoLibrary requestAuthorization:finish];
+        } else {
+            finish(st);
+        }
+    }
+}
+
+static void XHSFallbackSaveImage(UIImage *image, void (^done)(BOOL, NSError *)) {
+    if (!image) {
+        if (done) done(NO, [NSError errorWithDomain:@"XHSMediaSave" code:1
+                              userInfo:@{NSLocalizedDescriptionKey: @"nil image"}]);
+        return;
+    }
+    XHSFallbackAuthThen(^(BOOL granted) {
+        if (!granted) {
+            if (done) done(NO, [NSError errorWithDomain:@"XHSMediaSave" code:2
+                                  userInfo:@{NSLocalizedDescriptionKey: @"album permission denied"}]);
+            return;
+        }
+        [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
+            [PHAssetChangeRequest creationRequestForAssetFromImage:image];
+        } completionHandler:^(BOOL success, NSError *error) {
+            dispatch_async(dispatch_get_main_queue(), ^{ if (done) done(success, error); });
+        }];
+    });
+}
+
+static void XHSFallbackSaveData(NSData *data, void (^done)(BOOL, NSError *)) {
+    if (data.length < 32) {
+        if (done) done(NO, [NSError errorWithDomain:@"XHSMediaSave" code:3
+                              userInfo:@{NSLocalizedDescriptionKey: @"empty data"}]);
+        return;
+    }
+    UIImage *img = [UIImage imageWithData:data];
+    if (img) {
+        XHSFallbackSaveImage(img, done);
+        return;
+    }
+    XHSFallbackAuthThen(^(BOOL granted) {
+        if (!granted) {
+            if (done) done(NO, [NSError errorWithDomain:@"XHSMediaSave" code:2
+                                  userInfo:@{NSLocalizedDescriptionKey: @"album permission denied"}]);
+            return;
+        }
+        NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                          [NSString stringWithFormat:@"xhs_fb_%@.img", NSUUID.UUID.UUIDString]];
+        if (![data writeToFile:path atomically:YES]) {
+            if (done) done(NO, [NSError errorWithDomain:@"XHSMediaSave" code:4
+                                  userInfo:@{NSLocalizedDescriptionKey: @"write tmp fail"}]);
+            return;
+        }
+        [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
+            [PHAssetChangeRequest creationRequestForAssetFromImageAtFileURL:[NSURL fileURLWithPath:path]];
+        } completionHandler:^(BOOL success, NSError *error) {
+            [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+            dispatch_async(dispatch_get_main_queue(), ^{ if (done) done(success, error); });
+        }];
+    });
+}
+
+static UIWindow *XHSFallbackKeyWindow(void) {
+    UIWindow *win = UIApplication.sharedApplication.keyWindow;
+    if (win) return win;
+    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *ws = (UIWindowScene *)sc;
+        if (ws.activationState != UISceneActivationStateForegroundActive &&
+            ws.activationState != UISceneActivationStateForegroundInactive) {
+            continue;
+        }
+        for (UIWindow *w in ws.windows) {
+            if (w.isKeyWindow) return w;
+        }
+        if (ws.windows.count) return ws.windows.firstObject;
+    }
+    return nil;
+}
+
+static void XHSFallbackToast(NSString *msg) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *win = XHSFallbackKeyWindow();
+        if (!win) return;
+        UILabel *lab = [UILabel new];
+        lab.text = msg;
+        lab.textColor = UIColor.whiteColor;
+        lab.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.82];
+        lab.font = [UIFont boldSystemFontOfSize:14];
+        lab.textAlignment = NSTextAlignmentCenter;
+        lab.numberOfLines = 0;
+        lab.layer.cornerRadius = 10;
+        lab.clipsToBounds = YES;
+        CGSize fit = [lab sizeThatFits:CGSizeMake(win.bounds.size.width - 72, 160)];
+        lab.frame = CGRectMake(0, 0, fit.width + 28, fit.height + 16);
+        lab.center = CGPointMake(CGRectGetMidX(win.bounds), win.bounds.size.height * 0.78);
+        [win addSubview:lab];
+        [UIView animateWithDuration:0.2 delay:1.6 options:0 animations:^{ lab.alpha = 0; }
+                         completion:^(__unused BOOL f) { [lab removeFromSuperview]; }];
+    });
+}
+
+static BOOL XHSFallbackIsImageURL(NSString *s) {
+    if (s.length < 12) return NO;
+    NSString *l = s.lowercaseString;
+    if (![l hasPrefix:@"http"]) return NO;
+    return [l containsString:@"xhscdn"] ||
+           [l containsString:@"xiaohongshu"] ||
+           [l containsString:@"sns-img"] ||
+           [l containsString:@"sns-webpic"] ||
+           [l containsString:@".jpg"] ||
+           [l containsString:@".jpeg"] ||
+           [l containsString:@".png"] ||
+           [l containsString:@".webp"] ||
+           [l containsString:@".heic"] ||
+           [l containsString:@"fmt=jpeg"] ||
+           [l containsString:@"fmt=png"] ||
+           [l containsString:@"fmt=webp"] ||
+           [l containsString:@"/image"] ||
+           [l containsString:@"imageView2"] ||
+           [l containsString:@"ci.xiaohongshu"];
+}
+
+static void XHSFallbackCollect(id obj, NSMutableSet<NSString *> *out, NSInteger depth) {
+    if (!obj || depth > 6) return;
+    if ([obj isKindOfClass:[NSString class]]) {
+        if (XHSFallbackIsImageURL((NSString *)obj)) [out addObject:(NSString *)obj];
+        return;
+    }
+    if ([obj isKindOfClass:[NSURL class]]) {
+        NSString *s = [(NSURL *)obj absoluteString];
+        if (XHSFallbackIsImageURL(s)) [out addObject:s];
+        return;
+    }
+    if ([obj isKindOfClass:[NSArray class]]) {
+        for (id x in (NSArray *)obj) XHSFallbackCollect(x, out, depth + 1);
+        return;
+    }
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        [(NSDictionary *)obj enumerateKeysAndObjectsUsingBlock:^(__unused id k, id v, __unused BOOL *stop) {
+            XHSFallbackCollect(v, out, depth + 1);
+        }];
+        return;
+    }
+    static NSArray<NSString *> *keys;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        keys = @[
+            @"url", @"urlString", @"imageUrl", @"imageURL", @"image_url",
+            @"originUrl", @"originalUrl", @"origin_url", @"original_url",
+            @"url_size_large", @"url_default", @"urlDefault", @"urlSizeLarge",
+            @"largeUrl", @"veryLargeImageUrl", @"originImageUrl", @"originImgUrl",
+            @"info_list", @"infoList", @"urlInfoList", @"url_info_list",
+            @"originImgInfo", @"imageInfo", @"image_list", @"url_multi",
+            @"livePhotoUrl", @"live_photo_url", @"fileid", @"fileId",
+            @"origin_img", @"originImg", @"url_trans", @"currentURL",
+            @"imageList", @"images", @"media", @"noteImage", @"noteImageInfo"
+        ];
+    });
+    for (NSString *k in keys) {
+        @try {
+            if (![obj respondsToSelector:NSSelectorFromString(k)]) continue;
+            XHSFallbackCollect([obj valueForKey:k], out, depth + 1);
+        } @catch (__unused NSException *e) {}
+    }
+}
+
+static NSInteger XHSFallbackURLScore(NSString *u) {
+    NSString *l = u.lowercaseString;
+    NSInteger s = (NSInteger)u.length / 40;
+    if ([l containsString:@"origin"] || [l containsString:@"original"]) s += 14;
+    if ([l containsString:@"url_size_large"] || [l containsString:@"size_large"]) s += 10;
+    if ([l containsString:@"large"] || [l containsString:@"1080"] || [l containsString:@"1440"] || [l containsString:@"2160"]) s += 5;
+    if ([l containsString:@"webp"]) s -= 1;
+    if ([l containsString:@"thumb"] || [l containsString:@"avatar"] || [l containsString:@"icon"] ||
+        [l containsString:@"emoji"] || [l containsString:@"sticker"]) s -= 24;
+    return s;
+}
+
+static void XHSFallbackDownloadAndSave(NSString *urlString) {
+    if (!urlString.length) return;
+    NSLog(@"[XHSMediaSave] fallback GET %@", urlString);
+    XHSFallbackToast(@"\u6b63\u5728\u4e0b\u8f7d\u56fe\u7247\u2026");
+    NSURL *url = [NSURL URLWithString:urlString];
+    if (!url) {
+        XHSFallbackToast(@"URL \u65e0\u6548");
+        return;
+    }
+
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
+                                                       cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                                   timeoutInterval:30];
+    [req setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+forHTTPHeaderField:@"User-Agent"];
+    [req setValue:@"https://www.xiaohongshu.com/" forHTTPHeaderField:@"Referer"];
+    [req setValue:@"image/avif,image/webp,image/apng,image/*,*/*;q=0.8" forHTTPHeaderField:@"Accept"];
+
+    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
+    cfg.HTTPShouldSetCookies = YES;
+    cfg.HTTPCookieAcceptPolicy = NSHTTPCookieAcceptPolicyAlways;
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
+
+    [[session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        NSHTTPURLResponse *http = (NSHTTPURLResponse *)resp;
+        NSLog(@"[XHSMediaSave] fallback resp %ld bytes=%lu err=%@",
+              (long)http.statusCode, (unsigned long)data.length, err);
+        if (err || data.length < 64) {
+            XHSFallbackToast([NSString stringWithFormat:@"\u4e0b\u8f7d\u5931\u8d25: %@",
+                              err.localizedDescription ?: @"empty"]);
+            return;
+        }
+        XHSFallbackSaveData(data, ^(BOOL ok, NSError *e) {
+            XHSFallbackToast(ok ? @"\u2705 \u5df2\u4fdd\u5b58\u5230\u76f8\u518c" :
+                             [NSString stringWithFormat:@"\u4fdd\u5b58\u5931\u8d25: %@",
+                              e.localizedDescription ?: @"?"]);
+        });
+    }] resume];
+}
+
+static void XHSFallbackCollectFromView(UIView *root, NSMutableSet<NSString *> *set) {
+    UIView *v = root;
+    for (int i = 0; i < 12 && v; i++, v = v.superview) {
+        for (NSString *k in @[@"imageURL", @"imageUrl", @"url", @"currentImageURL",
+                              @"sd_imageURL", @"yy_imageURL", @"model", @"viewModel",
+                              @"note", @"imageInfo", @"noteImage", @"data", @"item", @"media",
+                              @"noteModel", @"imageModel", @"content", @"noteImageInfo"]) {
+            @try {
+                if (![v respondsToSelector:NSSelectorFromString(k)]) continue;
+                XHSFallbackCollect([v valueForKey:k], set, 0);
+            } @catch (__unused NSException *e) {}
+        }
+        @try {
+            id u = [v valueForKeyPath:@"sd_imageURL"];
+            XHSFallbackCollect(u, set, 0);
+        } @catch (__unused NSException *e) {}
+        @try {
+            id u = [v valueForKeyPath:@"yy_imageURL"];
+            XHSFallbackCollect(u, set, 0);
+        } @catch (__unused NSException *e) {}
+    }
+}
+
+static UIImage *XHSFallbackBestImageNear(UIView *view) {
+    UIView *v = view;
+    for (int i = 0; i < 14 && v; i++, v = v.superview) {
+        if ([v isKindOfClass:[UIImageView class]]) {
+            UIImage *img = ((UIImageView *)v).image;
+            if (img.size.width > 48 && img.size.height > 48) return img;
+        }
+    }
+    return nil;
+}
+
+static void XHSFallbackWalkImageViews(UIView *view, NSMutableArray<UIImageView *> *out) {
+    if (!view || view.hidden || view.alpha < 0.05) return;
+    if ([view isKindOfClass:[UIImageView class]]) {
+        UIImageView *iv = (UIImageView *)view;
+        if (iv.image && iv.image.size.width > 48 && iv.image.size.height > 48 &&
+            iv.bounds.size.width > 48 && iv.bounds.size.height > 48) {
+            [out addObject:iv];
+        }
+    }
+    for (UIView *sub in view.subviews) {
+        XHSFallbackWalkImageViews(sub, out);
+    }
+}
+
+static UIImageView *XHSFallbackPickBestImageView(UIWindow *win, CGPoint prefer) {
+    NSMutableArray<UIImageView *> *all = [NSMutableArray array];
+    XHSFallbackWalkImageViews(win, all);
+    if (!all.count) return nil;
+
+    UIImageView *best = nil;
+    CGFloat bestScore = -1;
+    for (UIImageView *iv in all) {
+        CGRect r = [iv convertRect:iv.bounds toView:win];
+        if (CGRectIsEmpty(r) || r.size.width < 48 || r.size.height < 48) continue;
+        // prefer large content near preferred point / screen center
+        CGFloat area = r.size.width * r.size.height;
+        CGFloat cx = CGRectGetMidX(r), cy = CGRectGetMidY(r);
+        CGFloat dx = cx - prefer.x, dy = cy - prefer.y;
+        CGFloat dist = sqrt(dx * dx + dy * dy);
+        CGFloat score = area - dist * 18.0;
+        // penalize very top bars / tiny corner widgets
+        if (r.origin.y < 80 && r.size.height < 120) score -= 80000;
+        if (score > bestScore) {
+            bestScore = score;
+            best = iv;
+        }
+    }
+    return best;
+}
+
+static void XHSFallbackForceSaveFromView(UIView *view) {
+    if (!view) {
+        XHSFallbackToast(@"\u672a\u627e\u5230\u53ef\u4fdd\u5b58\u7684\u56fe\u7247");
+        return;
+    }
+
+    NSMutableSet<NSString *> *set = [NSMutableSet set];
+    XHSFallbackCollectFromView(view, set);
+
+    // also probe best image view under current window
+    UIWindow *win = view.window ?: XHSFallbackKeyWindow();
+    if (win) {
+        CGPoint prefer = CGPointMake(CGRectGetMidX(win.bounds), CGRectGetMidY(win.bounds) - 40);
+        UIImageView *best = XHSFallbackPickBestImageView(win, prefer);
+        if (best) XHSFallbackCollectFromView(best, set);
+    }
+
+    if (set.count) {
+        NSArray *sorted = [set.allObjects sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+            NSInteger sa = XHSFallbackURLScore(a), sb = XHSFallbackURLScore(b);
+            if (sa > sb) return NSOrderedAscending;
+            if (sa < sb) return NSOrderedDescending;
+            return NSOrderedSame;
+        }];
+        NSLog(@"[XHSMediaSave] fallback picked url score=%ld %@",
+              (long)XHSFallbackURLScore(sorted.firstObject), sorted.firstObject);
+        XHSFallbackDownloadAndSave(sorted.firstObject);
+        return;
+    }
+
+    UIImage *img = XHSFallbackBestImageNear(view);
+    if (!img && win) {
+        CGPoint prefer = CGPointMake(CGRectGetMidX(win.bounds), CGRectGetMidY(win.bounds) - 40);
+        UIImageView *best = XHSFallbackPickBestImageView(win, prefer);
+        img = best.image;
+        view = best ?: view;
+    }
+    if (img) {
+        XHSFallbackSaveImage(img, ^(BOOL ok, NSError *e) {
+            XHSFallbackToast(ok ? @"\u2705 \u5df2\u4ece\u5f53\u524d\u753b\u9762\u4fdd\u5b58" :
+                             [NSString stringWithFormat:@"\u4fdd\u5b58\u5931\u8d25: %@",
+                              e.localizedDescription ?: @"?"]);
+        });
+        return;
+    }
+
+    if (view.bounds.size.width > 48 && view.bounds.size.height > 48) {
+        if (@available(iOS 10.0, *)) {
+            UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:view.bounds.size];
+            UIImage *snap = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+                [view drawViewHierarchyInRect:view.bounds afterScreenUpdates:NO];
+            }];
+            if (snap) {
+                XHSFallbackSaveImage(snap, ^(BOOL ok, NSError *e) {
+                    XHSFallbackToast(ok ? @"\u2705 \u5df2\u622a\u53d6\u89c6\u56fe\u4fdd\u5b58(\u975e\u539f\u56fe)" :
+                                     [NSString stringWithFormat:@"\u4fdd\u5b58\u5931\u8d25: %@",
+                                      e.localizedDescription ?: @"?"]);
+                });
+                return;
+            }
+        }
+    }
+    XHSFallbackToast(@"\u672a\u627e\u5230\u53ef\u4fdd\u5b58\u7684\u56fe\u7247");
+}
+
+@interface XHSFallbackFloatUI : NSObject
++ (void)install;
+@end
+
+@implementation XHSFallbackFloatUI
+
++ (void)install {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        __block void (^tryAttach)(void) = nil;
+        tryAttach = ^{
+            UIWindow *win = XHSFallbackKeyWindow();
+            if (!win) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), tryAttach);
+                return;
+            }
+            [self attachToWindow:win];
+        };
+        // wait until home/window exists; do not run at ctor
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.4 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), tryAttach);
+    });
+}
+
++ (void)attachToWindow:(UIWindow *)win {
+    if (!win) return;
+    if (objc_getAssociatedObject(win, _cmd)) return;
+    objc_setAssociatedObject(win, _cmd, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    CGFloat w = win.bounds.size.width, h = win.bounds.size.height;
+    UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
+    btn.frame = CGRectMake(w - 58, h * 0.55, 46, 46);
+    btn.backgroundColor = [[UIColor colorWithRed:1 green:0.22 blue:0.37 alpha:1] colorWithAlphaComponent:0.88];
+    btn.layer.cornerRadius = 23;
+    btn.layer.shadowColor = UIColor.blackColor.CGColor;
+    btn.layer.shadowOpacity = 0.28;
+    btn.layer.shadowRadius = 3.5;
+    btn.layer.shadowOffset = CGSizeMake(0, 2);
+    [btn setTitle:@"\u2193" forState:UIControlStateNormal];
+    [btn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    btn.titleLabel.font = [UIFont systemFontOfSize:22 weight:UIFontWeightBold];
+    btn.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin |
+                           UIViewAutoresizingFlexibleTopMargin |
+                           UIViewAutoresizingFlexibleBottomMargin;
+    [btn addTarget:self action:@selector(tap:) forControlEvents:UIControlEventTouchUpInside];
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)];
+    [btn addGestureRecognizer:pan];
+    [win addSubview:btn];
+
+    UILongPressGestureRecognizer *lp =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(twoFinger:)];
+    lp.numberOfTouchesRequired = 2;
+    lp.minimumPressDuration = 0.35;
+    [win addGestureRecognizer:lp];
+
+    NSLog(@"[XHSMediaSave] fallback float ready on %@", win);
+    XHSFallbackToast(@"\u4fdd\u5b58\u89e3\u9501\u5df2\u52a0\u8f7d(\u70b9\u2193\u6216\u53cc\u6307\u957f\u6309)");
+}
+
++ (void)pan:(UIPanGestureRecognizer *)g {
+    UIView *v = g.view;
+    CGPoint t = [g translationInView:v.superview];
+    v.center = CGPointMake(v.center.x + t.x, v.center.y + t.y);
+    [g setTranslation:CGPointZero inView:v.superview];
+}
+
++ (void)tap:(UIButton *)sender {
+    UIWindow *win = sender.window ?: XHSFallbackKeyWindow();
+    if (!win) return;
+    CGPoint prefer = CGPointMake(CGRectGetMidX(win.bounds), CGRectGetMidY(win.bounds) - 50);
+    UIImageView *best = XHSFallbackPickBestImageView(win, prefer);
+    if (best) {
+        XHSFallbackForceSaveFromView(best);
+        return;
+    }
+    UIView *hit = [win hitTest:prefer withEvent:nil] ?: win;
+    UIView *img = hit;
+    while (img && ![img isKindOfClass:[UIImageView class]]) img = img.superview;
+    XHSFallbackForceSaveFromView(img ?: hit);
+}
+
++ (void)twoFinger:(UILongPressGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateBegan) return;
+    CGPoint p = [g locationInView:g.view];
+    UIView *hit = [g.view hitTest:p withEvent:nil] ?: g.view;
+    UIView *img = hit;
+    while (img && ![img isKindOfClass:[UIImageView class]]) img = img.superview;
+    if (!img && [g.view isKindOfClass:[UIWindow class]]) {
+        img = XHSFallbackPickBestImageView((UIWindow *)g.view, p);
+    }
+    XHSFallbackForceSaveFromView(img ?: hit);
+}
+
+@end
+
 #pragma mark - delayed re-patch
 
 static void XHSRepatchCore(void) {
@@ -1527,7 +2011,7 @@ static void XHSDeferredHeavyInstall(void) {
                 XHSScanToastFilters();
                 XHSScanI18nFilters();
                 XHSScanAuthorityPatches();
-                LOG(@"v8 deferred heavy install done");
+                LOG(@"v9 deferred heavy install done");
             }
         });
     });
@@ -1539,17 +2023,18 @@ __attribute__((constructor))
 static void XHSInit(void) {
     @autoreleasepool {
         if (!XHSIsTarget()) return;
-        LOG(@"v8 load pid=%d", getpid());
+        LOG(@"v9 load pid=%d", getpid());
+        NSLog(@"[XHSMediaSave] v9 load pid=%d", getpid());
 
         // known-class only; no objc_copyClassList / no NSBundle / no session wrap
         XHSInstallClassHooks();
         XHSInstallJSONHook();
-        // XHSInstallSessionHook(); // intentionally skipped in v8
+        // XHSInstallSessionHook(); // intentionally skipped in v8/v9
         XHSInstallMediaSaveConfigHooks();
         XHSInstallUserDefaultsHooks();
         XHSInstallToastFilters();
         XHSInstallI18nFilters();
-        // XHSInstallBundleI18nHook(); // intentionally skipped in v8
+        // XHSInstallBundleI18nHook(); // intentionally skipped in v8/v9
         XHSInstallSaveMethodHooks();
         XHSInstallAuthorityPatches();
 
@@ -1557,12 +2042,17 @@ static void XHSInit(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             XHSRepatchCore();
-            LOG(@"v8 delayed light patch 1.2s");
+            LOG(@"v9 delayed light patch 1.2s");
         });
         // one heavy background scan after home is likely up
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             XHSDeferredHeavyInstall();
+        });
+        // fallback UI after window exists (does not touch hot paths)
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [XHSFallbackFloatUI install];
         });
     }
 }
