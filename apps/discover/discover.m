@@ -2,30 +2,20 @@
 // discover.dylib - Xiaohongshu unlock native image/video save (perf-first)
 // Bundle: com.xingin.discover | executable: discover | analyzed: 9.38.1
 //
+// v8 (perf/stability fix):
+//   - REMOVE NSBundle localizedStringForKey global hook (launch hang)
+//   - NO class-list scans in constructor; known-class only at load
+//   - ONE deferred background scan after UI is up
+//   - toast/i18n: known hosts only at load; optional deferred scan
+//   - NSURLSession hook disabled
+//   - JSON rewrite size-capped; no force-mutable on every parse
+//   - mediaSaveConfig / repatch no longer re-scan all classes at load
+//
 // v7:
-//   - Match real capa toast: "已关闭图片与视频的下载权限，笔记正文不能被复制"
-//     / "Images and videos can't be downloaded..."
-//   - Neutralize i18n key capa_allow_download_account_toast at string lookup
-//     (+ NSBundle localizedStringForKey:value:table:)
-//   - More toast selectors: showTipsWithKey / showErrorToastWithI18nKey /
-//     showFailToastWithTip / showToastWithToast / displayToastIfContentAvailable /
-//     horizon_asyn_showToastNew / supportAccessibility variants
-//   - Stronger SaveProvider / SaveCell / NotePaidDownload enable unlock
-//   - Keep no global NSObject KVC thrash; limited toast host scan
+//   - Match real capa toast + capa_allow_download_account_toast
+//   - Stronger SaveProvider unlock
 //
-// v6:
-//   - Avoid NSObject global KVC / full toast scan (home-page lag)
-//   - SaveProvider.enable / SaveCell / SaveImageService force-enable
-//   - XYPHMediaSaveConfig valueForKey: + setValue:forKey:
-//   - NSUserDefaults privacy download keys force-allow on read
-//   - toast filter: withKey / withData / withEvent / _executeShowToast
-//   - ImageSaveService native save force disableWatermark=YES
-//   - NSJSONSerialization rewrite + light JSON byte replace
-//   - mediaSaveConfig getter/setter per-class orig IMP
-//   - No floating button / no screenshot; use app native save
-//
-// v5:
-//   - SaveProvider / privacy keys / light toast / JSON rewrite / mediaSaveConfig
+// v6/v5: mediaSaveConfig / privacy defaults / JSON rewrite
 //
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -46,8 +36,7 @@ static BOOL XHSIsTarget(void) {
     NSString *bid = [NSBundle mainBundle].bundleIdentifier ?: @"";
     NSString *exe = [[NSBundle mainBundle].executablePath lastPathComponent] ?: @"";
     cached = ([bid isEqualToString:@"com.xingin.discover"] ||
-              [exe isEqualToString:@"discover"] ||
-              bid.length == 0) ? 1 : 0;
+              [exe isEqualToString:@"discover"]) ? 1 : 0;
     return cached != 0;
 }
 
@@ -199,55 +188,62 @@ static void XHSPatchKnownClass(Class cls) {
 
 #pragma mark - once class hooks
 
+static void XHSInstallClassHooksKnown(void) {
+    const char *known[] = {
+        "XYPHMediaSaveConfig",
+        "XYVFVideoDownloaderManager",
+        "XYNoteFeedbackFloatingConfig",
+        "NoteFeedbackFloatingConfig",
+        "_TtC18XYNegativeFeedback12SaveProvider",
+        "SaveProvider",
+        "_TtC18XYNegativeFeedback18SaveCellController",
+        "SaveCellController",
+        "_TtC18XYNegativeFeedback16SaveImageService",
+        "SaveImageService",
+        "_TtC12XYNoteModule16ImageSaveService",
+        "ImageSaveService",
+        "_TtC12XYNoteModule19ImageSaveServiceAPM",
+        "_TtC18XYNegativeFeedback24NotePaidDownloadProvider",
+        "NotePaidDownloadProvider",
+        NULL
+    };
+    for (const char **p = known; *p; p++) {
+        XHSPatchKnownClass(objc_getClass(*p));
+    }
+}
+
+static void XHSScanClassHooks(void) {
+    // deferred only - never call from constructor
+    unsigned int n = 0;
+    Class *list = objc_copyClassList(&n);
+    if (!list) return;
+
+    unsigned patched = 0;
+    for (unsigned int i = 0; i < n; i++) {
+        Class cls = list[i];
+        if (class_getInstanceMethod(cls, sel_registerName("disableSave")) ||
+            class_getInstanceMethod(cls, sel_registerName("hitUserNoteDownloadSwitch")) ||
+            class_getInstanceMethod(cls, sel_registerName("isFlowDownloadSwitchOn")) ||
+            class_getInstanceMethod(cls, sel_registerName("userNoteDownloadSwitch")) ||
+            class_getInstanceMethod(cls, sel_registerName("checkShowCloseNoteDownloadSwitchToast")) ||
+            class_getInstanceMethod(cls, sel_registerName("notAllowDownloadMyVideos")) ||
+            class_getInstanceMethod(cls, sel_registerName("notAllowDownloadMyVideosSwitchOn")) ||
+            class_getInstanceMethod(cls, sel_registerName("shareImageSaveEnable")) ||
+            class_getInstanceMethod(cls, sel_registerName("shareVideoSaveEnable")) ||
+            class_getInstanceMethod(cls, sel_registerName("isPaidImageNote"))) {
+            XHSPatchKnownClass(cls);
+            if (++patched > 80) break;
+        }
+    }
+    free(list);
+    LOG(@"class scan done, patched=%u / %u", patched, n);
+}
+
 static void XHSInstallClassHooks(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        const char *known[] = {
-            "XYPHMediaSaveConfig",
-            "XYVFVideoDownloaderManager",
-            "XYNoteFeedbackFloatingConfig",
-            "NoteFeedbackFloatingConfig",
-            "_TtC18XYNegativeFeedback12SaveProvider",
-            "SaveProvider",
-            "_TtC18XYNegativeFeedback18SaveCellController",
-            "SaveCellController",
-            "_TtC18XYNegativeFeedback16SaveImageService",
-            "SaveImageService",
-            "_TtC12XYNoteModule16ImageSaveService",
-            "ImageSaveService",
-            "_TtC12XYNoteModule19ImageSaveServiceAPM",
-            "_TtC18XYNegativeFeedback24NotePaidDownloadProvider",
-            "NotePaidDownloadProvider",
-            NULL
-        };
-        for (const char **p = known; *p; p++) {
-            XHSPatchKnownClass(objc_getClass(*p));
-        }
-
-        // one-shot scan for key selectors
-        unsigned int n = 0;
-        Class *list = objc_copyClassList(&n);
-        if (!list) return;
-
-        unsigned patched = 0;
-        for (unsigned int i = 0; i < n; i++) {
-            Class cls = list[i];
-            if (class_getInstanceMethod(cls, sel_registerName("disableSave")) ||
-                class_getInstanceMethod(cls, sel_registerName("hitUserNoteDownloadSwitch")) ||
-                class_getInstanceMethod(cls, sel_registerName("isFlowDownloadSwitchOn")) ||
-                class_getInstanceMethod(cls, sel_registerName("userNoteDownloadSwitch")) ||
-                class_getInstanceMethod(cls, sel_registerName("checkShowCloseNoteDownloadSwitchToast")) ||
-                class_getInstanceMethod(cls, sel_registerName("notAllowDownloadMyVideos")) ||
-                class_getInstanceMethod(cls, sel_registerName("notAllowDownloadMyVideosSwitchOn")) ||
-                class_getInstanceMethod(cls, sel_registerName("shareImageSaveEnable")) ||
-                class_getInstanceMethod(cls, sel_registerName("shareVideoSaveEnable")) ||
-                class_getInstanceMethod(cls, sel_registerName("isPaidImageNote"))) {
-                XHSPatchKnownClass(cls);
-                if (++patched > 120) break;
-            }
-        }
-        free(list);
-        LOG(@"class hooks done, patched=%u / %u", patched, n);
+        XHSInstallClassHooksKnown();
+        LOG(@"class hooks known-only (v8)");
     });
 }
 
@@ -492,11 +488,13 @@ static NSData *XHSPatchNoteJSONBytes(NSData *data) {
 static id (*orig_JSONObjectWithData)(id, SEL, NSData *, NSJSONReadingOptions, NSError **);
 
 static id hook_JSONObjectWithData(id self, SEL _cmd, NSData *data, NSJSONReadingOptions opt, NSError **err) {
-    NSData *use = data;
-    if (data.length) {
-        @try { use = XHSPatchNoteJSONBytes(data); }
-        @catch (__unused NSException *e) { use = data; }
+    // hot path: never force mutable / rewrite on every JSON parse
+    if (!data.length || data.length > 512 * 1024 || !XHSDataLooksRelated(data)) {
+        return orig_JSONObjectWithData ? orig_JSONObjectWithData(self, _cmd, data, opt, err) : nil;
     }
+    NSData *use = data;
+    @try { use = XHSPatchNoteJSONBytes(data); }
+    @catch (__unused NSException *e) { use = data; }
     NSJSONReadingOptions o2 = opt | NSJSONReadingMutableContainers;
     id obj = orig_JSONObjectWithData ? orig_JSONObjectWithData(self, _cmd, use, o2, err) : nil;
     if (!obj) return obj;
@@ -541,17 +539,10 @@ static id hook_dataTask(id self, SEL _cmd, NSURLRequest *req, XHSDataCompletion 
 }
 
 static void XHSInstallSessionHook(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        Class cls = objc_getClass("NSURLSession");
-        if (!cls) return;
-        SEL sel = @selector(dataTaskWithRequest:completionHandler:);
-        Method m = class_getInstanceMethod(cls, sel);
-        if (!m) return;
-        orig_dataTask = (void *)method_getImplementation(m);
-        method_setImplementation(m, (IMP)hook_dataTask);
-        LOG(@"NSURLSession dataTask hooked");
-    });
+    // v8: disabled - wrapping every dataTask stalls feed/home networking.
+    (void)hook_dataTask;
+    (void)orig_dataTask;
+    LOG(@"NSURLSession hook skipped (v8)");
 }
 
 #pragma mark - mediaSaveConfig getter / setter
@@ -657,41 +648,43 @@ static BOOL XHSNameLooksNoteMedia(const char *name) {
            strstr(name, "Media") || strstr(name, "ImageSave") || strstr(name, "NegativeFeedback");
 }
 
-static void XHSInstallMediaSaveConfigHooks(void) {
+static void XHSInstallMediaSaveConfigLight(void) {
     Class cfgCls = objc_getClass("XYPHMediaSaveConfig");
-    if (cfgCls) {
-        XHSPatchKnownClass(cfgCls);
-        Method setM = class_getInstanceMethod(cfgCls, @selector(setValue:forKey:));
-        if (setM) {
-            IMP cur = method_getImplementation(setM);
-            if (cur != (IMP)hook_cfg_setValue) {
-                orig_cfg_setValue = (void *)cur;
-                method_setImplementation(setM, (IMP)hook_cfg_setValue);
-                LOG(@"XYPHMediaSaveConfig setValue:forKey: hooked");
-            }
-        }
-        Method getM = class_getInstanceMethod(cfgCls, @selector(valueForKey:));
-        if (getM) {
-            IMP cur = method_getImplementation(getM);
-            if (cur != (IMP)hook_cfg_valueForKey) {
-                orig_cfg_valueForKey = (void *)cur;
-                method_setImplementation(getM, (IMP)hook_cfg_valueForKey);
-                LOG(@"XYPHMediaSaveConfig valueForKey: hooked");
-            }
+    if (!cfgCls) return;
+    XHSPatchKnownClass(cfgCls);
+    Method setM = class_getInstanceMethod(cfgCls, @selector(setValue:forKey:));
+    if (setM) {
+        IMP cur = method_getImplementation(setM);
+        if (cur != (IMP)hook_cfg_setValue) {
+            orig_cfg_setValue = (void *)cur;
+            method_setImplementation(setM, (IMP)hook_cfg_setValue);
+            LOG(@"XYPHMediaSaveConfig setValue:forKey: hooked");
         }
     }
+    Method getM = class_getInstanceMethod(cfgCls, @selector(valueForKey:));
+    if (getM) {
+        IMP cur = method_getImplementation(getM);
+        if (cur != (IMP)hook_cfg_valueForKey) {
+            orig_cfg_valueForKey = (void *)cur;
+            method_setImplementation(getM, (IMP)hook_cfg_valueForKey);
+            LOG(@"XYPHMediaSaveConfig valueForKey: hooked");
+        }
+    }
+}
 
+static void XHSScanMediaSaveConfigHooks(void) {
+    // deferred only
     unsigned int n = 0;
     Class *list = objc_copyClassList(&n);
     if (!list) return;
     unsigned g = 0, s = 0;
-    for (unsigned int i = 0; i < n && (g < 40 || s < 40); i++) {
+    for (unsigned int i = 0; i < n && (g < 24 || s < 24); i++) {
         Class cls = list[i];
         const char *name = class_getName(cls);
         if (!XHSNameLooksNoteMedia(name)) continue;
 
         Method gm = class_getInstanceMethod(cls, sel_registerName("mediaSaveConfig"));
-        if (gm && g < 40) {
+        if (gm && g < 24) {
             const char *enc = method_getTypeEncoding(gm);
             IMP prev = method_getImplementation(gm);
             if (enc && enc[0] == '@' && prev && prev != (IMP)hook_msc_get) {
@@ -705,7 +698,7 @@ static void XHSInstallMediaSaveConfigHooks(void) {
         }
 
         Method sm = class_getInstanceMethod(cls, sel_registerName("setMediaSaveConfig:"));
-        if (sm && s < 40) {
+        if (sm && s < 24) {
             const char *enc = method_getTypeEncoding(sm);
             IMP prev = method_getImplementation(sm);
             if (enc && enc[0] == 'v' && prev && prev != (IMP)hook_msc_set) {
@@ -719,7 +712,15 @@ static void XHSInstallMediaSaveConfigHooks(void) {
         }
     }
     free(list);
-    LOG(@"mediaSaveConfig get=%u set=%u", g, s);
+    LOG(@"mediaSaveConfig scan get=%u set=%u", g, s);
+}
+
+static void XHSInstallMediaSaveConfigHooks(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        XHSInstallMediaSaveConfigLight();
+        LOG(@"mediaSaveConfig light install (v8)");
+    });
 }
 
 
@@ -1011,106 +1012,112 @@ static void XHSTryHookToastMethod(Class cls, const char *selName, IMP hook, unsi
     LOG(@"toast hook %s %s", class_getName(cls), selName);
 }
 
+static void XHSInstallToastFiltersKnown(void) {
+    const char *known[] = {
+        "XYAlertUtils",
+        "XYAlert",
+        "XYAlertTextHUD",
+        "XYTipsManager",
+        "XYTipsView",
+        "XYToastEventHandler",
+        "XYPHToast",
+        "XYHUD",
+        "XYSTToast",
+        "ScarletToast",
+        "ZeusToastMessage",
+        "XHSAToastManager",
+        "XHSAToastView",
+        "__Toast__",
+        "XYCapaToastEventHandler",
+        "_TtC11XYCameraKit19XYToastEventHandler",
+        NULL
+    };
+
+    unsigned c1 = 0, c2 = 0, c3 = 0, cv = 0;
+    for (const char **p = known; *p; p++) {
+        Class cls = objc_getClass(*p);
+        if (!cls) continue;
+        XHSTryHookToastMethod(cls, "showToastWithMessage:", (IMP)hook_toast_msg1, &c1, 20);
+        XHSTryHookToastMethod(cls, "showToast:", (IMP)hook_toast_msg1, &c1, 20);
+        XHSTryHookToastMethod(cls, "showToastOnMainThread:", (IMP)hook_toast_msg1, &c1, 20);
+        XHSTryHookToastMethod(cls, "showToastOnMainThreadWith:", (IMP)hook_toast_msg1, &c1, 20);
+        XHSTryHookToastMethod(cls, "showToastWithTitle:", (IMP)hook_toast_msg1, &c1, 20);
+        XHSTryHookToastMethod(cls, "showTextToastOnMiddle:", (IMP)hook_toast_msg1, &c1, 20);
+        XHSTryHookToastMethod(cls, "showErrorToastWithMessage:", (IMP)hook_toast_msg1, &c1, 20);
+        XHSTryHookToastMethod(cls, "showFailToastWithTip:", (IMP)hook_toast_msg1, &c1, 20);
+        XHSTryHookToastMethod(cls, "showTipsWithKey:", (IMP)hook_toast_msg1, &c1, 20);
+        XHSTryHookToastMethod(cls, "showWithToast:", (IMP)hook_toast_msg1, &c1, 20);
+        XHSTryHookToastMethod(cls, "showToastWithData:", (IMP)hook_toast_msg1, &c1, 20);
+        XHSTryHookToastMethod(cls, "toastMsgInMainThreadWith:", (IMP)hook_toast_msg1, &c1, 20);
+        XHSTryHookToastMethod(cls, "displayToastIfContentAvailable:", (IMP)hook_toast_msg1, &c1, 20);
+        XHSTryHookToastMethod(cls, "horizon_asyn_showToastNew:", (IMP)hook_toast_msg1, &c1, 20);
+        XHSTryHookToastMethod(cls, "showToast:msg:", (IMP)hook_toast_msg2, &c2, 20);
+        XHSTryHookToastMethod(cls, "showToastWithMessage:to:", (IMP)hook_toast_msg2, &c2, 20);
+        XHSTryHookToastMethod(cls, "showToastWithMessage:withKey:", (IMP)hook_toast_msg2, &c2, 20);
+        XHSTryHookToastMethod(cls, "showErrorToastWithI18nKey:errorCode:", (IMP)hook_toast_msg2, &c2, 20);
+        XHSTryHookToastMethod(cls, "showToast:supportAccessibility:", (IMP)hook_toast_msg2, &c2, 20);
+        XHSTryHookToastMethod(cls, "showLivePhotoToastIfNeededWithToast:key:", (IMP)hook_toast_msg2, &c2, 20);
+        XHSTryHookToastMethod(cls, "showToastInView:message:", (IMP)hook_toast_inview, &cv, 16);
+        XHSTryHookToastMethod(cls, "showToastWithEvent:params:callback:", (IMP)hook_toast_msg3, &c3, 16);
+        XHSTryHookToastMethod(cls, "_executeShowToast:context:completion:", (IMP)hook_toast_msg3, &c3, 16);
+        XHSTryHookToastMethod(cls, "showToastWithToast:adjustKeyboard:offset:", (IMP)hook_toast_msg3, &c3, 16);
+        XHSTryHookToastMethod(cls, "toast:callback:", (IMP)hook_toast_msg2, &c2, 16);
+    }
+    LOG(@"toast known c1=%u c2=%u c3=%u cv=%u", c1, c2, c3, cv);
+}
+
+static void XHSScanToastFilters(void) {
+    // deferred only - keep bounds tight
+    unsigned c1 = 0, c2 = 0, c3 = 0, cv = 0;
+    unsigned int n = 0;
+    Class *list = objc_copyClassList(&n);
+    if (!list) return;
+    for (unsigned int i = 0; i < n && (c1 < 20 || c2 < 16 || c3 < 10 || cv < 10); i++) {
+        Class cls = list[i];
+        const char *name = class_getName(cls);
+        if (!XHSNameLooksToastHost(name)) continue;
+        if (class_getInstanceMethod(cls, sel_registerName("showToastWithMessage:")) ||
+            class_getInstanceMethod(cls, sel_registerName("showToast:")) ||
+            class_getInstanceMethod(cls, sel_registerName("showToastWithMessage:withKey:")) ||
+            class_getInstanceMethod(cls, sel_registerName("showToastWithData:")) ||
+            class_getInstanceMethod(cls, sel_registerName("showToastWithEvent:params:callback:")) ||
+            class_getInstanceMethod(cls, sel_registerName("_executeShowToast:context:completion:")) ||
+            class_getInstanceMethod(cls, sel_registerName("showToastInView:message:")) ||
+            class_getInstanceMethod(cls, sel_registerName("showTipsWithKey:")) ||
+            class_getInstanceMethod(cls, sel_registerName("showErrorToastWithI18nKey:errorCode:")) ||
+            class_getInstanceMethod(cls, sel_registerName("displayToastIfContentAvailable:")) ||
+            class_getInstanceMethod(cls, sel_registerName("horizon_asyn_showToastNew:")) ||
+            class_getInstanceMethod(cls, sel_registerName("showToastWithToast:adjustKeyboard:offset:")) ||
+            class_getInstanceMethod(cls, sel_registerName("showToast:supportAccessibility:"))) {
+            XHSTryHookToastMethod(cls, "showToastWithMessage:", (IMP)hook_toast_msg1, &c1, 20);
+            XHSTryHookToastMethod(cls, "showToast:", (IMP)hook_toast_msg1, &c1, 20);
+            XHSTryHookToastMethod(cls, "showToastWithData:", (IMP)hook_toast_msg1, &c1, 20);
+            XHSTryHookToastMethod(cls, "showTipsWithKey:", (IMP)hook_toast_msg1, &c1, 20);
+            XHSTryHookToastMethod(cls, "showFailToastWithTip:", (IMP)hook_toast_msg1, &c1, 20);
+            XHSTryHookToastMethod(cls, "showErrorToastWithMessage:", (IMP)hook_toast_msg1, &c1, 20);
+            XHSTryHookToastMethod(cls, "displayToastIfContentAvailable:", (IMP)hook_toast_msg1, &c1, 20);
+            XHSTryHookToastMethod(cls, "horizon_asyn_showToastNew:", (IMP)hook_toast_msg1, &c1, 20);
+            XHSTryHookToastMethod(cls, "showToastWithMessage:withKey:", (IMP)hook_toast_msg2, &c2, 16);
+            XHSTryHookToastMethod(cls, "showToastWithMessage:to:", (IMP)hook_toast_msg2, &c2, 16);
+            XHSTryHookToastMethod(cls, "showErrorToastWithI18nKey:errorCode:", (IMP)hook_toast_msg2, &c2, 16);
+            XHSTryHookToastMethod(cls, "showToast:supportAccessibility:", (IMP)hook_toast_msg2, &c2, 16);
+            XHSTryHookToastMethod(cls, "showToastWithEvent:params:callback:", (IMP)hook_toast_msg3, &c3, 10);
+            XHSTryHookToastMethod(cls, "_executeShowToast:context:completion:", (IMP)hook_toast_msg3, &c3, 10);
+            XHSTryHookToastMethod(cls, "showToastWithToast:adjustKeyboard:offset:", (IMP)hook_toast_msg3, &c3, 10);
+            XHSTryHookToastMethod(cls, "showToastInView:message:", (IMP)hook_toast_inview, &cv, 10);
+        }
+    }
+    free(list);
+    LOG(@"toast scan c1=%u c2=%u c3=%u cv=%u", c1, c2, c3, cv);
+}
+
 static void XHSInstallToastFilters(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        const char *known[] = {
-            "XYAlertUtils",
-            "XYAlert",
-            "XYAlertTextHUD",
-            "XYTipsManager",
-            "XYTipsView",
-            "XYToastEventHandler",
-            "XYPHToast",
-            "XYHUD",
-            "XYSTToast",
-            "ScarletToast",
-            "ZeusToastMessage",
-            "XHSAToastManager",
-            "XHSAToastView",
-            "__Toast__",
-            "XYCapaToastEventHandler",
-            "_TtC11XYCameraKit19XYToastEventHandler",
-            NULL
-        };
-
-        unsigned c1 = 0, c2 = 0, c3 = 0, cv = 0;
-        for (const char **p = known; *p; p++) {
-            Class cls = objc_getClass(*p);
-            if (!cls) continue;
-            XHSTryHookToastMethod(cls, "showToastWithMessage:", (IMP)hook_toast_msg1, &c1, 20);
-            XHSTryHookToastMethod(cls, "showToast:", (IMP)hook_toast_msg1, &c1, 20);
-            XHSTryHookToastMethod(cls, "showToastOnMainThread:", (IMP)hook_toast_msg1, &c1, 20);
-            XHSTryHookToastMethod(cls, "showToastOnMainThreadWith:", (IMP)hook_toast_msg1, &c1, 20);
-            XHSTryHookToastMethod(cls, "showToastWithTitle:", (IMP)hook_toast_msg1, &c1, 20);
-            XHSTryHookToastMethod(cls, "showTextToastOnMiddle:", (IMP)hook_toast_msg1, &c1, 20);
-            XHSTryHookToastMethod(cls, "showErrorToastWithMessage:", (IMP)hook_toast_msg1, &c1, 20);
-            XHSTryHookToastMethod(cls, "showFailToastWithTip:", (IMP)hook_toast_msg1, &c1, 20);
-            XHSTryHookToastMethod(cls, "showTipsWithKey:", (IMP)hook_toast_msg1, &c1, 20);
-            XHSTryHookToastMethod(cls, "showWithToast:", (IMP)hook_toast_msg1, &c1, 20);
-            XHSTryHookToastMethod(cls, "showToastWithData:", (IMP)hook_toast_msg1, &c1, 20);
-            XHSTryHookToastMethod(cls, "toastMsgInMainThreadWith:", (IMP)hook_toast_msg1, &c1, 20);
-            XHSTryHookToastMethod(cls, "displayToastIfContentAvailable:", (IMP)hook_toast_msg1, &c1, 20);
-            XHSTryHookToastMethod(cls, "horizon_asyn_showToastNew:", (IMP)hook_toast_msg1, &c1, 20);
-            XHSTryHookToastMethod(cls, "showToast:msg:", (IMP)hook_toast_msg2, &c2, 20);
-            XHSTryHookToastMethod(cls, "showToastWithMessage:to:", (IMP)hook_toast_msg2, &c2, 20);
-            XHSTryHookToastMethod(cls, "showToastWithMessage:withKey:", (IMP)hook_toast_msg2, &c2, 20);
-            XHSTryHookToastMethod(cls, "showErrorToastWithI18nKey:errorCode:", (IMP)hook_toast_msg2, &c2, 20);
-            XHSTryHookToastMethod(cls, "showToast:supportAccessibility:", (IMP)hook_toast_msg2, &c2, 20);
-            XHSTryHookToastMethod(cls, "showLivePhotoToastIfNeededWithToast:key:", (IMP)hook_toast_msg2, &c2, 20);
-            XHSTryHookToastMethod(cls, "showToastInView:message:", (IMP)hook_toast_inview, &cv, 16);
-            XHSTryHookToastMethod(cls, "showToastWithEvent:params:callback:", (IMP)hook_toast_msg3, &c3, 16);
-            XHSTryHookToastMethod(cls, "_executeShowToast:context:completion:", (IMP)hook_toast_msg3, &c3, 16);
-            XHSTryHookToastMethod(cls, "showToastWithToast:adjustKeyboard:offset:", (IMP)hook_toast_msg3, &c3, 16);
-            XHSTryHookToastMethod(cls, "toast:callback:", (IMP)hook_toast_msg2, &c2, 16);
-        }
-
-        unsigned int n = 0;
-        Class *list = objc_copyClassList(&n);
-        if (list) {
-            for (unsigned int i = 0; i < n && (c1 < 32 || c2 < 28 || c3 < 16 || cv < 16); i++) {
-                Class cls = list[i];
-                const char *name = class_getName(cls);
-                if (!XHSNameLooksToastHost(name)) continue;
-                if (class_getInstanceMethod(cls, sel_registerName("showToastWithMessage:")) ||
-                    class_getInstanceMethod(cls, sel_registerName("showToast:")) ||
-                    class_getInstanceMethod(cls, sel_registerName("showToastWithMessage:withKey:")) ||
-                    class_getInstanceMethod(cls, sel_registerName("showToastWithData:")) ||
-                    class_getInstanceMethod(cls, sel_registerName("showToastWithEvent:params:callback:")) ||
-                    class_getInstanceMethod(cls, sel_registerName("_executeShowToast:context:completion:")) ||
-                    class_getInstanceMethod(cls, sel_registerName("showToastInView:message:")) ||
-                    class_getInstanceMethod(cls, sel_registerName("showTipsWithKey:")) ||
-                    class_getInstanceMethod(cls, sel_registerName("showErrorToastWithI18nKey:errorCode:")) ||
-                    class_getInstanceMethod(cls, sel_registerName("displayToastIfContentAvailable:")) ||
-                    class_getInstanceMethod(cls, sel_registerName("horizon_asyn_showToastNew:")) ||
-                    class_getInstanceMethod(cls, sel_registerName("showToastWithToast:adjustKeyboard:offset:")) ||
-                    class_getInstanceMethod(cls, sel_registerName("showToast:supportAccessibility:"))) {
-                    XHSTryHookToastMethod(cls, "showToastWithMessage:", (IMP)hook_toast_msg1, &c1, 32);
-                    XHSTryHookToastMethod(cls, "showToast:", (IMP)hook_toast_msg1, &c1, 32);
-                    XHSTryHookToastMethod(cls, "showToastWithData:", (IMP)hook_toast_msg1, &c1, 32);
-                    XHSTryHookToastMethod(cls, "showTipsWithKey:", (IMP)hook_toast_msg1, &c1, 32);
-                    XHSTryHookToastMethod(cls, "showFailToastWithTip:", (IMP)hook_toast_msg1, &c1, 32);
-                    XHSTryHookToastMethod(cls, "showErrorToastWithMessage:", (IMP)hook_toast_msg1, &c1, 32);
-                    XHSTryHookToastMethod(cls, "displayToastIfContentAvailable:", (IMP)hook_toast_msg1, &c1, 32);
-                    XHSTryHookToastMethod(cls, "horizon_asyn_showToastNew:", (IMP)hook_toast_msg1, &c1, 32);
-                    XHSTryHookToastMethod(cls, "showToastWithMessage:withKey:", (IMP)hook_toast_msg2, &c2, 28);
-                    XHSTryHookToastMethod(cls, "showToastWithMessage:to:", (IMP)hook_toast_msg2, &c2, 28);
-                    XHSTryHookToastMethod(cls, "showErrorToastWithI18nKey:errorCode:", (IMP)hook_toast_msg2, &c2, 28);
-                    XHSTryHookToastMethod(cls, "showToast:supportAccessibility:", (IMP)hook_toast_msg2, &c2, 28);
-                    XHSTryHookToastMethod(cls, "showToastWithEvent:params:callback:", (IMP)hook_toast_msg3, &c3, 16);
-                    XHSTryHookToastMethod(cls, "_executeShowToast:context:completion:", (IMP)hook_toast_msg3, &c3, 16);
-                    XHSTryHookToastMethod(cls, "showToastWithToast:adjustKeyboard:offset:", (IMP)hook_toast_msg3, &c3, 16);
-                    XHSTryHookToastMethod(cls, "showToastInView:message:", (IMP)hook_toast_inview, &cv, 16);
-                }
-            }
-            free(list);
-        }
-        LOG(@"toast filters c1=%u c2=%u c3=%u cv=%u", c1, c2, c3, cv);
+        XHSInstallToastFiltersKnown();
+        LOG(@"toast filters known-only (v8)");
     });
 }
-
-
-#pragma mark - i18n key neutralize (capa download toast)
 
 static BOOL XHSIsBlockedI18nKey(NSString *key) {
     if (![key isKindOfClass:[NSString class]] || key.length == 0) return NO;
@@ -1237,55 +1244,63 @@ static BOOL XHSNameLooksI18nHost(const char *name) {
            strstr(name, "Tips");
 }
 
-static void XHSInstallI18nFilters(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        const char *known[] = {
-            "_TtC7RedI18N14I18nI18NModule",
-            "I18nI18NModule",
-            "RedI18N",
-            "XYAlertUtils",
-            "XYTipsManager",
-            "XYToastEventHandler",
-            NULL
-        };
-        unsigned c1 = 0, c2 = 0, c3 = 0;
-        for (const char **p = known; *p; p++) {
-            Class cls = objc_getClass(*p);
-            if (!cls) continue;
+static void XHSInstallI18nFiltersKnown(void) {
+    const char *known[] = {
+        "_TtC7RedI18N14I18nI18NModule",
+        "I18nI18NModule",
+        "RedI18N",
+        "XYAlertUtils",
+        "XYTipsManager",
+        "XYToastEventHandler",
+        NULL
+    };
+    unsigned c1 = 0, c2 = 0, c3 = 0;
+    for (const char **p = known; *p; p++) {
+        Class cls = objc_getClass(*p);
+        if (!cls) continue;
+        XHSTryHookI18nMethod(cls, "getStringWithKey:", (IMP)hook_i18n_key1, &c1, 16);
+        XHSTryHookI18nMethod(cls, "getStringWithKey:defaultValue:", (IMP)hook_i18n_key2, &c2, 16);
+        XHSTryHookI18nMethod(cls, "localizedStringWithKey:", (IMP)hook_i18n_key1, &c1, 16);
+        XHSTryHookI18nMethod(cls, "localizedStringWithKey:fallbackValue:", (IMP)hook_i18n_key2, &c2, 16);
+        XHSTryHookI18nMethod(cls, "localizedStringWithKey:comment:", (IMP)hook_i18n_key2, &c2, 16);
+        XHSTryHookI18nMethod(cls, "localizedStringWithModuleStr:key:", (IMP)hook_i18n_module_key, &c2, 16);
+        XHSTryHookI18nMethod(cls, "localizedStringFromConfig:key:defaultString:", (IMP)hook_i18n_cfg_key, &c3, 12);
+    }
+    LOG(@"i18n known c1=%u c2=%u c3=%u", c1, c2, c3);
+}
+
+static void XHSScanI18nFilters(void) {
+    unsigned c1 = 0, c2 = 0, c3 = 0;
+    unsigned int n = 0;
+    Class *list = objc_copyClassList(&n);
+    if (!list) return;
+    for (unsigned int i = 0; i < n && (c1 < 16 || c2 < 16 || c3 < 8); i++) {
+        Class cls = list[i];
+        const char *name = class_getName(cls);
+        if (!XHSNameLooksI18nHost(name)) continue;
+        if (class_getInstanceMethod(cls, sel_registerName("getStringWithKey:")) ||
+            class_getInstanceMethod(cls, sel_registerName("localizedStringWithKey:")) ||
+            class_getInstanceMethod(cls, sel_registerName("localizedStringWithKey:fallbackValue:")) ||
+            class_getClassMethod(cls, sel_registerName("getStringWithKey:")) ||
+            class_getClassMethod(cls, sel_registerName("localizedStringWithKey:"))) {
             XHSTryHookI18nMethod(cls, "getStringWithKey:", (IMP)hook_i18n_key1, &c1, 16);
             XHSTryHookI18nMethod(cls, "getStringWithKey:defaultValue:", (IMP)hook_i18n_key2, &c2, 16);
             XHSTryHookI18nMethod(cls, "localizedStringWithKey:", (IMP)hook_i18n_key1, &c1, 16);
             XHSTryHookI18nMethod(cls, "localizedStringWithKey:fallbackValue:", (IMP)hook_i18n_key2, &c2, 16);
             XHSTryHookI18nMethod(cls, "localizedStringWithKey:comment:", (IMP)hook_i18n_key2, &c2, 16);
-            XHSTryHookI18nMethod(cls, "localizedStringWithModuleStr:key:", (IMP)hook_i18n_module_key, &c2, 16);
-            XHSTryHookI18nMethod(cls, "localizedStringFromConfig:key:defaultString:", (IMP)hook_i18n_cfg_key, &c3, 12);
+            XHSTryHookI18nMethod(cls, "localizedStringWithModuleStr:key:", (IMP)hook_i18n_module_key, &c2, 12);
+            XHSTryHookI18nMethod(cls, "localizedStringFromConfig:key:defaultString:", (IMP)hook_i18n_cfg_key, &c3, 8);
         }
+    }
+    free(list);
+    LOG(@"i18n scan c1=%u c2=%u c3=%u", c1, c2, c3);
+}
 
-        unsigned int n = 0;
-        Class *list = objc_copyClassList(&n);
-        if (list) {
-            for (unsigned int i = 0; i < n && (c1 < 24 || c2 < 24 || c3 < 12); i++) {
-                Class cls = list[i];
-                const char *name = class_getName(cls);
-                if (!XHSNameLooksI18nHost(name)) continue;
-                if (class_getInstanceMethod(cls, sel_registerName("getStringWithKey:")) ||
-                    class_getInstanceMethod(cls, sel_registerName("localizedStringWithKey:")) ||
-                    class_getInstanceMethod(cls, sel_registerName("localizedStringWithKey:fallbackValue:")) ||
-                    class_getClassMethod(cls, sel_registerName("getStringWithKey:")) ||
-                    class_getClassMethod(cls, sel_registerName("localizedStringWithKey:"))) {
-                    XHSTryHookI18nMethod(cls, "getStringWithKey:", (IMP)hook_i18n_key1, &c1, 24);
-                    XHSTryHookI18nMethod(cls, "getStringWithKey:defaultValue:", (IMP)hook_i18n_key2, &c2, 24);
-                    XHSTryHookI18nMethod(cls, "localizedStringWithKey:", (IMP)hook_i18n_key1, &c1, 24);
-                    XHSTryHookI18nMethod(cls, "localizedStringWithKey:fallbackValue:", (IMP)hook_i18n_key2, &c2, 24);
-                    XHSTryHookI18nMethod(cls, "localizedStringWithKey:comment:", (IMP)hook_i18n_key2, &c2, 24);
-                    XHSTryHookI18nMethod(cls, "localizedStringWithModuleStr:key:", (IMP)hook_i18n_module_key, &c2, 20);
-                    XHSTryHookI18nMethod(cls, "localizedStringFromConfig:key:defaultString:", (IMP)hook_i18n_cfg_key, &c3, 12);
-                }
-            }
-            free(list);
-        }
-        LOG(@"i18n filters c1=%u c2=%u c3=%u", c1, c2, c3);
+static void XHSInstallI18nFilters(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        XHSInstallI18nFiltersKnown();
+        LOG(@"i18n filters known-only (v8)");
     });
 }
 
@@ -1303,18 +1318,10 @@ static NSString *hook_bundle_localized(id self, SEL _cmd, NSString *key, NSStrin
 }
 
 static void XHSInstallBundleI18nHook(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        Class cls = objc_getClass("NSBundle");
-        if (!cls) return;
-        Method m = class_getInstanceMethod(cls, @selector(localizedStringForKey:value:table:));
-        if (!m) return;
-        IMP cur = method_getImplementation(m);
-        if (cur == (IMP)hook_bundle_localized) return;
-        orig_bundle_localized = (void *)cur;
-        method_setImplementation(m, (IMP)hook_bundle_localized);
-        LOG(@"NSBundle localizedStringForKey hooked");
-    });
+    // v8: NEVER hook NSBundle localizedStringForKey - ultra-hot path, launch hang.
+    (void)hook_bundle_localized;
+    (void)orig_bundle_localized;
+    LOG(@"NSBundle localizedString skipped (v8)");
 }
 
 #pragma mark - ImageSaveService native save entry
@@ -1394,93 +1401,136 @@ static void XHSTryHookSaveMethod(Class cls, const char *selName, IMP hook, unsig
     LOG(@"save hook %s %s", class_getName(cls), selName);
 }
 
+static void XHSInstallSaveMethodHooksKnown(void) {
+    const char *classes[] = {
+        "_TtC12XYNoteModule16ImageSaveService",
+        "ImageSaveService",
+        "_TtC18XYNegativeFeedback16SaveImageService",
+        "SaveImageService",
+        "_TtC6XYDots20DotsImageSaveService",
+        "DotsImageSaveService",
+        NULL
+    };
+    unsigned c = 0;
+    for (const char **p = classes; *p; p++) {
+        Class cls = objc_getClass(*p);
+        if (!cls) continue;
+        XHSPatchKnownClass(cls);
+        XHSTryHookSaveMethod(cls, "saveImageListFrom:disableWatermark:saveAllCompletion:", (IMP)hook_saveImageList, &c);
+        XHSTryHookSaveMethod(cls, "saveImageAt:from:disableWatermark:completion:", (IMP)hook_saveImageAt, &c);
+        XHSTryHookSaveMethod(cls, "saveImageWithoutManualTrackAt:from:disableWatermark:completion:", (IMP)hook_saveImageNoTrack, &c);
+        XHSTryHookSaveMethod(cls, "saveOriginalImageListFrom:saveAllCompletion:", (IMP)hook_saveOriginalList, &c);
+    }
+    LOG(@"save method known hooks=%u", c);
+}
+
+static void XHSScanSaveMethodHooks(void) {
+    unsigned c = 0;
+    unsigned int n = 0;
+    Class *list = objc_copyClassList(&n);
+    if (!list) return;
+    for (unsigned int i = 0; i < n && c < 16; i++) {
+        Class cls = list[i];
+        const char *name = class_getName(cls);
+        if (!name) continue;
+        if (!(strstr(name, "ImageSave") || strstr(name, "SaveImage") || strstr(name, "MediaSave"))) continue;
+        XHSPatchKnownClass(cls);
+        XHSTryHookSaveMethod(cls, "saveImageListFrom:disableWatermark:saveAllCompletion:", (IMP)hook_saveImageList, &c);
+        XHSTryHookSaveMethod(cls, "saveImageAt:from:disableWatermark:completion:", (IMP)hook_saveImageAt, &c);
+        XHSTryHookSaveMethod(cls, "saveImageWithoutManualTrackAt:from:disableWatermark:completion:", (IMP)hook_saveImageNoTrack, &c);
+    }
+    free(list);
+    LOG(@"save method scan hooks=%u", c);
+}
+
 static void XHSInstallSaveMethodHooks(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        const char *classes[] = {
-            "_TtC12XYNoteModule16ImageSaveService",
-            "ImageSaveService",
-            "_TtC18XYNegativeFeedback16SaveImageService",
-            "SaveImageService",
-            "_TtC6XYDots20DotsImageSaveService",
-            "DotsImageSaveService",
-            NULL
-        };
-        unsigned c = 0;
-        for (const char **p = classes; *p; p++) {
-            Class cls = objc_getClass(*p);
-            if (!cls) continue;
-            XHSPatchKnownClass(cls);
-            XHSTryHookSaveMethod(cls, "saveImageListFrom:disableWatermark:saveAllCompletion:", (IMP)hook_saveImageList, &c);
-            XHSTryHookSaveMethod(cls, "saveImageAt:from:disableWatermark:completion:", (IMP)hook_saveImageAt, &c);
-            XHSTryHookSaveMethod(cls, "saveImageWithoutManualTrackAt:from:disableWatermark:completion:", (IMP)hook_saveImageNoTrack, &c);
-            XHSTryHookSaveMethod(cls, "saveOriginalImageListFrom:saveAllCompletion:", (IMP)hook_saveOriginalList, &c);
-        }
-
-        unsigned int n = 0;
-        Class *list = objc_copyClassList(&n);
-        if (list) {
-            for (unsigned int i = 0; i < n && c < 24; i++) {
-                Class cls = list[i];
-                const char *name = class_getName(cls);
-                if (!name) continue;
-                if (!(strstr(name, "ImageSave") || strstr(name, "SaveImage") || strstr(name, "MediaSave"))) continue;
-                XHSPatchKnownClass(cls);
-                XHSTryHookSaveMethod(cls, "saveImageListFrom:disableWatermark:saveAllCompletion:", (IMP)hook_saveImageList, &c);
-                XHSTryHookSaveMethod(cls, "saveImageAt:from:disableWatermark:completion:", (IMP)hook_saveImageAt, &c);
-                XHSTryHookSaveMethod(cls, "saveImageWithoutManualTrackAt:from:disableWatermark:completion:", (IMP)hook_saveImageNoTrack, &c);
-            }
-            free(list);
-        }
-        LOG(@"save method hooks=%u", c);
+        XHSInstallSaveMethodHooksKnown();
+        LOG(@"save method hooks known-only (v8)");
     });
+}
+
+static void XHSInstallAuthorityPatchesKnown(void) {
+    const char *known[] = {
+        "XYPHMediaSaveConfig",
+        "XYNoteFeedbackFloatingConfig",
+        "NoteFeedbackFloatingConfig",
+        "_TtC18XYNegativeFeedback12SaveProvider",
+        "SaveProvider",
+        NULL
+    };
+    for (const char **p = known; *p; p++) {
+        Class cls = objc_getClass(*p);
+        if (!cls) continue;
+        XHSPatchKnownClass(cls);
+        XHSPatchBool(cls, "hasDownloadMyNotesAuthorityData", YES);
+        XHSPatchBool(cls, "hasSaveNotAllowDownloadMyVideosKey", NO);
+    }
+}
+
+static void XHSScanAuthorityPatches(void) {
+    unsigned int n = 0;
+    Class *list = objc_copyClassList(&n);
+    if (!list) return;
+    unsigned patched = 0;
+    for (unsigned int i = 0; i < n && patched < 24; i++) {
+        Class cls = list[i];
+        BOOL hit = NO;
+        if (class_getInstanceMethod(cls, sel_registerName("hasDownloadMyNotesAuthorityData")) ||
+            class_getInstanceMethod(cls, sel_registerName("downloadMyNotesAuthorityData")) ||
+            class_getInstanceMethod(cls, sel_registerName("hasSaveNotAllowDownloadMyVideosKey")) ||
+            class_getInstanceMethod(cls, sel_registerName("privacyCloseNoteDownloadKey")) ||
+            class_getInstanceMethod(cls, sel_registerName("userNoteDownloadSwitch")) ||
+            class_getInstanceMethod(cls, sel_registerName("hitUserNoteDownloadSwitch"))) {
+            hit = YES;
+        }
+        if (!hit) continue;
+        XHSPatchKnownClass(cls);
+        XHSPatchBool(cls, "hasDownloadMyNotesAuthorityData", YES);
+        XHSPatchBool(cls, "hasSaveNotAllowDownloadMyVideosKey", NO);
+        patched++;
+    }
+    free(list);
+    LOG(@"authority scan patches=%u", patched);
 }
 
 static void XHSInstallAuthorityPatches(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        unsigned int n = 0;
-        Class *list = objc_copyClassList(&n);
-        if (!list) return;
-        unsigned patched = 0;
-        for (unsigned int i = 0; i < n && patched < 40; i++) {
-            Class cls = list[i];
-            BOOL hit = NO;
-            if (class_getInstanceMethod(cls, sel_registerName("hasDownloadMyNotesAuthorityData")) ||
-                class_getInstanceMethod(cls, sel_registerName("downloadMyNotesAuthorityData")) ||
-                class_getInstanceMethod(cls, sel_registerName("hasSaveNotAllowDownloadMyVideosKey")) ||
-                class_getInstanceMethod(cls, sel_registerName("privacyCloseNoteDownloadKey")) ||
-                class_getInstanceMethod(cls, sel_registerName("userNoteDownloadSwitch")) ||
-                class_getInstanceMethod(cls, sel_registerName("hitUserNoteDownloadSwitch"))) {
-                hit = YES;
-            }
-            if (!hit) continue;
-            XHSPatchKnownClass(cls);
-            XHSPatchBool(cls, "hasDownloadMyNotesAuthorityData", YES);
-            XHSPatchBool(cls, "hasSaveNotAllowDownloadMyVideosKey", NO);
-            patched++;
-        }
-        free(list);
-        LOG(@"authority patches=%u", patched);
+        XHSInstallAuthorityPatchesKnown();
+        LOG(@"authority patches known-only (v8)");
     });
 }
 
 #pragma mark - delayed re-patch
 
 static void XHSRepatchCore(void) {
-    XHSPatchKnownClass(objc_getClass("XYPHMediaSaveConfig"));
-    XHSPatchKnownClass(objc_getClass("XYNoteFeedbackFloatingConfig"));
-    XHSPatchKnownClass(objc_getClass("_TtC18XYNegativeFeedback12SaveProvider"));
-    XHSPatchKnownClass(objc_getClass("_TtC18XYNegativeFeedback18SaveCellController"));
-    XHSPatchKnownClass(objc_getClass("_TtC18XYNegativeFeedback16SaveImageService"));
-    XHSPatchKnownClass(objc_getClass("_TtC12XYNoteModule16ImageSaveService"));
-    XHSPatchKnownClass(objc_getClass("_TtC18XYNegativeFeedback24NotePaidDownloadProvider"));
-    XHSPatchKnownClass(objc_getClass("XYVFVideoDownloaderManager"));
-    XHSInstallMediaSaveConfigHooks();
-    XHSInstallSaveMethodHooks();
-    XHSInstallToastFilters();
-    XHSInstallI18nFilters();
-    XHSInstallBundleI18nHook();
+    // light only - never full class scan on main thread
+    XHSInstallClassHooksKnown();
+    XHSInstallMediaSaveConfigLight();
+    XHSInstallSaveMethodHooksKnown();
+    XHSInstallToastFiltersKnown();
+    XHSInstallI18nFiltersKnown();
+    XHSInstallAuthorityPatchesKnown();
+}
+
+static void XHSDeferredHeavyInstall(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // off main: one bounded class-list pass after UI is up
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            @autoreleasepool {
+                XHSScanClassHooks();
+                XHSScanMediaSaveConfigHooks();
+                XHSScanSaveMethodHooks();
+                XHSScanToastFilters();
+                XHSScanI18nFilters();
+                XHSScanAuthorityPatches();
+                LOG(@"v8 deferred heavy install done");
+            }
+        });
+    });
 }
 
 #pragma mark - ctor
@@ -1489,29 +1539,30 @@ __attribute__((constructor))
 static void XHSInit(void) {
     @autoreleasepool {
         if (!XHSIsTarget()) return;
-        LOG(@"v7 load pid=%d", getpid());
+        LOG(@"v8 load pid=%d", getpid());
 
+        // known-class only; no objc_copyClassList / no NSBundle / no session wrap
         XHSInstallClassHooks();
         XHSInstallJSONHook();
-        XHSInstallSessionHook();
+        // XHSInstallSessionHook(); // intentionally skipped in v8
         XHSInstallMediaSaveConfigHooks();
         XHSInstallUserDefaultsHooks();
         XHSInstallToastFilters();
         XHSInstallI18nFilters();
-        XHSInstallBundleI18nHook();
+        // XHSInstallBundleI18nHook(); // intentionally skipped in v8
         XHSInstallSaveMethodHooks();
         XHSInstallAuthorityPatches();
 
-        // Swift 类注册后再补几次（轻量，不定时轮询）
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+        // Swift classes may register later - light repatch only
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             XHSRepatchCore();
-            LOG(@"v7 delayed patch 0.8s");
+            LOG(@"v8 delayed light patch 1.2s");
         });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+        // one heavy background scan after home is likely up
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            XHSRepatchCore();
-            LOG(@"v7 delayed patch 2.5s");
+            XHSDeferredHeavyInstall();
         });
     }
 }

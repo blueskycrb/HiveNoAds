@@ -89,21 +89,18 @@ apps/
 5. **视频**：别人视频笔记 → 分享 / 更多 → **保存视频**（走 App 原生下载）
 6. 设置 → 小红书 → 照片 → **允许添加**
 
-### v7 原理（性能优先）
+### v8 原理（稳定优先 / 修启动卡死）
+- **启动期只 hook 已知类**：构造函数里不做 `objc_copyClassList` 全量扫描
+- **去掉 `NSBundle localizedStringForKey:` 全局 hook**（v7 启动卡死主因）
+- **去掉 `NSURLSession dataTask` 包装**（避免首页网络/打开笔记卡顿）
+- **JSON 改写限流**：仅相关且 <=512KB 的 payload 才 rewrite，不再对所有 JSON 强制 mutable
+- **toast / i18n / mediaSaveConfig / authority**：加载时 known-only，约 1.8s 后后台一次延迟扫描
+- 仍保留 v7 能力：capa 下载权限 toast 文本/key 过滤、SaveProvider 解锁、`mediaSaveConfig` 强制允许保存
+
+### v7 说明（已由 v8 取代）
 - 图片：`XYPHMediaSaveConfig.disableSave = NO`，并 hook `valueForKey:` / `setValue:forKey:`
-- 分享面板：`SaveProvider.enable` / `SaveCell` / `SaveImageService` / `NotePaidDownloadProvider` 强制可点
-- 作者隐私下载开关：`hitUserNoteDownloadSwitch` / `userNoteDownloadSwitch` / `isFlowDownloadSwitchOn`
-- 视频：`notAllowDownloadMyVideos = NO`、相关 allow/download 开关强制打开
-- `NSUserDefaults` 隐私下载 key 读路径强制允许
-- toast 过滤：匹配真实文案 `已关闭图片与视频的下载权限，笔记正文不能被复制` / `Images and videos can't be downloaded...` 以及 key `capa_allow_download_account_toast`
-- **i18n 消音**：`getStringWithKey` / `localizedStringWithKey` / `NSBundle localizedStringForKey:value:table:` 对 capa toast key 返回空串
-- 更多 toast 入口：`showTipsWithKey` / `showErrorToastWithI18nKey` / `showFailToastWithTip` / `displayToastIfContentAvailable` / `horizon_asyn_showToastNew` 等
-- **NSJSONSerialization** 解析结果 + 轻量 JSON 字节替换，改写笔记响应里的 `disable_save` / 下载开关
-- `mediaSaveConfig` getter/setter 按类保存原 IMP，访问时强制 config 允许保存
-- **不**做 NSObject 全局 KVC、**不**全表 toast 扫描（避免卡顿）
-
-不破解付费图/视频墙；若服务端硬性禁止，入口可能仍不出现。
-
+- capa toast：`capa_allow_download_account_toast` / 真实文案过滤
+- 但 v7 在 ctor 扫全类 + hook NSBundle，可能导致一进 app 卡住 / 开帖闪退
 
 ## 本地编译 (macOS)
 
