@@ -2,6 +2,11 @@
 // discover.dylib - Xiaohongshu unlock native image/video save (perf-first)
 // Bundle: com.xingin.discover | executable: discover | analyzed: 9.38.1
 //
+// v10 (video fallback):
+//   - Keep v8/v9 light startup and image fallback
+//   - Floating ↓ / 2-finger long press also saves video notes
+//   - Prefer master_url / videoURL / origin video CDN, write album via PHPhotoLibrary
+//
 // v9 (real save path):
 //   - Keep v8 light startup (no NSBundle / no ctor class-scan / no session wrap)
 //   - Native gate unlock retained (disableSave / SaveProvider / toast / JSON)
@@ -1515,7 +1520,7 @@ static void XHSInstallAuthorityPatches(void) {
 #pragma mark - fallback save (float button / 2-finger long press)
 
 // Native flag flips alone are not enough on 9.38.1 when author closes download.
-// Fallback grabs current image URL / UIImage and writes Photos itself.
+// Fallback grabs current image/video URL (or UIImage) and writes Photos itself.
 
 static void XHSFallbackAuthThen(void (^block)(BOOL granted)) {
     void (^finish)(PHAuthorizationStatus) = ^(PHAuthorizationStatus st) {
@@ -1637,14 +1642,51 @@ static void XHSFallbackToast(NSString *msg) {
     });
 }
 
-static BOOL XHSFallbackIsImageURL(NSString *s) {
-    if (s.length < 12) return NO;
-    NSString *l = s.lowercaseString;
-    if (![l hasPrefix:@"http"]) return NO;
+static BOOL XHSFallbackLooksMediaHost(NSString *l) {
     return [l containsString:@"xhscdn"] ||
            [l containsString:@"xiaohongshu"] ||
            [l containsString:@"sns-img"] ||
            [l containsString:@"sns-webpic"] ||
+           [l containsString:@"sns-video"] ||
+           [l containsString:@"fe-video"] ||
+           [l containsString:@"ci.xiaohongshu"];
+}
+
+static BOOL XHSFallbackIsVideoURL(NSString *s) {
+    if (s.length < 12) return NO;
+    NSString *l = s.lowercaseString;
+    if (![l hasPrefix:@"http"] && ![l hasPrefix:@"file:"]) return NO;
+    // reject obvious non-media assets unless path clearly says video
+    if ([l containsString:@".png"] || [l containsString:@".jpg"] || [l containsString:@".jpeg"] ||
+        [l containsString:@".webp"] || [l containsString:@".gif"] || [l containsString:@".heic"] ||
+        [l containsString:@".json"] || [l containsString:@".zip"] || [l containsString:@".ttf"] ||
+        [l containsString:@".otf"] || [l containsString:@".bin"] || [l containsString:@".docx"] ||
+        [l containsString:@".mp3"]) {
+        if (!([l containsString:@".mp4"] || [l containsString:@"video_original"] ||
+              [l containsString:@"/video/"] || [l containsString:@"sns-video"])) {
+            return NO;
+        }
+    }
+    if ([l containsString:@".mp4"] || [l containsString:@".mov"] || [l containsString:@".m4v"] ||
+        [l containsString:@".m3u8"] || [l containsString:@"video_original"] ||
+        [l containsString:@"sns-video"] || [l containsString:@"/video/"] ||
+        [l containsString:@"master_url"] || [l containsString:@"video_url"] ||
+        [l containsString:@"videourl"] || [l containsString:@"stream"]) {
+        return YES;
+    }
+    if ([l containsString:@"sns-video"] || [l containsString:@"fe-video"] ||
+        ([l containsString:@"xhscdn"] && [l containsString:@"video"])) {
+        return YES;
+    }
+    return NO;
+}
+
+static BOOL XHSFallbackIsImageURL(NSString *s) {
+    if (s.length < 12) return NO;
+    NSString *l = s.lowercaseString;
+    if (![l hasPrefix:@"http"]) return NO;
+    if (XHSFallbackIsVideoURL(s)) return NO;
+    return XHSFallbackLooksMediaHost(l) ||
            [l containsString:@".jpg"] ||
            [l containsString:@".jpeg"] ||
            [l containsString:@".png"] ||
@@ -1654,19 +1696,22 @@ static BOOL XHSFallbackIsImageURL(NSString *s) {
            [l containsString:@"fmt=png"] ||
            [l containsString:@"fmt=webp"] ||
            [l containsString:@"/image"] ||
-           [l containsString:@"imageView2"] ||
-           [l containsString:@"ci.xiaohongshu"];
+           [l containsString:@"imageView2"];
+}
+
+static BOOL XHSFallbackIsMediaURL(NSString *s) {
+    return XHSFallbackIsVideoURL(s) || XHSFallbackIsImageURL(s);
 }
 
 static void XHSFallbackCollect(id obj, NSMutableSet<NSString *> *out, NSInteger depth) {
     if (!obj || depth > 6) return;
     if ([obj isKindOfClass:[NSString class]]) {
-        if (XHSFallbackIsImageURL((NSString *)obj)) [out addObject:(NSString *)obj];
+        if (XHSFallbackIsMediaURL((NSString *)obj)) [out addObject:(NSString *)obj];
         return;
     }
     if ([obj isKindOfClass:[NSURL class]]) {
         NSString *s = [(NSURL *)obj absoluteString];
-        if (XHSFallbackIsImageURL(s)) [out addObject:s];
+        if (XHSFallbackIsMediaURL(s)) [out addObject:s];
         return;
     }
     if ([obj isKindOfClass:[NSArray class]]) {
@@ -1691,7 +1736,16 @@ static void XHSFallbackCollect(id obj, NSMutableSet<NSString *> *out, NSInteger 
             @"originImgInfo", @"imageInfo", @"image_list", @"url_multi",
             @"livePhotoUrl", @"live_photo_url", @"fileid", @"fileId",
             @"origin_img", @"originImg", @"url_trans", @"currentURL",
-            @"imageList", @"images", @"media", @"noteImage", @"noteImageInfo"
+            @"imageList", @"images", @"media", @"noteImage", @"noteImageInfo",
+            // video
+            @"videoURL", @"videoUrl", @"video_url", @"videoUrlString", @"videoURLString",
+            @"videoSourceUrl", @"videoSourceURL", @"master_url", @"masterUrl",
+            @"originVideoURL", @"orginVideoURL", @"originalVideoURL", @"userOriginVideo",
+            @"fallbackVideoUrl", @"mediaURL", @"mediaUrl", @"media_url",
+            @"currentVideoURL", @"videoStreamingList", @"streamingList",
+            @"h264UrlInfo", @"hdrUrlInfo", @"urlInfo", @"multiStreamingUrlInfoList",
+            @"video", @"videoInfo", @"videoModel", @"player", @"playerItem",
+            @"note", @"noteModel", @"viewModel", @"data", @"item"
         ];
     });
     for (NSString *k in keys) {
@@ -1705,19 +1759,85 @@ static void XHSFallbackCollect(id obj, NSMutableSet<NSString *> *out, NSInteger 
 static NSInteger XHSFallbackURLScore(NSString *u) {
     NSString *l = u.lowercaseString;
     NSInteger s = (NSInteger)u.length / 40;
-    if ([l containsString:@"origin"] || [l containsString:@"original"]) s += 14;
+    BOOL isVideo = XHSFallbackIsVideoURL(u);
+    if (isVideo) s += 20;
+    if ([l containsString:@"master_url"] || [l containsString:@"masterurl"]) s += 18;
+    if ([l containsString:@"origin"] || [l containsString:@"original"] || [l containsString:@"video_original"]) s += 14;
     if ([l containsString:@"url_size_large"] || [l containsString:@"size_large"]) s += 10;
-    if ([l containsString:@"large"] || [l containsString:@"1080"] || [l containsString:@"1440"] || [l containsString:@"2160"]) s += 5;
+    if ([l containsString:@"1080"] || [l containsString:@"1440"] || [l containsString:@"2160"] || [l containsString:@"4k"]) s += 6;
+    if ([l containsString:@".mp4"] || [l containsString:@".mov"]) s += 8;
+    if ([l containsString:@".m3u8"]) s -= 8; // progressive mp4 preferred over hls for album save
     if ([l containsString:@"webp"]) s -= 1;
     if ([l containsString:@"thumb"] || [l containsString:@"avatar"] || [l containsString:@"icon"] ||
-        [l containsString:@"emoji"] || [l containsString:@"sticker"]) s -= 24;
+        [l containsString:@"emoji"] || [l containsString:@"sticker"] || [l containsString:@"cover"]) s -= 24;
+    if ([l containsString:@".json"] || [l containsString:@".zip"] || [l containsString:@".ttf"]) s -= 50;
     return s;
+}
+
+static void XHSFallbackSaveVideoFile(NSString *path, void (^done)(BOOL, NSError *)) {
+    if (path.length == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        if (done) done(NO, [NSError errorWithDomain:@"XHSMediaSave" code:5
+                              userInfo:@{NSLocalizedDescriptionKey: @"video file missing"}]);
+        return;
+    }
+    XHSFallbackAuthThen(^(BOOL granted) {
+        if (!granted) {
+            if (done) done(NO, [NSError errorWithDomain:@"XHSMediaSave" code:2
+                                  userInfo:@{NSLocalizedDescriptionKey: @"album permission denied"}]);
+            return;
+        }
+        [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
+            [PHAssetChangeRequest creationRequestForAssetFromVideoAtFileURL:[NSURL fileURLWithPath:path]];
+        } completionHandler:^(BOOL success, NSError *error) {
+            dispatch_async(dispatch_get_main_queue(), ^{ if (done) done(success, error); });
+        }];
+    });
+}
+
+static BOOL XHSFallbackDataLooksVideo(NSData *data, NSString *urlString, NSString *mime) {
+    if (XHSFallbackIsVideoURL(urlString)) return YES;
+    NSString *m = mime.lowercaseString ?: @"";
+    if ([m containsString:@"video"] || [m containsString:@"mp4"] || [m containsString:@"mpeg"]) return YES;
+    if (data.length >= 12) {
+        const unsigned char *b = data.bytes;
+        // ISO BMFF: ....ftyp
+        if (b[4] == 'f' && b[5] == 't' && b[6] == 'y' && b[7] == 'p') return YES;
+    }
+    return NO;
 }
 
 static void XHSFallbackDownloadAndSave(NSString *urlString) {
     if (!urlString.length) return;
-    NSLog(@"[XHSMediaSave] fallback GET %@", urlString);
-    XHSFallbackToast(@"\u6b63\u5728\u4e0b\u8f7d\u56fe\u7247\u2026");
+    BOOL wantVideo = XHSFallbackIsVideoURL(urlString);
+    NSLog(@"[XHSMediaSave] fallback GET %@ video=%d", urlString, (int)wantVideo);
+    XHSFallbackToast(wantVideo ? @"\u6b63\u5728\u4e0b\u8f7d\u89c6\u9891\u2026" : @"\u6b63\u5728\u4e0b\u8f7d\u56fe\u7247\u2026");
+
+    // local file path / file URL
+    if ([urlString hasPrefix:@"file:"]) {
+        NSURL *fu = [NSURL URLWithString:urlString];
+        NSString *path = fu.path;
+        if (path.length) {
+            XHSFallbackSaveVideoFile(path, ^(BOOL ok, NSError *e) {
+                XHSFallbackToast(ok ? @"\u2705 \u89c6\u9891\u5df2\u4fdd\u5b58\u5230\u76f8\u518c" :
+                                 [NSString stringWithFormat:@"\u4fdd\u5b58\u5931\u8d25: %@", e.localizedDescription ?: @"?"]);
+            });
+            return;
+        }
+    }
+    if ([urlString hasPrefix:@"/"] && [[NSFileManager defaultManager] fileExistsAtPath:urlString]) {
+        XHSFallbackSaveVideoFile(urlString, ^(BOOL ok, NSError *e) {
+            XHSFallbackToast(ok ? @"\u2705 \u89c6\u9891\u5df2\u4fdd\u5b58\u5230\u76f8\u518c" :
+                             [NSString stringWithFormat:@"\u4fdd\u5b58\u5931\u8d25: %@", e.localizedDescription ?: @"?"]);
+        });
+        return;
+    }
+
+    // HLS playlists cannot be written to Photos as-is
+    if ([urlString.lowercaseString containsString:@".m3u8"]) {
+        XHSFallbackToast(@"\u6682\u4e0d\u652f\u6301 HLS(m3u8) \u89c6\u9891");
+        return;
+    }
+
     NSURL *url = [NSURL URLWithString:urlString];
     if (!url) {
         XHSFallbackToast(@"URL \u65e0\u6548");
@@ -1726,25 +1846,82 @@ static void XHSFallbackDownloadAndSave(NSString *urlString) {
 
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
                                                        cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
-                                                   timeoutInterval:30];
+                                                   timeoutInterval:wantVideo ? 90 : 30];
     [req setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
 forHTTPHeaderField:@"User-Agent"];
     [req setValue:@"https://www.xiaohongshu.com/" forHTTPHeaderField:@"Referer"];
-    [req setValue:@"image/avif,image/webp,image/apng,image/*,*/*;q=0.8" forHTTPHeaderField:@"Accept"];
+    [req setValue:wantVideo ? @"*/*" : @"image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+forHTTPHeaderField:@"Accept"];
 
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
     cfg.HTTPShouldSetCookies = YES;
     cfg.HTTPCookieAcceptPolicy = NSHTTPCookieAcceptPolicyAlways;
     NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
 
+    if (wantVideo) {
+        [[session downloadTaskWithRequest:req completionHandler:^(NSURL *location, NSURLResponse *resp, NSError *err) {
+            NSHTTPURLResponse *http = (NSHTTPURLResponse *)resp;
+            NSLog(@"[XHSMediaSave] fallback video resp %ld err=%@ loc=%@",
+                  (long)http.statusCode, err, location.path);
+            if (err || !location) {
+                XHSFallbackToast([NSString stringWithFormat:@"\u89c6\u9891\u4e0b\u8f7d\u5931\u8d25: %@",
+                                  err.localizedDescription ?: @"empty"]);
+                return;
+            }
+            NSString *ext = location.pathExtension.length ? location.pathExtension : @"mp4";
+            if ([ext.lowercaseString isEqualToString:@"m3u8"]) {
+                XHSFallbackToast(@"\u6682\u4e0d\u652f\u6301 HLS(m3u8) \u89c6\u9891");
+                return;
+            }
+            NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                             [NSString stringWithFormat:@"xhs_vid_%@.%@", NSUUID.UUID.UUIDString, ext]];
+            NSError *moveErr = nil;
+            [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
+            if (![[NSFileManager defaultManager] moveItemAtPath:location.path toPath:tmp error:&moveErr]) {
+                if (![[NSFileManager defaultManager] copyItemAtPath:location.path toPath:tmp error:&moveErr]) {
+                    XHSFallbackToast([NSString stringWithFormat:@"\u5199\u4e34\u65f6\u6587\u4ef6\u5931\u8d25: %@",
+                                      moveErr.localizedDescription ?: @"?"]);
+                    return;
+                }
+            }
+            unsigned long long sz = [[[NSFileManager defaultManager] attributesOfItemAtPath:tmp error:nil] fileSize];
+            if (sz < 1024) {
+                [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
+                XHSFallbackToast(@"\u89c6\u9891\u6570\u636e\u8fc7\u5c0f");
+                return;
+            }
+            XHSFallbackSaveVideoFile(tmp, ^(BOOL ok, NSError *e) {
+                [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
+                XHSFallbackToast(ok ? @"\u2705 \u89c6\u9891\u5df2\u4fdd\u5b58\u5230\u76f8\u518c" :
+                                 [NSString stringWithFormat:@"\u4fdd\u5b58\u5931\u8d25: %@",
+                                  e.localizedDescription ?: @"?"]);
+            });
+        }] resume];
+        return;
+    }
+
     [[session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         NSHTTPURLResponse *http = (NSHTTPURLResponse *)resp;
-        NSLog(@"[XHSMediaSave] fallback resp %ld bytes=%lu err=%@",
-              (long)http.statusCode, (unsigned long)data.length, err);
+        NSString *mime = http.MIMEType ?: @"";
+        NSLog(@"[XHSMediaSave] fallback resp %ld bytes=%lu mime=%@ err=%@",
+              (long)http.statusCode, (unsigned long)data.length, mime, err);
         if (err || data.length < 64) {
             XHSFallbackToast([NSString stringWithFormat:@"\u4e0b\u8f7d\u5931\u8d25: %@",
                               err.localizedDescription ?: @"empty"]);
             return;
+        }
+        if (XHSFallbackDataLooksVideo(data, urlString, mime)) {
+            NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                             [NSString stringWithFormat:@"xhs_vid_%@.mp4", NSUUID.UUID.UUIDString]];
+            if ([data writeToFile:tmp atomically:YES]) {
+                XHSFallbackSaveVideoFile(tmp, ^(BOOL ok, NSError *e) {
+                    [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
+                    XHSFallbackToast(ok ? @"\u2705 \u89c6\u9891\u5df2\u4fdd\u5b58\u5230\u76f8\u518c" :
+                                     [NSString stringWithFormat:@"\u4fdd\u5b58\u5931\u8d25: %@",
+                                      e.localizedDescription ?: @"?"]);
+                });
+                return;
+            }
         }
         XHSFallbackSaveData(data, ^(BOOL ok, NSError *e) {
             XHSFallbackToast(ok ? @"\u2705 \u5df2\u4fdd\u5b58\u5230\u76f8\u518c" :
@@ -1760,7 +1937,10 @@ static void XHSFallbackCollectFromView(UIView *root, NSMutableSet<NSString *> *s
         for (NSString *k in @[@"imageURL", @"imageUrl", @"url", @"currentImageURL",
                               @"sd_imageURL", @"yy_imageURL", @"model", @"viewModel",
                               @"note", @"imageInfo", @"noteImage", @"data", @"item", @"media",
-                              @"noteModel", @"imageModel", @"content", @"noteImageInfo"]) {
+                              @"noteModel", @"imageModel", @"content", @"noteImageInfo",
+                              @"videoURL", @"videoUrl", @"video_url", @"videoUrlString",
+                              @"currentVideoURL", @"videoSourceUrl", @"player", @"playerItem",
+                              @"videoModel", @"videoInfo", @"mediaModel", @"video"]) {
             @try {
                 if (![v respondsToSelector:NSSelectorFromString(k)]) continue;
                 XHSFallbackCollect([v valueForKey:k], set, 0);
@@ -1828,21 +2008,62 @@ static UIImageView *XHSFallbackPickBestImageView(UIWindow *win, CGPoint prefer) 
     return best;
 }
 
+static void XHSFallbackCollectFromResponder(UIResponder *r, NSMutableSet<NSString *> *set) {
+    UIResponder *cur = r;
+    for (int i = 0; i < 12 && cur; i++, cur = cur.nextResponder) {
+        for (NSString *k in @[@"model", @"viewModel", @"note", @"noteModel", @"data", @"item",
+                              @"media", @"video", @"videoModel", @"videoInfo", @"player",
+                              @"videoURL", @"videoUrl", @"currentVideoURL", @"videoSourceUrl",
+                              @"content", @"noteImageInfo", @"mediaModel"]) {
+            @try {
+                if (![cur respondsToSelector:NSSelectorFromString(k)]) continue;
+                XHSFallbackCollect([(id)cur valueForKey:k], set, 0);
+            } @catch (__unused NSException *e) {}
+        }
+        for (NSString *path in @[@"player.currentItem", @"player.currentItem.asset",
+                                 @"videoPlayer.currentItem", @"playerItem.asset"]) {
+            @try {
+                id v = [(id)cur valueForKeyPath:path];
+                XHSFallbackCollect(v, set, 0);
+            } @catch (__unused NSException *e) {}
+        }
+        @try {
+            id asset = [(id)cur valueForKeyPath:@"player.currentItem.asset"];
+            if ([asset respondsToSelector:@selector(URL)]) {
+                XHSFallbackCollect([asset valueForKey:@"URL"], set, 0);
+            }
+        } @catch (__unused NSException *e) {}
+    }
+}
+
 static void XHSFallbackForceSaveFromView(UIView *view) {
     if (!view) {
-        XHSFallbackToast(@"\u672a\u627e\u5230\u53ef\u4fdd\u5b58\u7684\u56fe\u7247");
+        XHSFallbackToast(@"\u672a\u627e\u5230\u53ef\u4fdd\u5b58\u7684\u5a92\u4f53");
         return;
     }
 
     NSMutableSet<NSString *> *set = [NSMutableSet set];
     XHSFallbackCollectFromView(view, set);
+    XHSFallbackCollectFromResponder(view, set);
 
-    // also probe best image view under current window
+    // also probe best image view under current window + top VC
     UIWindow *win = view.window ?: XHSFallbackKeyWindow();
     if (win) {
         CGPoint prefer = CGPointMake(CGRectGetMidX(win.bounds), CGRectGetMidY(win.bounds) - 40);
         UIImageView *best = XHSFallbackPickBestImageView(win, prefer);
-        if (best) XHSFallbackCollectFromView(best, set);
+        if (best) {
+            XHSFallbackCollectFromView(best, set);
+            XHSFallbackCollectFromResponder(best, set);
+        }
+        UIViewController *root = win.rootViewController;
+        while (root.presentedViewController) root = root.presentedViewController;
+        if ([root isKindOfClass:[UINavigationController class]]) {
+            root = ((UINavigationController *)root).visibleViewController ?: root;
+        }
+        if ([root isKindOfClass:[UITabBarController class]]) {
+            root = ((UITabBarController *)root).selectedViewController ?: root;
+        }
+        if (root) XHSFallbackCollectFromResponder(root, set);
     }
 
     if (set.count) {
@@ -1852,13 +2073,18 @@ static void XHSFallbackForceSaveFromView(UIView *view) {
             if (sa < sb) return NSOrderedDescending;
             return NSOrderedSame;
         }];
-        NSLog(@"[XHSMediaSave] fallback picked url score=%ld %@",
-              (long)XHSFallbackURLScore(sorted.firstObject), sorted.firstObject);
-        XHSFallbackDownloadAndSave(sorted.firstObject);
+        NSString *pick = sorted.firstObject;
+        // if any video URL exists, prefer highest-score video over image cover
+        for (NSString *u in sorted) {
+            if (XHSFallbackIsVideoURL(u)) { pick = u; break; }
+        }
+        NSLog(@"[XHSMediaSave] fallback picked url score=%ld video=%d %@",
+              (long)XHSFallbackURLScore(pick), (int)XHSFallbackIsVideoURL(pick), pick);
+        XHSFallbackDownloadAndSave(pick);
         return;
     }
 
-    UIImage *img = XHSFallbackBestImageNear(view);
+UIImage *img = XHSFallbackBestImageNear(view);
     if (!img && win) {
         CGPoint prefer = CGPointMake(CGRectGetMidX(win.bounds), CGRectGetMidY(win.bounds) - 40);
         UIImageView *best = XHSFallbackPickBestImageView(win, prefer);
@@ -1890,7 +2116,7 @@ static void XHSFallbackForceSaveFromView(UIView *view) {
             }
         }
     }
-    XHSFallbackToast(@"\u672a\u627e\u5230\u53ef\u4fdd\u5b58\u7684\u56fe\u7247");
+    XHSFallbackToast(@"\u672a\u627e\u5230\u53ef\u4fdd\u5b58\u7684\u5a92\u4f53");
 }
 
 @interface XHSFallbackFloatUI : NSObject
@@ -1953,7 +2179,7 @@ static void XHSFallbackForceSaveFromView(UIView *view) {
     [win addGestureRecognizer:lp];
 
     NSLog(@"[XHSMediaSave] fallback float ready on %@", win);
-    XHSFallbackToast(@"\u4fdd\u5b58\u89e3\u9501\u5df2\u52a0\u8f7d(\u70b9\u2193\u6216\u53cc\u6307\u957f\u6309)");
+    XHSFallbackToast(@"\u56fe/\u89c6\u9891\u4fdd\u5b58\u5df2\u52a0\u8f7d(\u70b9\u2193\u6216\u53cc\u6307\u957f\u6309)");
 }
 
 + (void)pan:(UIPanGestureRecognizer *)g {
@@ -2016,7 +2242,7 @@ static void XHSDeferredHeavyInstall(void) {
                 XHSScanToastFilters();
                 XHSScanI18nFilters();
                 XHSScanAuthorityPatches();
-                LOG(@"v9 deferred heavy install done");
+                LOG(@"v10 deferred heavy install done");
             }
         });
     });
@@ -2028,8 +2254,8 @@ __attribute__((constructor))
 static void XHSInit(void) {
     @autoreleasepool {
         if (!XHSIsTarget()) return;
-        LOG(@"v9 load pid=%d", getpid());
-        NSLog(@"[XHSMediaSave] v9 load pid=%d", getpid());
+        LOG(@"v10 load pid=%d", getpid());
+        NSLog(@"[XHSMediaSave] v10 load pid=%d", getpid());
 
         // known-class only; no objc_copyClassList / no NSBundle / no session wrap
         XHSInstallClassHooks();
@@ -2047,7 +2273,7 @@ static void XHSInit(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             XHSRepatchCore();
-            LOG(@"v9 delayed light patch 1.2s");
+            LOG(@"v10 delayed light patch 1.2s");
         });
         // one heavy background scan after home is likely up
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)),
