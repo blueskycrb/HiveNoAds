@@ -2,6 +2,11 @@
 // discover.dylib - Xiaohongshu unlock native image/video save (perf-first)
 // Bundle: com.xingin.discover | executable: discover | analyzed: 9.38.1
 //
+// v10.1 (fix false video detect):
+//   - HEIC/AVIF also use ISO BMFF ftyp; naive ftyp==video caused PHPhotos 3302
+//   - Prefer real image decode first; only treat as video when content looks video
+//   - Tighten URL heuristics (drop loose stream match)
+//
 // v10 (video fallback):
 //   - Keep v8/v9 light startup and image fallback
 //   - Floating ↓ / 2-finger long press also saves video notes
@@ -1656,26 +1661,35 @@ static BOOL XHSFallbackIsVideoURL(NSString *s) {
     if (s.length < 12) return NO;
     NSString *l = s.lowercaseString;
     if (![l hasPrefix:@"http"] && ![l hasPrefix:@"file:"]) return NO;
-    // reject obvious non-media assets unless path clearly says video
+    // reject obvious image / non-media assets unless path clearly says video
     if ([l containsString:@".png"] || [l containsString:@".jpg"] || [l containsString:@".jpeg"] ||
         [l containsString:@".webp"] || [l containsString:@".gif"] || [l containsString:@".heic"] ||
-        [l containsString:@".json"] || [l containsString:@".zip"] || [l containsString:@".ttf"] ||
-        [l containsString:@".otf"] || [l containsString:@".bin"] || [l containsString:@".docx"] ||
-        [l containsString:@".mp3"]) {
-        if (!([l containsString:@".mp4"] || [l containsString:@"video_original"] ||
-              [l containsString:@"/video/"] || [l containsString:@"sns-video"])) {
+        [l containsString:@".avif"] || [l containsString:@".json"] || [l containsString:@".zip"] ||
+        [l containsString:@".ttf"] || [l containsString:@".otf"] || [l containsString:@".bin"] ||
+        [l containsString:@".docx"] || [l containsString:@".mp3"] ||
+        [l containsString:@"fmt=jpeg"] || [l containsString:@"fmt=png"] ||
+        [l containsString:@"fmt=webp"] || [l containsString:@"fmt=heic"] ||
+        [l containsString:@"fmt=avif"] || [l containsString:@"imageview2"] ||
+        [l containsString:@"/image"] || [l containsString:@"sns-img"] ||
+        [l containsString:@"sns-webpic"] || [l containsString:@"webpic"]) {
+        if (!([l containsString:@".mp4"] || [l containsString:@".mov"] ||
+              [l containsString:@".m4v"] || [l containsString:@".m3u8"] ||
+              [l containsString:@"video_original"] || [l containsString:@"/video/"] ||
+              [l containsString:@"sns-video"] || [l containsString:@"fe-video"])) {
             return NO;
         }
     }
     if ([l containsString:@".mp4"] || [l containsString:@".mov"] || [l containsString:@".m4v"] ||
         [l containsString:@".m3u8"] || [l containsString:@"video_original"] ||
-        [l containsString:@"sns-video"] || [l containsString:@"/video/"] ||
-        [l containsString:@"master_url"] || [l containsString:@"video_url"] ||
-        [l containsString:@"videourl"] || [l containsString:@"stream"]) {
+        [l containsString:@"sns-video"] || [l containsString:@"fe-video"] ||
+        [l containsString:@"/video/"] || [l containsString:@"master_url"] ||
+        [l containsString:@"video_url"] || [l containsString:@"videourl"] ||
+        [l containsString:@"h264"] || [l containsString:@"h265"] ||
+        [l containsString:@"avc1"] || [l containsString:@"video_streaming"]) {
         return YES;
     }
-    if ([l containsString:@"sns-video"] || [l containsString:@"fe-video"] ||
-        ([l containsString:@"xhscdn"] && [l containsString:@"video"])) {
+    if ([l containsString:@"xhscdn"] &&
+        ([l containsString:@"video"] || [l containsString:@"stream"])) {
         return YES;
     }
     return NO;
@@ -1795,14 +1809,53 @@ static void XHSFallbackSaveVideoFile(NSString *path, void (^done)(BOOL, NSError 
 }
 
 static BOOL XHSFallbackDataLooksVideo(NSData *data, NSString *urlString, NSString *mime) {
-    if (XHSFallbackIsVideoURL(urlString)) return YES;
+    // UIImage can decode HEIC/AVIF/JPEG/PNG/WebP; if so, never treat as video.
+    if (data.length >= 32 && [UIImage imageWithData:data] != nil) {
+        return NO;
+    }
     NSString *m = mime.lowercaseString ?: @"";
-    if ([m containsString:@"video"] || [m containsString:@"mp4"] || [m containsString:@"mpeg"]) return YES;
+    if ([m hasPrefix:@"image/"] ||
+        [m containsString:@"jpeg"] || [m containsString:@"png"] ||
+        [m containsString:@"webp"] || [m containsString:@"heic"] ||
+        [m containsString:@"heif"] || [m containsString:@"avif"] ||
+        [m containsString:@"gif"]) {
+        return NO;
+    }
+    if ([m hasPrefix:@"video/"] ||
+        [m containsString:@"mp4"] || [m containsString:@"mpeg"] ||
+        [m containsString:@"quicktime"] || [m containsString:@"x-m4v"]) {
+        return YES;
+    }
     if (data.length >= 12) {
         const unsigned char *b = data.bytes;
-        // ISO BMFF: ....ftyp
-        if (b[4] == 'f' && b[5] == 't' && b[6] == 'y' && b[7] == 'p') return YES;
+        // ISO BMFF: ....ftypXXXX  (HEIC/AVIF also use ftyp!)
+        if (b[4] == 'f' && b[5] == 't' && b[6] == 'y' && b[7] == 'p') {
+            char brand[5] = {0};
+            brand[0] = (char)b[8];
+            brand[1] = (char)b[9];
+            brand[2] = (char)b[10];
+            brand[3] = (char)b[11];
+            NSString *br = [[NSString stringWithUTF8String:brand] lowercaseString];
+            if ([br isEqualToString:@"heic"] || [br isEqualToString:@"heix"] ||
+                [br isEqualToString:@"hevc"] || [br isEqualToString:@"hevx"] ||
+                [br isEqualToString:@"mif1"] || [br isEqualToString:@"msf1"] ||
+                [br isEqualToString:@"avif"] || [br isEqualToString:@"avis"] ||
+                [br isEqualToString:@"miaf"] || [br isEqualToString:@"mihb"]) {
+                return NO;
+            }
+            if ([br isEqualToString:@"isom"] || [br isEqualToString:@"iso2"] ||
+                [br isEqualToString:@"iso3"] || [br isEqualToString:@"iso4"] ||
+                [br isEqualToString:@"iso5"] || [br isEqualToString:@"iso6"] ||
+                [br isEqualToString:@"mp41"] || [br isEqualToString:@"mp42"] ||
+                [br isEqualToString:@"avc1"] || [br isEqualToString:@"dash"] ||
+                [br isEqualToString:@"msdh"] || [br isEqualToString:@"m4v "] ||
+                [br isEqualToString:@"qt  "] || [br hasPrefix:@"mp4"]) {
+                return YES;
+            }
+        }
     }
+    // URL alone is a weak signal; only use when bytes/mime did not contradict
+    if (XHSFallbackIsVideoURL(urlString)) return YES;
     return NO;
 }
 
@@ -1812,23 +1865,35 @@ static void XHSFallbackDownloadAndSave(NSString *urlString) {
     NSLog(@"[XHSMediaSave] fallback GET %@ video=%d", urlString, (int)wantVideo);
     XHSFallbackToast(wantVideo ? @"\u6b63\u5728\u4e0b\u8f7d\u89c6\u9891\u2026" : @"\u6b63\u5728\u4e0b\u8f7d\u56fe\u7247\u2026");
 
-    // local file path / file URL
-    if ([urlString hasPrefix:@"file:"]) {
-        NSURL *fu = [NSURL URLWithString:urlString];
-        NSString *path = fu.path;
-        if (path.length) {
-            XHSFallbackSaveVideoFile(path, ^(BOOL ok, NSError *e) {
-                XHSFallbackToast(ok ? @"\u2705 \u89c6\u9891\u5df2\u4fdd\u5b58\u5230\u76f8\u518c" :
-                                 [NSString stringWithFormat:@"\u4fdd\u5b58\u5931\u8d25: %@", e.localizedDescription ?: @"?"]);
+    // local file path / file URL - probe image first to avoid HEIC->video 3302
+    void (^saveLocalPath)(NSString *) = ^(NSString *path) {
+        if (path.length == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+            XHSFallbackToast(@"\u4fdd\u5b58\u5931\u8d25: file missing");
+            return;
+        }
+        NSData *probe = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
+        NSString *mime = @"";
+        if (probe.length && !XHSFallbackDataLooksVideo(probe, urlString, mime)) {
+            XHSFallbackSaveData(probe, ^(BOOL ok, NSError *e) {
+                XHSFallbackToast(ok ? @"\u2705 \u5df2\u4fdd\u5b58\u5230\u76f8\u518c" :
+                                 [NSString stringWithFormat:@"\u4fdd\u5b58\u5931\u8d25: %@",
+                                  e.localizedDescription ?: @"?"]);
             });
             return;
         }
+        XHSFallbackSaveVideoFile(path, ^(BOOL ok, NSError *e) {
+            XHSFallbackToast(ok ? @"\u2705 \u89c6\u9891\u5df2\u4fdd\u5b58\u5230\u76f8\u518c" :
+                             [NSString stringWithFormat:@"\u4fdd\u5b58\u5931\u8d25: %@",
+                              e.localizedDescription ?: @"?"]);
+        });
+    };
+
+    if ([urlString hasPrefix:@"file:"]) {
+        NSURL *fu = [NSURL URLWithString:urlString];
+        if (fu.path.length) { saveLocalPath(fu.path); return; }
     }
     if ([urlString hasPrefix:@"/"] && [[NSFileManager defaultManager] fileExistsAtPath:urlString]) {
-        XHSFallbackSaveVideoFile(urlString, ^(BOOL ok, NSError *e) {
-            XHSFallbackToast(ok ? @"\u2705 \u89c6\u9891\u5df2\u4fdd\u5b58\u5230\u76f8\u518c" :
-                             [NSString stringWithFormat:@"\u4fdd\u5b58\u5931\u8d25: %@", e.localizedDescription ?: @"?"]);
-        });
+        saveLocalPath(urlString);
         return;
     }
 
@@ -1861,8 +1926,9 @@ forHTTPHeaderField:@"Accept"];
     if (wantVideo) {
         [[session downloadTaskWithRequest:req completionHandler:^(NSURL *location, NSURLResponse *resp, NSError *err) {
             NSHTTPURLResponse *http = (NSHTTPURLResponse *)resp;
-            NSLog(@"[XHSMediaSave] fallback video resp %ld err=%@ loc=%@",
-                  (long)http.statusCode, err, location.path);
+            NSString *mime = http.MIMEType ?: @"";
+            NSLog(@"[XHSMediaSave] fallback video resp %ld mime=%@ err=%@ loc=%@",
+                  (long)http.statusCode, mime, err, location.path);
             if (err || !location) {
                 XHSFallbackToast([NSString stringWithFormat:@"\u89c6\u9891\u4e0b\u8f7d\u5931\u8d25: %@",
                                   err.localizedDescription ?: @"empty"]);
@@ -1871,6 +1937,18 @@ forHTTPHeaderField:@"Accept"];
             NSString *ext = location.pathExtension.length ? location.pathExtension : @"mp4";
             if ([ext.lowercaseString isEqualToString:@"m3u8"]) {
                 XHSFallbackToast(@"\u6682\u4e0d\u652f\u6301 HLS(m3u8) \u89c6\u9891");
+                return;
+            }
+            // Probe first: HEIC/AVIF mislabeled as video URL must go image path
+            NSData *probe = [NSData dataWithContentsOfURL:location options:NSDataReadingMappedIfSafe error:nil];
+            if (probe.length >= 64 && !XHSFallbackDataLooksVideo(probe, urlString, mime)) {
+                NSLog(@"[XHSMediaSave] video URL was actually image mime=%@ bytes=%lu",
+                      mime, (unsigned long)probe.length);
+                XHSFallbackSaveData(probe, ^(BOOL ok, NSError *e) {
+                    XHSFallbackToast(ok ? @"\u2705 \u5df2\u4fdd\u5b58\u5230\u76f8\u518c" :
+                                     [NSString stringWithFormat:@"\u4fdd\u5b58\u5931\u8d25: %@",
+                                      e.localizedDescription ?: @"?"]);
+                });
                 return;
             }
             NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
@@ -1910,15 +1988,24 @@ forHTTPHeaderField:@"Accept"];
                               err.localizedDescription ?: @"empty"]);
             return;
         }
+        // Always try image path unless content really looks like video.
+        // Fixes HEIC ftyp false-positive -> PHPhotosErrorDomain 3302.
         if (XHSFallbackDataLooksVideo(data, urlString, mime)) {
             NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
                              [NSString stringWithFormat:@"xhs_vid_%@.mp4", NSUUID.UUID.UUIDString]];
             if ([data writeToFile:tmp atomically:YES]) {
                 XHSFallbackSaveVideoFile(tmp, ^(BOOL ok, NSError *e) {
                     [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
-                    XHSFallbackToast(ok ? @"\u2705 \u89c6\u9891\u5df2\u4fdd\u5b58\u5230\u76f8\u518c" :
-                                     [NSString stringWithFormat:@"\u4fdd\u5b58\u5931\u8d25: %@",
-                                      e.localizedDescription ?: @"?"]);
+                    if (ok) {
+                        XHSFallbackToast(@"\u2705 \u89c6\u9891\u5df2\u4fdd\u5b58\u5230\u76f8\u518c");
+                        return;
+                    }
+                    // last resort: maybe it was still an image container
+                    XHSFallbackSaveData(data, ^(BOOL ok2, NSError *e2) {
+                        XHSFallbackToast(ok2 ? @"\u2705 \u5df2\u4fdd\u5b58\u5230\u76f8\u518c" :
+                                         [NSString stringWithFormat:@"\u4fdd\u5b58\u5931\u8d25: %@",
+                                          (e2.localizedDescription ?: e.localizedDescription) ?: @"?"]);
+                    });
                 });
                 return;
             }
@@ -1930,6 +2017,7 @@ forHTTPHeaderField:@"Accept"];
         });
     }] resume];
 }
+
 
 static void XHSFallbackCollectFromView(UIView *root, NSMutableSet<NSString *> *set) {
     UIView *v = root;
@@ -2074,9 +2162,16 @@ static void XHSFallbackForceSaveFromView(UIView *view) {
             return NSOrderedSame;
         }];
         NSString *pick = sorted.firstObject;
-        // if any video URL exists, prefer highest-score video over image cover
+        // Prefer video only when it is the top URL or within ~8 score of top image.
+        // Avoid blindly taking a weak video URL over a clear image note.
+        NSInteger topScore = XHSFallbackURLScore(pick);
         for (NSString *u in sorted) {
-            if (XHSFallbackIsVideoURL(u)) { pick = u; break; }
+            if (!XHSFallbackIsVideoURL(u)) continue;
+            NSInteger vs = XHSFallbackURLScore(u);
+            if (vs + 8 >= topScore) {
+                pick = u;
+                break;
+            }
         }
         NSLog(@"[XHSMediaSave] fallback picked url score=%ld video=%d %@",
               (long)XHSFallbackURLScore(pick), (int)XHSFallbackIsVideoURL(pick), pick);
@@ -2242,7 +2337,7 @@ static void XHSDeferredHeavyInstall(void) {
                 XHSScanToastFilters();
                 XHSScanI18nFilters();
                 XHSScanAuthorityPatches();
-                LOG(@"v10 deferred heavy install done");
+                LOG(@"v10.1 deferred heavy install done");
             }
         });
     });
@@ -2254,8 +2349,8 @@ __attribute__((constructor))
 static void XHSInit(void) {
     @autoreleasepool {
         if (!XHSIsTarget()) return;
-        LOG(@"v10 load pid=%d", getpid());
-        NSLog(@"[XHSMediaSave] v10 load pid=%d", getpid());
+        LOG(@"v10.1 load pid=%d", getpid());
+        NSLog(@"[XHSMediaSave] v10.1 load pid=%d", getpid());
 
         // known-class only; no objc_copyClassList / no NSBundle / no session wrap
         XHSInstallClassHooks();
@@ -2273,7 +2368,7 @@ static void XHSInit(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             XHSRepatchCore();
-            LOG(@"v10 delayed light patch 1.2s");
+            LOG(@"v10.1 delayed light patch 1.2s");
         });
         // one heavy background scan after home is likely up
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)),
