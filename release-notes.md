@@ -1,3 +1,10 @@
+## Douyin.dylib v1.4
+
+- **安全启动**：默认不再 hook JSON / NSUserDefaults / toast / i18n（解决一打开就闪退）
+- 仅悬浮保存 + 下载写相册；5 秒后后台轻量 patch 抖音 preventDownload 等 BOOL 门
+- 保留 v1.3：Photos 直写优先、无水印 URL 变体、后台缓存扫描
+- 使用：TrollFools 移除旧插件 → 注入新 Douyin.dylib → 彻底杀进程冷启动
+
 ## Douyin.dylib v1.3
 
 - **防闪退**：关闭危险全量 class 扫描后的收尾；收窄 NSUserDefaults 匹配；KVC 仅扫 Player/Video/Aweme 等视图

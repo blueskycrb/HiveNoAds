@@ -2,6 +2,11 @@
 // Douyin.dylib - unlock video/image save for Douyin (Aweme)
 // Bundle: com.ss.iphone.ugc.Aweme | executable: Aweme | analyzed: 38.7.0
 //
+// v1.4:
+//   - SAFE boot: NO JSON/UserDefaults/toast/i18n hooks (they crash Aweme 38.x)
+//   - Only floating save UI + download pipeline; optional minimal AWE gate patch
+//   - Keep v1.3 Photos-first save + no-wm URL variants
+//
 // v1.3:
 //   - Stability: no full-class scan hooks; safer KVC; direct Photos write first
 //   - No-watermark prefer: downloadAddr / play (not playwm) + URL rewrite
@@ -64,19 +69,20 @@ static void DY_void0(id s, SEL c) { (void)s; (void)c; }
 static void DY_setBoolDrop(id s, SEL c, BOOL v) { (void)s; (void)c; (void)v; }
 
 static void DYPatchBool(Class cls, const char *selName, BOOL value) {
+    // v1.4: ONLY true BOOL/char returns. Never patch '@' methods — returning @YES
+    // for a method that actually returns a model/object crashes Aweme later.
     if (!cls || !selName) return;
     SEL sel = sel_registerName(selName);
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) return;
+    if (method_getNumberOfArguments(m) != 2) return; // instance getter only
     const char *t = method_getTypeEncoding(m);
     if (!t) return;
     if (t[0] == 'B' || t[0] == 'c') {
         method_setImplementation(m, value ? (IMP)DY_retYES : (IMP)DY_retNO);
         LOG(@"%s -%s => %d", class_getName(cls), selName, (int)value);
-    } else if (t[0] == '@') {
-        method_setImplementation(m, value ? (IMP)DY_retYesObj : (IMP)DY_retNoObj);
-        LOG(@"%s -%s => @%d", class_getName(cls), selName, (int)value);
     }
+    // deliberately ignore '@' / other encodings
 }
 
 static void DYPatchVoid(Class cls, const char *selName) {
@@ -93,6 +99,12 @@ static void DYPatchSetterDrop(Class cls, const char *selName) {
     if (!cls || !selName) return;
     Method m = class_getInstanceMethod(cls, sel_registerName(selName));
     if (!m) return;
+    // only (id,SEL,BOOL) style setters
+    if (method_getNumberOfArguments(m) != 3) return;
+    const char *t = method_getTypeEncoding(m);
+    if (!t || t[0] != 'v') return;
+    // look for BOOL/char arg roughly: encoding like v@:B or v@:c
+    if (!(strstr(t, "B") || strstr(t, "c"))) return;
     method_setImplementation(m, (IMP)DY_setBoolDrop);
 }
 
@@ -198,26 +210,13 @@ static void DYPatchKnownClass(Class cls) {
     DYPatchBool(cls, "hasSaveNotAllowDownloadMyVideosKey", NO);
     DYPatchBool(cls, "isShowedAdvanceOptionNoteDownloadTips", YES);
 
-    // enable only for save-related classes
-    if (DYNameLooksSaveProvider(class_getName(cls))) {
-        DYPatchBool(cls, "enable", YES);
-        DYPatchBool(cls, "isEnabled", YES);
-        DYPatchBool(cls, "isAvailable", YES);
-        DYPatchBool(cls, "canSave", YES);
-        DYPatchBool(cls, "canDownload", YES);
-        // avoid paid-image branch only; do not crack paid download wall
-        DYPatchBool(cls, "isPaidImageNote", NO);
-        DYPatchBool(cls, "isPaidDownload", NO);
-        DYPatchBool(cls, "hasPaidDownload", NO);
-        DYPatchBool(cls, "showPaidDownload", NO);
-    }
+    // v1.4: do NOT patch generic enable/isAvailable/isEnabled — breaks AWE download UI/modules
+    // keep only explicit download permission getters above + safe void toasts
 
     DYPatchVoid(cls, "checkShowCloseNoteDownloadSwitchToast");
     DYPatchVoid(cls, "showCloseNoteDownloadSwitchToast");
     DYPatchVoid(cls, "showDownloadPermissionToast");
-    DYPatchSetterDrop(cls, "setNotAllowDownloadMyVideos:");
-    DYPatchSetterDrop(cls, "setNotAllowDownloadMyVideosSwitchOn:");
-    DYPatchSetterDrop(cls, "setHitUserNoteDownloadSwitch:");
+    // setters skipped in v1.4 safe path (called only if encoding matches via DYPatchSetterDrop)
     DYPatchSetterDrop(cls, "setHitRacingUserNoteDownloadSwitch:");
 }
 
@@ -2535,32 +2534,38 @@ forHTTPHeaderField:@"User-Agent"];
     }] resume];
 }
 
+static BOOL DYViewClassLooksMedia(UIView *v) {
+    if (!v) return NO;
+    const char *cn = object_getClassName(v);
+    if (!cn) return NO;
+    return strstr(cn, "Player") || strstr(cn, "Video") || strstr(cn, "Aweme") ||
+           strstr(cn, "Feed") || strstr(cn, "Play") || strstr(cn, "Media") ||
+           strstr(cn, "IES") || strstr(cn, "TTVideo") || strstr(cn, "Image") ||
+           strstr(cn, "Photo") || strstr(cn, "Note") || strstr(cn, "Cell");
+}
+
 static void DYFallbackCollectFromView(UIView *root, NSMutableSet<NSString *> *set) {
     UIView *v = root;
-    for (int i = 0; i < 12 && v; i++, v = v.superview) {
-        for (NSString *k in @[@"imageURL", @"imageUrl", @"url", @"currentImageURL",
-                              @"sd_imageURL", @"yy_imageURL", @"model", @"viewModel",
-                              @"awemeModel", @"aweme", @"currentAweme", @"playingAweme",
-                              @"playAddr", @"downloadAddr", @"playAddrModel", @"downloadAddrModel",
-                              @"note", @"imageInfo", @"noteImage", @"data", @"item", @"media",
-                              @"noteModel", @"imageModel", @"content", @"noteImageInfo",
-                              @"videoURL", @"videoUrl", @"video_url", @"videoUrlString",
-                              @"currentVideoURL", @"videoSourceUrl", @"player", @"playerItem",
-                              @"videoModel", @"videoInfo", @"mediaModel", @"video",
-                              @"playerController", @"interactionContext"]) {
+    for (int i = 0; i < 10 && v; i++, v = v.superview) {
+        if (!DYViewClassLooksMedia(v) && ![v isKindOfClass:[UIImageView class]]) {
+            continue;
+        }
+        NSArray *keys;
+        if ([v isKindOfClass:[UIImageView class]]) {
+            keys = @[@"imageURL", @"imageUrl", @"url", @"sd_imageURL", @"yy_imageURL",
+                     @"awemeModel", @"model", @"downloadAddr", @"playAddr"];
+        } else {
+            keys = @[@"awemeModel", @"aweme", @"currentAweme", @"playingAweme",
+                     @"playAddr", @"downloadAddr", @"playAddrModel", @"downloadAddrModel",
+                     @"videoURL", @"videoUrl", @"player", @"playerItem", @"videoModel",
+                     @"video", @"model", @"viewModel", @"context", @"interactionContext"];
+        }
+        for (NSString *k in keys) {
             @try {
                 if (![v respondsToSelector:NSSelectorFromString(k)]) continue;
                 DYFallbackCollect([v valueForKey:k], set, 0);
             } @catch (__unused NSException *e) {}
         }
-        @try {
-            id u = [v valueForKeyPath:@"sd_imageURL"];
-            DYFallbackCollect(u, set, 0);
-        } @catch (__unused NSException *e) {}
-        @try {
-            id u = [v valueForKeyPath:@"yy_imageURL"];
-            DYFallbackCollect(u, set, 0);
-        } @catch (__unused NSException *e) {}
     }
 }
 
@@ -2776,6 +2781,7 @@ static void DYFallbackCollectClassNamedModels(id obj, NSMutableSet<NSString *> *
 }
 
 static void DYFallbackForceSaveFromView(UIView *view) {
+    @try {
     if (!view) {
         DYFallbackToast(@"\u672a\u627e\u5230\u53ef\u4fdd\u5b58\u7684\u5a92\u4f53");
         return;
@@ -2971,6 +2977,10 @@ static void DYFallbackForceSaveFromView(UIView *view) {
         });
     });
     return;
+    } @catch (__unused NSException *e) {
+        NSLog(@"[DouyinSave] forceSave exception: %@", e);
+        DYFallbackToast(@"保存过程异常，请重试");
+    }
 }
 
 
@@ -3033,7 +3043,7 @@ static void DYFallbackForceSaveFromView(UIView *view) {
     lp.minimumPressDuration = 0.35;
     [win addGestureRecognizer:lp];
 
-    NSLog(@"[DouyinSave] fallback float ready on %@", win);
+    NSLog(@"[DouyinSave] v1.4 float ready on %@", win);
     DYFallbackToast(@"\u89c6\u9891/\u56fe\u7247\u4fdd\u5b58\u5df2\u52a0\u8f7d(\u70b9\u2193\u6216\u53cc\u6307\u957f\u6309)");
 }
 
@@ -3067,34 +3077,47 @@ static void DYFallbackForceSaveFromView(UIView *view) {
 
 #pragma mark - delayed re-patch
 
+// v1.4: minimal AWE download gates only (no XHS leftovers)
+static void DYInstallMinimalAwemeGates(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *known[] = {
+            "AWEAwemeModel",
+            "AWEVideoModel",
+            "AWEAwemeStatusModel",
+            "AWEDownloadPermissionItem",
+            "AWEDownloadSettingUtil",
+            "AWEDownloadEntranceHelper",
+            "AWEAwemeDetailNaviBarDownloadElement",
+            NULL
+        };
+        for (const char **p = known; *p; p++) {
+            Class cls = objc_getClass(*p);
+            if (!cls) continue;
+            DYPatchBool(cls, "preventDownload", NO);
+            DYPatchBool(cls, "hasPreventDownload", NO);
+            DYPatchBool(cls, "isPreventDownload", NO);
+            DYPatchBool(cls, "shouldPreventDownload", NO);
+            DYPatchBool(cls, "isControlledByPreventDownload", NO);
+            DYPatchBool(cls, "allowDownload", YES);
+            DYPatchBool(cls, "canDownload", YES);
+            DYPatchBool(cls, "shouldShowDownload", YES);
+            DYPatchBool(cls, "isDownloadEnabled", YES);
+            DYPatchBool(cls, "downloadEnabled", YES);
+            DYPatchBool(cls, "disableWatermark", YES);
+            DYPatchBool(cls, "disableWatermarkWhenSavingAlbum", YES);
+        }
+        NSLog(@"[DouyinSave] v1.4 minimal AWE gates installed");
+    });
+}
+
 static void DYRepatchCore(void) {
-    // light only - never full class scan on main thread
-    DYInstallClassHooksKnown();
-    DYInstallMediaSaveConfigLight();
-    DYInstallSaveMethodHooksKnown();
-    DYInstallToastFiltersKnown();
-    DYInstallI18nFiltersKnown();
-    DYInstallAuthorityPatchesKnown();
+    // v1.4: gates only
+    DYInstallMinimalAwemeGates();
 }
 
 static void DYDeferredHeavyInstall(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        // v1.3: DO NOT scan/patch all *Download* classes — that crashes Aweme after feed use.
-        // Known-class hooks + light repatch are enough for gate unlock.
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            @autoreleasepool {
-                DYInstallClassHooksKnown();
-                DYInstallMediaSaveConfigLight();
-                DYInstallSaveMethodHooksKnown();
-                DYInstallToastFiltersKnown();
-                DYInstallI18nFiltersKnown();
-                DYInstallAuthorityPatchesKnown();
-                LOG(@"v1.3 deferred known-only reinstall done");
-                NSLog(@"[DouyinSave] v1.3 skip full class scan (stability)");
-            }
-        });
-    });
+    // no-op: full scans removed
 }
 
 #pragma mark - ctor
@@ -3103,36 +3126,30 @@ __attribute__((constructor))
 static void DYInit(void) {
     @autoreleasepool {
         if (!DYIsTarget()) return;
-        LOG(@"v1.3 load pid=%d", getpid());
-        NSLog(@"[DouyinSave] v1.3 load pid=%d", getpid());
+        // v1.4 SAFE BOOT: do NOT touch JSON / UserDefaults / toast / i18n / XHS save services.
+        // Those global hooks are the main cause of immediate Aweme crash-on-launch.
+        NSLog(@"[DouyinSave] v1.4 safe load pid=%d (float-save only)", getpid());
 
-        // known-class only; no objc_copyClassList / no NSBundle / no session wrap
-        DYInstallClassHooks();
-        DYInstallJSONHook();
-        // DYInstallSessionHook(); // intentionally skipped in v8/v9
-        DYInstallMediaSaveConfigHooks();
-        DYInstallUserDefaultsHooks();
-        DYInstallToastFilters();
-        DYInstallI18nFilters();
-        // DYInstallBundleI18nHook(); // intentionally skipped in v8/v9
-        DYInstallSaveMethodHooks();
-        DYInstallAuthorityPatches();
+        // Float UI only — after app UI is up
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try {
+                [DYFallbackFloatUI install];
+            } @catch (__unused NSException *e) {
+                NSLog(@"[DouyinSave] float install exception: %@", e);
+            }
+        });
 
-        // Swift classes may register later - light repatch only
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            DYRepatchCore();
-            LOG(@"v1.3 delayed light patch 1.2s");
-        });
-        // one heavy background scan after home is likely up
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            DYDeferredHeavyInstall();
-        });
-        // fallback UI after window exists (does not touch hot paths)
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            [DYFallbackFloatUI install];
+        // Optional light gate unlock after feed likely loaded (background)
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            @autoreleasepool {
+                @try {
+                    DYInstallMinimalAwemeGates();
+                } @catch (__unused NSException *e) {
+                    NSLog(@"[DouyinSave] gate install exception: %@", e);
+                }
+            }
         });
     }
 }
