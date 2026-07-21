@@ -37,11 +37,14 @@ jobs:
             if [ "$app" = "Xiaohongshu" ]; then
               min_ios="14.0"
             fi
+            if [ "$app" = "Douyin" ]; then
+              min_ios="15.0"
+            fi
             echo "==> building $out from $src"
-            # Xiaohongshu v10.2 needs Photos + AVFoundation for video re-export album save
+            # Xiaohongshu / Douyin need Photos + AVFoundation for video re-export album save
             EXTRA_FW=""
-            if [ "$app" = "Xiaohongshu" ]; then
-              # v10.2 fallback save: Photos write + AVFoundation re-export + CoreGraphics
+            if [ "$app" = "Xiaohongshu" ] || [ "$app" = "Douyin" ]; then
+              # fallback save: Photos write + AVFoundation re-export + CoreGraphics
               EXTRA_FW="-framework Photos -framework AVFoundation -framework CoreGraphics"
             fi
             # shellcheck disable=SC2086
