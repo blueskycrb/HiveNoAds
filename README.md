@@ -106,12 +106,12 @@ apps/
 
 ## 抖音 `Douyin.dylib`（解锁保存视频 / 图片）
 
-**v1.6**：在 v1.5 当前条优先基础上，**优先 downloadAddr/原画与高码率**（打分 + 低码率自动换源），转码预设改为 Passthrough/Highest（不再先 Medium）；仍安全启动。若只找到封面会明确提示。
+**v1.7**：严格只锁**当前居中 feed cell**（不再混下一条）；**无水印优先**于高清带水印 download；低码率过滤只针对 play 流。兼顾画质与正确条目。仍安全启动。
 
 
 **优先尝试解锁原生下载门控**；仍不可用时用右侧青色 **↓** 悬浮按钮或双指长按兜底。
 
-1. 下载 [Releases](../../releases) 里的 **`Douyin.dylib`** (v1.6)（ASCII 名，避免 GitHub 把中文资源改成 `default.dylib`）
+1. 下载 [Releases](../../releases) 里的 **`Douyin.dylib`** (v1.7)（ASCII 名，避免 GitHub 把中文资源改成 `default.dylib`）
 2. TrollFools → 选**抖音** → 注入（先移除旧插件）
 3. **彻底划掉**抖音再冷启动
 4. 打开视频作品 → 点右侧 **↓**，或双指长按画面

@@ -2,6 +2,11 @@
 // Douyin.dylib - unlock video/image save for Douyin (Aweme)
 // Bundle: com.ss.iphone.ugc.Aweme | executable: Aweme | analyzed: 38.7.0
 //
+// v1.7:
+//   - STRICT single feed cell (window-center) — no multi-scroll / multi-VC mix
+//   - No-watermark first in try order; quality reject only for play/lowbr streams
+//   - Keep high-quality scoring from v1.6 + safe boot
+//
 // v1.6:
 //   - Prefer original/high quality: downloadAddr/bitRate > adaptive play stream
 //   - Stronger res/bitrate scoring; export uses Passthrough/Highest first (not Medium)
@@ -1988,15 +1993,17 @@ static NSInteger DYFallbackURLScore(NSString *u) {
         [l containsString:@"hevc"] || [l containsString:@"h.265"]) s += 18;
     if ([l containsString:@"hdr"]) s += 25;
 
-    // Hard penalty for watermark play URLs
+    // Hard penalty for watermark play URLs (prefer no-wm even if slightly lower res)
     if ([l containsString:@"playwm"] || [l containsString:@"play_wm"] ||
         [l containsString:@"watermark=1"] || [l containsString:@"watermark=true"] ||
         [l containsString:@"&wm=1"] || [l containsString:@"?wm=1"] ||
-        [l containsString:@"with_watermark"] || [l containsString:@"withwatermark"]) s -= 160;
+        [l containsString:@"with_watermark"] || [l containsString:@"withwatermark"]) s -= 220;
     if ([l containsString:@"nwm"] || [l containsString:@"no_watermark"] ||
         [l containsString:@"nowm"] || [l containsString:@"without_watermark"] ||
         [l containsString:@"withoutwatermark"] || [l containsString:@"no-watermark"] ||
-        [l containsString:@"watermark=0"] || [l containsString:@"wm=0"]) s += 80;
+        [l containsString:@"watermark=0"] || [l containsString:@"wm=0"]) s += 140;
+    // /play without playwm is usually cleaner than share-download with logo
+    if ([l containsString:@"/aweme/v1/play"] && ![l containsString:@"playwm"]) s += 55;
 
     if ([l containsString:@"origin"] || [l containsString:@"original"]) s += 25;
     if ([l containsString:@".mp4"] || [l containsString:@".mov"]) s += 20;
@@ -2377,6 +2384,11 @@ static BOOL DYFallbackFileLooksPlayableVideo(NSString *path) {
 
 static void DYFallbackDownloadOneVideo(NSString *urlString, void (^done)(BOOL ok, NSString *msg));
 static void DYFallbackDownloadVideosTry(NSArray<NSString *> *urls, NSUInteger idx);
+static BOOL DYURLLooksWatermarked(NSString *u);
+static BOOL DYURLLooksNoWatermark(NSString *u);
+static BOOL DYURLLooksDownload(NSString *u);
+static BOOL DYURLLooksLowLadderPlay(NSString *u);
+
 static void DYFallbackDownloadAndSaveImage(NSString *urlString);
 
 static void DYFallbackDownloadAndSave(NSString *urlString) {
@@ -2561,29 +2573,29 @@ forHTTPHeaderField:@"User-Agent"];
             return;
         }
 
-        // Reject obvious low-ladder streams so caller can try next (download/origin) URL
-        {
+        // Only reject obvious low-ladder PLAY streams (not download/origin).
+        // Hard reject was causing: skip current no-wm play -> save next's big download (wrong + watermark).
+        if (DYURLLooksLowLadderPlay(urlString) && !DYURLLooksDownload(urlString)) {
             double sec = 0;
             @try {
                 AVURLAsset *a = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:tmp] options:nil];
                 sec = CMTimeGetSeconds(a.duration);
             } @catch (__unused NSException *e) {}
-            if (sec > 2.5 && sec < 600) {
+            if (sec > 3.0 && sec < 600) {
                 double kbps = (sz * 8.0) / (sec * 1000.0);
-                // Mobile feed play often ~400-900kbps; original download usually >>1500
-                if (sz < 500ull * 1024ull || kbps < 700.0) {
-                    NSLog(@"[DouyinSave] reject low quality bytes=%llu sec=%.1f kbps=%.0f",
+                if (sz < 400ull * 1024ull || kbps < 450.0) {
+                    NSLog(@"[DouyinSave] reject low play stream bytes=%llu sec=%.1f kbps=%.0f",
                           sz, sec, kbps);
                     [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
-                    if (done) done(NO, @"low quality stream");
+                    if (done) done(NO, @"low quality play stream");
                     return;
                 }
-            } else if (sz < 350ull * 1024ull) {
-                NSLog(@"[DouyinSave] reject tiny video bytes=%llu", sz);
-                [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
-                if (done) done(NO, @"tiny video");
-                return;
             }
+        } else if (sz < 200ull * 1024ull) {
+            NSLog(@"[DouyinSave] reject tiny video bytes=%llu", sz);
+            [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
+            if (done) done(NO, @"tiny video");
+            return;
         }
 
         NSLog(@"[DouyinSave] video file ready bytes=%llu", sz);
@@ -2821,8 +2833,9 @@ static CGFloat DYVisibilityScore(UIView *v, UIView *container) {
     CGFloat dx = cx - CGRectGetMidX(bounds);
     CGFloat dy = cy - CGRectGetMidY(bounds);
     CGFloat dist = sqrt(dx * dx + dy * dy);
-    // Full-screen feed cells: area dominates; slight center bias for mid-swipe
-    return area - dist * 24.0;
+    // Full-screen feed: center distance dominates (prevents next cell winning by peek area)
+    CGFloat cover = area / MAX(bounds.size.width * bounds.size.height, 1.0);
+    return cover * 1e7 - dist * 80.0 + area * 0.01;
 }
 
 static void DYFallbackCollectCellKeys(UIView *cell, NSMutableSet<NSString *> *set) {
@@ -2830,7 +2843,8 @@ static void DYFallbackCollectCellKeys(UIView *cell, NSMutableSet<NSString *> *se
     for (NSString *k in @[@"awemeModel", @"aweme", @"model", @"viewModel",
                           @"currentAweme", @"playingAweme", @"context",
                           @"video", @"videoModel", @"pageContext",
-                          @"playAddr", @"downloadAddr", @"player"]) {
+                          @"playAddr", @"downloadAddr", @"player",
+                          @"awemeViewModel", @"cardModel", @"feedModel"]) {
         @try {
             if ([cell respondsToSelector:NSSelectorFromString(k)]) {
                 DYFallbackCollect([cell valueForKey:k], set, 0);
@@ -2841,42 +2855,60 @@ static void DYFallbackCollectCellKeys(UIView *cell, NSMutableSet<NSString *> *se
     DYFallbackCollectFromResponder(cell, set);
 }
 
-// v1.5: ONLY the most-visible cell per scroll view (Douyin preloads next/prev)
-static void DYFallbackCollectFromScrollViews(UIView *root, NSMutableSet<NSString *> *set) {
-    if (!root || !set) return;
+// v1.7: ONE cell only — best vs WINDOW center (not one per scroll view)
+static UIView *DYPickSingleBestFeedCell(UIView *root) {
+    if (!root) return nil;
+    UIView *container = root.window ?: root;
     NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
     NSInteger steps = 0;
-    while (stack.count && steps < 220) {
+    UIView *best = nil;
+    CGFloat bestScore = -1e9;
+    while (stack.count && steps < 260) {
         steps++;
         UIView *v = stack.lastObject;
         [stack removeLastObject];
-        if ([v isKindOfClass:[UITableView class]]) {
-            UITableView *tv = (UITableView *)v;
-            UITableViewCell *best = nil;
-            CGFloat bestScore = -1e9;
-            for (UITableViewCell *cell in tv.visibleCells) {
-                CGFloat sc = DYVisibilityScore(cell, tv);
-                if (sc > bestScore) { bestScore = sc; best = cell; }
+        if ([v isKindOfClass:[UITableView class]] || [v isKindOfClass:[UICollectionView class]]) {
+            NSArray *cells = nil;
+            @try {
+                if ([v isKindOfClass:[UITableView class]]) cells = [(UITableView *)v visibleCells];
+                else cells = [(UICollectionView *)v visibleCells];
+            } @catch (__unused NSException *e) {}
+            for (UIView *cell in cells ?: @[]) {
+                // Prefer full-screen-ish cells (feed), skip tiny chips
+                CGRect r = [cell convertRect:cell.bounds toView:container];
+                if (r.size.height < container.bounds.size.height * 0.35) continue;
+                if (r.size.width < container.bounds.size.width * 0.5) continue;
+                CGFloat sc = DYVisibilityScore(cell, container);
+                // Extra: distance of cell center to screen center (vertical feed)
+                CGFloat dy = fabs(CGRectGetMidY(r) - CGRectGetMidY(container.bounds));
+                sc -= dy * 40.0;
+                if (sc > bestScore) {
+                    bestScore = sc;
+                    best = cell;
+                }
             }
-            if (best) DYFallbackCollectCellKeys(best, set);
-        } else if ([v isKindOfClass:[UICollectionView class]]) {
-            UICollectionView *cv = (UICollectionView *)v;
-            UICollectionViewCell *best = nil;
-            CGFloat bestScore = -1e9;
-            for (UICollectionViewCell *cell in cv.visibleCells) {
-                CGFloat sc = DYVisibilityScore(cell, cv);
-                if (sc > bestScore) { bestScore = sc; best = cell; }
-            }
-            if (best) DYFallbackCollectCellKeys(best, set);
         }
         for (UIView *sub in v.subviews) [stack addObject:sub];
     }
+    return best;
 }
 
-// Prefer the single most-centered / actually-playing AVPlayerLayer
+static void DYFallbackCollectFromScrollViews(UIView *root, NSMutableSet<NSString *> *set) {
+    // Back-compat name: now only the single best feed cell
+    UIView *best = DYPickSingleBestFeedCell(root);
+    if (best) {
+        NSLog(@"[DouyinSave] single cell class=%s", object_getClassName(best));
+        DYFallbackCollectCellKeys(best, set);
+    }
+}
+
+// Player only if it overlaps the chosen cell (or is the single most-centered playing player)
 static void DYFallbackCollectActivePlayersInView(UIView *root, NSMutableSet<NSString *> *set) {
     if (!root || !set) return;
     UIView *container = root.window ?: root;
+    UIView *cell = DYPickSingleBestFeedCell(root);
+    CGRect cellRect = cell ? [cell convertRect:cell.bounds toView:container] : container.bounds;
+
     NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
     NSInteger steps = 0;
     AVPlayer *bestPlayer = nil;
@@ -2884,53 +2916,62 @@ static void DYFallbackCollectActivePlayersInView(UIView *root, NSMutableSet<NSSt
     id bestEngine = nil;
     CGFloat bestPlayerScore = -1e9;
     CGFloat bestEngineScore = -1e9;
+
     while (stack.count && steps < 320) {
         steps++;
         UIView *v = stack.lastObject;
         [stack removeLastObject];
         @try {
-            CALayer *layer = v.layer;
-            if ([layer isKindOfClass:[AVPlayerLayer class]]) {
-                AVPlayer *pl = [(AVPlayerLayer *)layer player];
-                if (pl) {
-                    CGFloat sc = DYVisibilityScore(v, container);
-                    if (pl.rate > 0.01) sc += 500000; // currently playing wins
-                    if (pl.currentItem) sc += 50000;
-                    if (sc > bestPlayerScore) {
-                        bestPlayerScore = sc;
-                        bestPlayer = pl;
+            CGRect vr = [v convertRect:v.bounds toView:container];
+            CGRect inter = CGRectIntersection(vr, cellRect);
+            CGFloat overlap = CGRectIsEmpty(inter) ? 0 : inter.size.width * inter.size.height;
+            // Must largely sit inside current cell
+            CGFloat vArea = MAX(vr.size.width * vr.size.height, 1.0);
+            if (overlap / vArea < 0.35 && cell) {
+                // still walk children; skip scoring this player shell
+            } else {
+                CALayer *layer = v.layer;
+                if ([layer isKindOfClass:[AVPlayerLayer class]]) {
+                    AVPlayer *pl = [(AVPlayerLayer *)layer player];
+                    if (pl) {
+                        CGFloat sc = DYVisibilityScore(v, container) + overlap * 0.001;
+                        if (pl.rate > 0.01) sc += 800000;
+                        if (pl.currentItem) sc += 50000;
+                        if (sc > bestPlayerScore) {
+                            bestPlayerScore = sc;
+                            bestPlayer = pl;
+                        }
                     }
                 }
-            }
-            const char *cn = object_getClassName(v);
-            if (cn && (strstr(cn, "Player") || strstr(cn, "Video") || strstr(cn, "TTVideo") ||
-                       strstr(cn, "IES") || strstr(cn, "Engine") || strstr(cn, "Play"))) {
-                for (NSString *k in @[@"player", @"videoPlayer", @"ttPlayer", @"iesPlayer"]) {
-                    @try {
-                        if (![v respondsToSelector:NSSelectorFromString(k)]) continue;
-                        id p = [v valueForKey:k];
-                        if (!p) continue;
-                        CGFloat sc = DYVisibilityScore(v, container);
-                        if ([p isKindOfClass:[AVPlayer class]]) {
-                            AVPlayer *ap = (AVPlayer *)p;
-                            if (ap.rate > 0.01) sc += 500000;
-                            if (ap.currentItem) sc += 50000;
-                            if (sc > bestPlayerScore) {
-                                bestPlayerScore = sc;
-                                bestPlayer = ap;
+                const char *cn = object_getClassName(v);
+                if (cn && (strstr(cn, "Player") || strstr(cn, "Video") || strstr(cn, "TTVideo") ||
+                           strstr(cn, "IES") || strstr(cn, "Engine") || strstr(cn, "Play"))) {
+                    for (NSString *k in @[@"player", @"videoPlayer", @"ttPlayer", @"iesPlayer"]) {
+                        @try {
+                            if (![v respondsToSelector:NSSelectorFromString(k)]) continue;
+                            id p = [v valueForKey:k];
+                            if (!p) continue;
+                            CGFloat sc = DYVisibilityScore(v, container) + overlap * 0.001;
+                            if ([p isKindOfClass:[AVPlayer class]]) {
+                                AVPlayer *ap = (AVPlayer *)p;
+                                if (ap.rate > 0.01) sc += 800000;
+                                if (ap.currentItem) sc += 50000;
+                                if (sc > bestPlayerScore) {
+                                    bestPlayerScore = sc;
+                                    bestPlayer = ap;
+                                }
+                            } else if (sc > bestEngineScore) {
+                                bestEngineScore = sc;
+                                bestEngineView = v;
+                                bestEngine = p;
                             }
-                        } else if (sc > bestEngineScore) {
-                            bestEngineScore = sc;
-                            bestEngineView = v;
-                            bestEngine = p;
-                        }
-                    } @catch (__unused NSException *e) {}
+                        } @catch (__unused NSException *e) {}
+                    }
                 }
             }
         } @catch (__unused NSException *e) {}
         for (UIView *sub in v.subviews) [stack addObject:sub];
     }
-    // Only the single best player / engine — never all preloaded ones
     if (bestPlayer) {
         DYFallbackCollect(bestPlayer, set, 0);
         @try {
@@ -2954,6 +2995,41 @@ static BOOL DYSetHasVideoURL(NSSet<NSString *> *set) {
         if (DYFallbackIsVideoURL(u) && ![u.lowercaseString containsString:@".m3u8"]) return YES;
     }
     return NO;
+}
+
+static BOOL DYURLLooksWatermarked(NSString *u) {
+    if (u.length == 0) return NO;
+    NSString *l = u.lowercaseString;
+    return [l containsString:@"playwm"] || [l containsString:@"play_wm"] ||
+           [l containsString:@"watermark=1"] || [l containsString:@"watermark=true"] ||
+           [l containsString:@"&wm=1"] || [l containsString:@"?wm=1"] ||
+           [l containsString:@"with_watermark"] || [l containsString:@"withwatermark"];
+}
+
+static BOOL DYURLLooksNoWatermark(NSString *u) {
+    if (u.length == 0) return NO;
+    NSString *l = u.lowercaseString;
+    if (DYURLLooksWatermarked(u)) return NO;
+    return [l containsString:@"nwm"] || [l containsString:@"no_watermark"] ||
+           [l containsString:@"nowm"] || [l containsString:@"without_watermark"] ||
+           [l containsString:@"watermark=0"] || [l containsString:@"wm=0"] ||
+           ([l containsString:@"/aweme/v1/play"] && ![l containsString:@"playwm"]);
+}
+
+static BOOL DYURLLooksDownload(NSString *u) {
+    if (u.length == 0) return NO;
+    NSString *l = u.lowercaseString;
+    return [l containsString:@"download"] || [l containsString:@"origin_download"] ||
+           [l containsString:@"origindownload"];
+}
+
+static BOOL DYURLLooksLowLadderPlay(NSString *u) {
+    if (u.length == 0) return YES;
+    NSString *l = u.lowercaseString;
+    if (DYURLLooksDownload(u)) return NO;
+    return [l containsString:@"lowbr"] || [l containsString:@"low_br"] ||
+           [l containsString:@"playaddr"] || [l containsString:@"play_addr"] ||
+           [l containsString:@"/aweme/v1/play"] || [l containsString:@"playwm"];
 }
 
 static void DYFallbackCollectClassNamedModels(id obj, NSMutableSet<NSString *> *set, NSInteger depth) {
@@ -2998,78 +3074,58 @@ static void DYFallbackForceSaveFromView(UIView *view) {
     UIWindow *win = view.window ?: DYFallbackKeyWindow();
     UIView *scope = win ?: view;
 
-    // v1.5 PHASE A: current item only (active player + most-visible cell + VC currentAweme)
-    // Avoid pulling preloaded next/prev feed cells into the URL set.
+    // v1.7 STRICT: only ONE feed cell + player overlapping that cell.
+    // Do NOT merge every child VC's currentAweme (that re-introduces next video).
+    UIView *cell = scope ? DYPickSingleBestFeedCell(scope) : nil;
+    if (cell) {
+        NSLog(@"[DouyinSave] lock cell=%s", object_getClassName(cell));
+        DYFallbackCollectCellKeys(cell, set);
+    }
     if (scope) {
         DYFallbackCollectActivePlayersInView(scope, set);
-        DYFallbackCollectFromScrollViews(scope, set);
     }
-    DYFallbackCollectFromView(view, set);
-    DYFallbackCollectFromResponder(view, set);
+    // Point of interaction (float button still uses window; long-press uses hit view)
+    if (view && view != win && view != scope) {
+        DYFallbackCollectFromView(view, set);
+        DYFallbackCollectFromResponder(view, set);
+    }
 
-    UIViewController *top = DYTopViewController();
-    if (top) {
-        // Prefer current/playing keys only (do not walk generic model lists)
-        for (NSString *k in @[@"currentAweme", @"playingAweme", @"currentModel",
-                              @"playingModel", @"currentVideo", @"playingVideo",
-                              @"currentItem", @"playingItem"]) {
-            @try {
-                if ([top respondsToSelector:NSSelectorFromString(k)]) {
-                    DYFallbackCollect([top valueForKey:k], set, 0);
-                }
-            } @catch (__unused NSException *e) {}
-        }
-        DYFallbackCollectFromResponder(top, set);
-        if (top.isViewLoaded) {
-            DYFallbackCollectActivePlayersInView(top.view, set);
-            DYFallbackCollectFromScrollViews(top.view, set);
-        }
-        for (UIViewController *c in top.childViewControllers) {
+    // Only if still empty: ONE shot at top VC current/playing (not all children)
+    if (!DYSetHasVideoURL(set)) {
+        UIViewController *top = DYTopViewController();
+        if (top) {
             for (NSString *k in @[@"currentAweme", @"playingAweme", @"currentModel",
-                                  @"playingModel", @"currentVideo", @"playingVideo",
-                                  @"currentItem", @"playingItem"]) {
+                                  @"playingModel", @"currentVideo", @"playingVideo"]) {
                 @try {
-                    if ([c respondsToSelector:NSSelectorFromString(k)]) {
-                        DYFallbackCollect([c valueForKey:k], set, 0);
+                    if ([top respondsToSelector:NSSelectorFromString(k)]) {
+                        DYFallbackCollect([top valueForKey:k], set, 0);
                     }
                 } @catch (__unused NSException *e) {}
             }
-            DYFallbackCollectFromResponder(c, set);
-            if (c.isViewLoaded) {
-                DYFallbackCollectActivePlayersInView(c.view, set);
-                DYFallbackCollectFromScrollViews(c.view, set);
+            if (top.isViewLoaded) {
+                UIView *c2 = DYPickSingleBestFeedCell(top.view);
+                if (c2) DYFallbackCollectCellKeys(c2, set);
+                DYFallbackCollectActivePlayersInView(top.view, set);
             }
         }
     }
 
-    // PHASE B only if current-scope found no video (e.g. photo post / odd page)
+    // PHASE B last resort only
     if (!DYSetHasVideoURL(set)) {
         NSLog(@"[DouyinSave] phaseA empty video; broaden collect");
+        UIViewController *top = DYTopViewController();
         if (scope) {
             DYFallbackCollectPlayersInView(scope, set);
             DYFallbackCollectFromScrollViews(scope, set);
         }
         if (top) {
             DYFallbackCollectClassNamedModels(top, set, 0);
-            if (top.isViewLoaded) {
-                DYFallbackCollectPlayersInView(top.view, set);
-            }
-            for (UIViewController *c in top.childViewControllers) {
-                DYFallbackCollectClassNamedModels(c, set, 0);
-                if (c.isViewLoaded) DYFallbackCollectPlayersInView(c.view, set);
-            }
-        }
-        if (win) {
-            CGPoint prefer = CGPointMake(CGRectGetMidX(win.bounds), CGRectGetMidY(win.bounds) - 40);
-            UIImageView *best = DYFallbackPickBestImageView(win, prefer);
-            if (best) {
-                DYFallbackCollectFromView(best, set);
-                DYFallbackCollectFromResponder(best, set);
-            }
+            DYFallbackCollectFromResponder(top, set);
         }
     }
 
     NSLog(@"[DouyinSave] collected %lu urls (current-first)", (unsigned long)set.count);
+
 
     for (NSString *u in set) {
         NSLog(@"[DouyinSave]  candidate score=%ld video=%d %@",
@@ -3105,29 +3161,51 @@ static void DYFallbackForceSaveFromView(UIView *view) {
             }
             if (expanded.count > 60) break;
         }
-        NSArray *rescored = [expanded.allObjects sortedArrayUsingComparator:cmp];
+        // Comparator: no-wm first, then score (quality), then download
+        NSComparator cmp2 = ^NSComparisonResult(NSString *a, NSString *b) {
+            BOOL aw = DYURLLooksWatermarked(a), bw = DYURLLooksWatermarked(b);
+            if (aw != bw) return aw ? NSOrderedDescending : NSOrderedAscending; // no-wm first
+            BOOL an = DYURLLooksNoWatermark(a), bn = DYURLLooksNoWatermark(b);
+            if (an != bn) return an ? NSOrderedAscending : NSOrderedDescending;
+            NSInteger sa = DYFallbackURLScore(a), sb = DYFallbackURLScore(b);
+            if (sa > sb) return NSOrderedAscending;
+            if (sa < sb) return NSOrderedDescending;
+            BOOL ad = DYURLLooksDownload(a), bd = DYURLLooksDownload(b);
+            if (ad != bd) return ad ? NSOrderedAscending : NSOrderedDescending;
+            return NSOrderedSame;
+        };
+        NSArray *rescored = [expanded.allObjects sortedArrayUsingComparator:cmp2];
         NSMutableArray<NSString *> *tryList = [NSMutableArray array];
-        // Pass 1: download/origin only (original / high quality)
+        void (^addU)(NSString *, NSInteger) = ^(NSString *u, NSInteger cap) {
+            if (!u.length || tryList.count >= (NSUInteger)cap) return;
+            if (DYURLLooksWatermarked(u) && tryList.count > 0) {
+                // keep wm only as late fillers
+            }
+            for (NSString *e in tryList) { if ([e isEqualToString:u]) return; }
+            [tryList addObject:u];
+        };
+        // Pass A: no-watermark + download/origin (best)
         for (NSString *u in rescored) {
-            if (tryList.count >= 10) break;
-            NSString *l = u.lowercaseString;
-            BOOL isDL = [l containsString:@"download"] || [l containsString:@"origin_download"] ||
-                        [l containsString:@"origindownload"];
-            if (!isDL) continue;
-            BOOL dup = NO;
-            for (NSString *e in tryList) { if ([e isEqualToString:u]) { dup = YES; break; } }
-            if (!dup) [tryList addObject:u];
+            if (tryList.count >= 8) break;
+            if (DYURLLooksWatermarked(u)) continue;
+            if (DYURLLooksDownload(u) || DYURLLooksNoWatermark(u)) addU(u, 8);
         }
-        // Pass 2: high-res / high-br play URLs
+        // Pass B: other no-watermark (high score play)
         for (NSString *u in rescored) {
-            if (tryList.count >= 14) break;
-            BOOL dup = NO;
-            for (NSString *e in tryList) { if ([e isEqualToString:u]) { dup = YES; break; } }
-            if (!dup) [tryList addObject:u];
+            if (tryList.count >= 12) break;
+            if (DYURLLooksWatermarked(u)) continue;
+            addU(u, 12);
         }
-        NSLog(@"[DouyinSave] VIDEO pick top=%@ score=%ld (try %lu, expanded %lu)",
+        // Pass C: remaining including watermarked (last resort)
+        for (NSString *u in rescored) {
+            if (tryList.count >= 16) break;
+            addU(u, 16);
+        }
+        NSLog(@"[DouyinSave] VIDEO pick top=%@ score=%ld wm=%d dl=%d (try %lu, expanded %lu)",
               tryList.firstObject,
               (long)DYFallbackURLScore(tryList.firstObject),
+              (int)DYURLLooksWatermarked(tryList.firstObject),
+              (int)DYURLLooksDownload(tryList.firstObject),
               (unsigned long)tryList.count, (unsigned long)expanded.count);
         DYFallbackDownloadVideosTry(tryList, 0);
         return;
@@ -3350,7 +3428,7 @@ static void DYInstallMinimalAwemeGates(void) {
             DYPatchBool(cls, "disableWatermark", YES);
             DYPatchBool(cls, "disableWatermarkWhenSavingAlbum", YES);
         }
-        NSLog(@"[DouyinSave] v1.6 minimal AWE gates installed");
+        NSLog(@"[DouyinSave] v1.7 minimal AWE gates installed");
     });
 }
 
@@ -3371,7 +3449,7 @@ static void DYInit(void) {
         if (!DYIsTarget()) return;
         // v1.4 SAFE BOOT: do NOT touch JSON / UserDefaults / toast / i18n / XHS save services.
         // Those global hooks are the main cause of immediate Aweme crash-on-launch.
-        NSLog(@"[DouyinSave] v1.6 quality load pid=%d (float-save only)", getpid());
+        NSLog(@"[DouyinSave] v1.7 strict-current load pid=%d (float-save only)", getpid());
 
         // Float UI only — after app UI is up
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
