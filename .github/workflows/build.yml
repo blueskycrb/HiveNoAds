@@ -45,7 +45,7 @@ jobs:
             EXTRA_FW=""
             if [ "$app" = "Xiaohongshu" ] || [ "$app" = "Douyin" ]; then
               # fallback save: Photos write + AVFoundation re-export + CoreGraphics
-              EXTRA_FW="-framework Photos -framework AVFoundation -framework CoreGraphics"
+              EXTRA_FW="-framework Photos -framework AVFoundation -framework CoreGraphics -framework CoreMedia"
             fi
             # shellcheck disable=SC2086
             clang -dynamiclib \
