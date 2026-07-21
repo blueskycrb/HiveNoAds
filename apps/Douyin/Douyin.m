@@ -2,6 +2,17 @@
 // Douyin.dylib - unlock video/image save for Douyin (Aweme)
 // Bundle: com.ss.iphone.ugc.Aweme | executable: Aweme | analyzed: 38.7.0
 //
+// v1.2:
+//   - Multi-URL video try; strict content check (no image/HTML as video)
+//   - Photos verifies localIdentifier + mediaType==Video
+//   - Collect aweme models from cells; deeper local cache scan
+//
+// v1.1:
+//   - Video-first: never treat feed cover as success video save
+//   - Stronger player/model URL collect (TTVideoEngine/IES keys + AVPlayerLayer)
+//   - Douyin CDN without .mp4 still counted as video; heavy penalty for cover/byteimg
+//   - Photos write verifies localIdentifier; cookie-aware download
+//
 // v1:
 //   - Based on Xiaohongshu v1 save pipeline (Photos + AV re-export)
 //   - Gate unlock: preventDownload / allowDownload / canDownload
@@ -15,6 +26,8 @@
 #import <UIKit/UIKit.h>
 #import <Photos/Photos.h>
 #import <AVFoundation/AVFoundation.h>
+#import <CoreMedia/CoreMedia.h>
+#import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <string.h>
@@ -1557,10 +1570,18 @@ static void DYFallbackSaveImage(UIImage *image, void (^done)(BOOL, NSError *)) {
                                   userInfo:@{NSLocalizedDescriptionKey: @"album permission denied"}]);
             return;
         }
+        __block NSString *localId = nil;
         [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
-            [PHAssetChangeRequest creationRequestForAssetFromImage:image];
+            PHAssetChangeRequest *req = [PHAssetChangeRequest creationRequestForAssetFromImage:image];
+            localId = req.placeholderForCreatedAsset.localIdentifier;
         } completionHandler:^(BOOL success, NSError *error) {
-            dispatch_async(dispatch_get_main_queue(), ^{ if (done) done(success, error); });
+            NSLog(@"[DouyinSave] photos write image success=%d id=%@ err=%@", (int)success, localId, error);
+            BOOL really = success && localId.length > 0;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (done) done(really, really ? nil : (error ?:
+                    [NSError errorWithDomain:@"DouyinSave" code:3302
+                                    userInfo:@{NSLocalizedDescriptionKey: @"Photos rejected image"}]));
+            });
         }];
     });
 }
@@ -1659,29 +1680,72 @@ static BOOL DYFallbackLooksMediaHost(NSString *l) {
            [l containsString:@"tos-cn"] ||
            [l containsString:@"vlabvod"] ||
            [l containsString:@"bytevcloud"] ||
-           [l containsString:@"ibytedtos"];
+           [l containsString:@"ibytedtos"] ||
+           [l containsString:@"douyinvod"] ||
+           [l containsString:@"douyinpic"] ||
+           [l containsString:@"volces.com"] ||
+           [l containsString:@"byted.org"];
 }
 
 static BOOL DYFallbackIsVideoURL(NSString *s) {
     if (s.length < 8) return NO;
     NSString *l = s.lowercaseString;
-    if ([l containsString:@".jpg"] || [l containsString:@".jpeg"] ||
-        [l containsString:@".png"] || [l containsString:@".webp"] ||
-        [l containsString:@".heic"] || [l containsString:@".gif"]) {
-        if (![l containsString:@"video"]) return NO;
+    // hard image hosts / templates
+    if ([l containsString:@"byteimg"] || [l containsString:@"douyinpic"] ||
+        [l containsString:@"~tplv-"] || [l containsString:@"imageview2"] ||
+        [l containsString:@"fmt=jpeg"] || [l containsString:@"fmt=png"] ||
+        [l containsString:@"fmt=webp"] || [l containsString:@"fmt=heic"]) {
+        if (![l containsString:@".mp4"] && ![l containsString:@"mime_type=video"]) return NO;
+    }
+    // explicit image extensions are not video (cover frames)
+    if (([l containsString:@".jpg"] || [l containsString:@".jpeg"] ||
+         [l containsString:@".png"] || [l containsString:@".webp"] ||
+         [l containsString:@".heic"] || [l containsString:@".gif"] ||
+         [l containsString:@".bmp"]) &&
+        ![l containsString:@".mp4"] && ![l containsString:@"mime_type=video"]) {
+        return NO;
+    }
+    if (([l containsString:@"cover"] || [l containsString:@"avatar"] ||
+         [l containsString:@"thumb"] || [l containsString:@"head"]) &&
+        ![l containsString:@".mp4"] && ![l containsString:@"video_id"] &&
+        ![l containsString:@"/aweme/v1/play"]) {
+        return NO;
     }
     if ([l containsString:@".m3u8"] || [l containsString:@".mp4"] ||
-        [l containsString:@".m4v"] || [l containsString:@".mov"]) return YES;
-    if ([l containsString:@"mime_type=video"] || [l containsString:@"media_type=video"]) return YES;
+        [l containsString:@".m4v"] || [l containsString:@".mov"] ||
+        [l containsString:@".flv"]) return YES;
+    if ([l containsString:@"mime_type=video"] || [l containsString:@"media_type=video"] ||
+        [l containsString:@"content-type=video"]) return YES;
+    // strong Douyin video endpoints / vod hosts
     if ([l containsString:@"play_addr"] || [l containsString:@"playaddr"] ||
         [l containsString:@"download_addr"] || [l containsString:@"downloadaddr"] ||
         [l containsString:@"bytevcloud"] || [l containsString:@"vlabvod"] ||
-        [l containsString:@"/video/"] || [l containsString:@"video_id"] ||
-        [l containsString:@"aweme"] && [l containsString:@"play"]) return YES;
+        [l containsString:@"douyinvod"] || [l containsString:@"video_id="] ||
+        [l containsString:@"/aweme/v1/play"] || [l containsString:@"/aweme/v1/playwm"] ||
+        [l containsString:@"media-video"] || [l containsString:@"video_mp4"] ||
+        [l containsString:@"/video/tos/"] || [l containsString:@"/obj/ies-music/"] ||
+        [l containsString:@"/obj/tos-"] || [l containsString:@"mime_type%3dvideo"] ||
+        [l containsString:@"mime_type%3Dvideo"]) return YES;
+    // progressive CDN: require video-ish path segment, NOT bare /obj/
     if (([l containsString:@"tos-cn"] || [l containsString:@"cdn-tos"] ||
-         [l containsString:@"bytecdn"] || [l containsString:@"snssdk"]) &&
-        ([l containsString:@"video"] || [l containsString:@"play"] ||
-         [l containsString:@"download"] || [l containsString:@"/obj/"])) return YES;
+         [l containsString:@"bytecdn"] || [l containsString:@"snssdk"] ||
+         [l containsString:@"volces.com"] || [l containsString:@"bytedance"] ||
+         [l containsString:@"iesdouyin"] || [l containsString:@"douyinvod"] ||
+         [l containsString:@"ibytedtos"]) &&
+        ([l containsString:@"/video/"] || [l containsString:@"video/"] ||
+         [l containsString:@"vod"] || [l containsString:@"stream"] ||
+         [l containsString:@"play"] || [l containsString:@"media-video"] ||
+         [l containsString:@"download"])) {
+        if ([l containsString:@"cover"] || [l containsString:@"avatar"] ||
+            [l containsString:@"thumb"] || [l containsString:@"icon"] ||
+            [l containsString:@"image"]) return NO;
+        return YES;
+    }
+    if ([l hasPrefix:@"file:"] &&
+        ([l containsString:@".mp4"] || [l containsString:@".mov"] ||
+         [l containsString:@".m4v"])) return YES;
+    if ([l hasPrefix:@"/"] &&
+        ([l hasSuffix:@".mp4"] || [l hasSuffix:@".mov"] || [l hasSuffix:@".m4v"])) return YES;
     return NO;
 }
 
@@ -1690,8 +1754,10 @@ static BOOL DYFallbackIsImageURL(NSString *s) {
     NSString *l = s.lowercaseString;
     if (![l hasPrefix:@"http"]) return NO;
     if (DYFallbackIsVideoURL(s)) return NO;
-    return DYFallbackLooksMediaHost(l) ||
-           [l containsString:@".jpg"] ||
+    if ([l containsString:@"byteimg"] || [l containsString:@"douyinpic"] ||
+        [l containsString:@"~tplv-"] || [l containsString:@"avatar"] ||
+        [l containsString:@"cover"] || [l containsString:@"thumb"]) return YES;
+    return [l containsString:@".jpg"] ||
            [l containsString:@".jpeg"] ||
            [l containsString:@".png"] ||
            [l containsString:@".webp"] ||
@@ -1708,7 +1774,7 @@ static BOOL DYFallbackIsMediaURL(NSString *s) {
 }
 
 static void DYFallbackCollect(id obj, NSMutableSet<NSString *> *out, NSInteger depth) {
-    if (!obj || depth > 6) return;
+    if (!obj || depth > 10 || out.count > 120) return;
     if ([obj isKindOfClass:[NSString class]]) {
         if (DYFallbackIsMediaURL((NSString *)obj)) [out addObject:(NSString *)obj];
         return;
@@ -1731,6 +1797,47 @@ static void DYFallbackCollect(id obj, NSMutableSet<NSString *> *out, NSInteger d
     if ([obj isKindOfClass:[AVPlayer class]]) {
         DYFallbackCollect([(AVPlayer *)obj currentItem], out, depth + 1);
         return;
+    }
+    // Douyin often uses non-AVPlayer engines; probe common KVC keys
+    if (depth < 4 && [obj isKindOfClass:[NSObject class]]) {
+        static NSArray<NSString *> *engineKeys;
+        static dispatch_once_t onceEK;
+        dispatch_once(&onceEK, ^{
+            engineKeys = @[
+                @"currentURL", @"currentUrl", @"playURL", @"playUrl", @"videoURL", @"videoUrl",
+                @"url", @"URL", @"contentURL", @"assetURL", @"localURL", @"localUrl",
+                @"cacheFilePath", @"cachePath", @"filePath", @"videoPath", @"localPath",
+                @"originURL", @"originUrl", @"downloadURL", @"downloadUrl",
+                @"playAddr", @"downloadAddr", @"urlList", @"url_list",
+                @"videoEngine", @"ttVideoEngine", @"player", @"videoPlayer",
+                @"iesVideoPlayer", @"playerItem", @"currentItem", @"model",
+                @"awemeModel", @"aweme", @"video", @"videoModel", @"currentAweme",
+                @"currentPlayURL", @"playbackURL", @"videoURLString", @"playURLString",
+                @"local_url", @"file_url", @"videoFilePath",
+                @"downloadAddrModel", @"playAddrModel", @"playAddrH264Model"
+            ];
+        });
+        for (NSString *k in engineKeys) {
+            @try {
+                id v = [obj valueForKey:k];
+                if (v && v != obj) DYFallbackCollect(v, out, depth + 1);
+            } @catch (__unused NSException *e) {}
+        }
+        // some engines expose URL via method without KVC property
+        @try {
+            SEL s1 = sel_registerName("currentURL");
+            if ([obj respondsToSelector:s1]) {
+                id u = ((id (*)(id, SEL))objc_msgSend)(obj, s1);
+                DYFallbackCollect(u, out, depth + 1);
+            }
+        } @catch (__unused NSException *e) {}
+        @try {
+            SEL s1 = sel_registerName("getUrl");
+            if ([obj respondsToSelector:s1]) {
+                id u = ((id (*)(id, SEL))objc_msgSend)(obj, s1);
+                DYFallbackCollect(u, out, depth + 1);
+            }
+        } @catch (__unused NSException *e) {}
     }
     if ([obj isKindOfClass:[NSArray class]]) {
         for (id x in (NSArray *)obj) DYFallbackCollect(x, out, depth + 1);
@@ -1784,24 +1891,30 @@ static void DYFallbackCollect(id obj, NSMutableSet<NSString *> *out, NSInteger d
 }
 
 static NSInteger DYFallbackURLScore(NSString *u) {
+    if (u.length == 0) return -10000;
     NSString *l = u.lowercaseString;
     NSInteger s = (NSInteger)u.length / 40;
     BOOL isVideo = DYFallbackIsVideoURL(u);
-    if (isVideo) s += 20;
-    if ([l containsString:@"download"]) s += 40;
-    if ([l containsString:@"download_addr"] || [l containsString:@"downloadaddr"]) s += 25;
-    if ([l containsString:@"play_addr"] || [l containsString:@"playaddr"]) s += 15;
-    if ([l containsString:@"nwm"] || [l containsString:@"no_watermark"] || [l containsString:@"nowm"] || [l containsString:@"without_watermark"]) s += 30;
-    if ([l containsString:@"watermark"] || [l containsString:@"&wm="]) s -= 20;
-    if ([l containsString:@"origin"] || [l containsString:@"original"] || [l containsString:@"video_original"]) s += 14;
-    if ([l containsString:@"url_size_large"] || [l containsString:@"size_large"]) s += 10;
-    if ([l containsString:@"1080"] || [l containsString:@"1440"] || [l containsString:@"2160"] || [l containsString:@"4k"]) s += 6;
-    if ([l containsString:@".mp4"] || [l containsString:@".mov"]) s += 8;
-    if ([l containsString:@".m3u8"]) s -= 500; // progressive mp4 preferred over hls for album save
-    if ([l containsString:@"webp"]) s -= 1;
-    if ([l containsString:@"thumb"] || [l containsString:@"avatar"] || [l containsString:@"icon"] ||
-        [l containsString:@"emoji"] || [l containsString:@"sticker"] || [l containsString:@"cover"]) s -= 24;
-    if ([l containsString:@".json"] || [l containsString:@".zip"] || [l containsString:@".ttf"]) s -= 50;
+    BOOL isImage = DYFallbackIsImageURL(u);
+    if (isVideo) s += 80;
+    if (isImage && !isVideo) s -= 40;
+    if ([l hasPrefix:@"file:"]) s += 60; // local player cache preferred
+    if ([l containsString:@"download"]) s += 50;
+    if ([l containsString:@"download_addr"] || [l containsString:@"downloadaddr"]) s += 35;
+    if ([l containsString:@"play_addr"] || [l containsString:@"playaddr"]) s += 25;
+    if ([l containsString:@"/aweme/v1/play"] && ![l containsString:@"playwm"]) s += 30;
+    if ([l containsString:@"playwm"] || [l containsString:@"watermark"] || [l containsString:@"&wm="]) s -= 25;
+    if ([l containsString:@"nwm"] || [l containsString:@"no_watermark"] || [l containsString:@"nowm"] || [l containsString:@"without_watermark"]) s += 35;
+    if ([l containsString:@"origin"] || [l containsString:@"original"]) s += 12;
+    if ([l containsString:@".mp4"] || [l containsString:@".mov"]) s += 20;
+    if ([l containsString:@".m3u8"]) s -= 500;
+    // cover / avatar hard penalty so we never "save photo" by accident on video feed
+    if ([l containsString:@"cover"] || [l containsString:@"avatar"] ||
+        [l containsString:@"thumb"] || [l containsString:@"byteimg"] ||
+        [l containsString:@"douyinpic"] || [l containsString:@"~tplv-"] ||
+        [l containsString:@"icon"] || [l containsString:@"head"]) s -= 80;
+    if ([l containsString:@"1080"] || [l containsString:@"720"] || [l containsString:@"4k"]) s += 6;
+    if ([l hasPrefix:@"https://"]) s += 2;
     return s;
 }
 
@@ -1814,25 +1927,48 @@ static BOOL DYFallbackDataLooksPlaylist(NSData *data) {
     return [t hasPrefix:@"#EXTM3U"] || [t containsString:@"#EXT-X-"];
 }
 
+static BOOL DYFallbackVerifyVideoAssetId(NSString *localId) {
+    if (localId.length == 0) return NO;
+    @try {
+        PHFetchResult<PHAsset *> *r = [PHAsset fetchAssetsWithLocalIdentifiers:@[localId] options:nil];
+        PHAsset *a = r.firstObject;
+        if (!a) {
+            // placeholder id is still a strong success signal if Photos reported success
+            return localId.length > 0;
+        }
+        return a.mediaType == PHAssetMediaTypeVideo;
+    } @catch (__unused NSException *e) {
+        return localId.length > 0;
+    }
+}
+
 static void DYFallbackPhotosWriteVideo(NSString *path, void (^done)(BOOL, NSError *)) {
+    __block NSString *localId = nil;
     [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
-        NSURL *u = [NSURL fileURLWithPath:path];
-        // Prefer creation request; also works better after re-export to progressive mp4
-        [PHAssetChangeRequest creationRequestForAssetFromVideoAtFileURL:u];
+        PHAssetChangeRequest *req =
+            [PHAssetChangeRequest creationRequestForAssetFromVideoAtFileURL:[NSURL fileURLWithPath:path]];
+        localId = req.placeholderForCreatedAsset.localIdentifier;
     } completionHandler:^(BOOL success, NSError *error) {
-        if (success) {
+        NSLog(@"[DouyinSave] photos write video success=%d id=%@ err=%@", (int)success, localId, error);
+        BOOL really = success && DYFallbackVerifyVideoAssetId(localId);
+        if (really) {
             dispatch_async(dispatch_get_main_queue(), ^{ if (done) done(YES, nil); });
             return;
         }
-        // Secondary path: resource API (sometimes accepts more containers)
+        __block NSString *localId2 = nil;
         [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
             PHAssetCreationRequest *req = [PHAssetCreationRequest creationRequestForAsset];
             [req addResourceWithType:PHAssetResourceTypeVideo
-                             fileURL:[NSURL fileURLWithPath:path]
-                             options:nil];
+                              fileURL:[NSURL fileURLWithPath:path]
+                              options:nil];
+            localId2 = req.placeholderForCreatedAsset.localIdentifier;
         } completionHandler:^(BOOL ok2, NSError *e2) {
+            NSLog(@"[DouyinSave] photos resource write ok=%d id=%@ err=%@", (int)ok2, localId2, e2);
+            BOOL really2 = ok2 && DYFallbackVerifyVideoAssetId(localId2);
             dispatch_async(dispatch_get_main_queue(), ^{
-                if (done) done(ok2, ok2 ? nil : (e2 ?: error));
+                if (done) done(really2, really2 ? nil : (e2 ?: error ?:
+                    [NSError errorWithDomain:@"DouyinSave" code:3302
+                                    userInfo:@{NSLocalizedDescriptionKey: @"Photos rejected video"}]));
             });
         }];
     }];
@@ -2028,37 +2164,112 @@ static BOOL DYFallbackDataLooksVideo(NSData *data, NSString *urlString, NSString
             }
         }
     }
-    // URL alone is a weak signal; only use when bytes/mime did not contradict
+    // With enough payload bytes, URL alone must NOT force video (covers mis-scored)
+    if (data.length >= 64) return NO;
+    // tiny/empty probe only: allow URL heuristic
     if (DYFallbackIsVideoURL(urlString)) return YES;
     return NO;
 }
 
+static BOOL DYFallbackDataLooksTextPayload(NSData *data) {
+    if (data.length < 8) return NO;
+    NSUInteger n = MIN((NSUInteger)data.length, (NSUInteger)64);
+    const unsigned char *b = data.bytes;
+    NSUInteger i = 0;
+    while (i < n && (b[i] == 0xEF || b[i] == 0xBB || b[i] == 0xBF ||
+                     b[i] == ' ' || b[i] == '\n' || b[i] == '\r' || b[i] == '\t')) i++;
+    if (i >= n) return NO;
+    unsigned char c = b[i];
+    if (c == '{' || c == '[' || c == '<') return YES;
+    NSString *head = [[NSString alloc] initWithBytes:b + i length:MIN((NSUInteger)24, n - i)
+                                            encoding:NSASCIIStringEncoding];
+    if (!head) return NO;
+    NSString *hl = head.lowercaseString;
+    return [hl hasPrefix:@"error"] || [hl hasPrefix:@"forbidden"] ||
+           [hl hasPrefix:@"denied"] || [hl hasPrefix:@"not found"];
+}
+
+static BOOL DYFallbackFileLooksPlayableVideo(NSString *path) {
+    if (path.length == 0) return NO;
+    unsigned long long sz = [[[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil] fileSize];
+    if (sz < 32 * 1024) return NO;
+    NSData *probe = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
+    if (probe.length >= 8 && DYFallbackDataLooksTextPayload(probe)) return NO;
+    BOOL magicOK = (probe.length >= 32 && DYFallbackDataLooksVideo(probe, path, @"video/mp4"));
+    @try {
+        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+        Float64 sec = CMTimeGetSeconds(asset.duration);
+        if (sec > 0.2 && sec < 36000) return YES;
+        if (magicOK && sz > 80 * 1024) return YES;
+    } @catch (__unused NSException *e) {}
+    return magicOK && sz > 80 * 1024;
+}
+
+static void DYFallbackDownloadOneVideo(NSString *urlString, void (^done)(BOOL ok, NSString *msg));
+static void DYFallbackDownloadVideosTry(NSArray<NSString *> *urls, NSUInteger idx);
+static void DYFallbackDownloadAndSaveImage(NSString *urlString);
+
 static void DYFallbackDownloadAndSave(NSString *urlString) {
     if (!urlString.length) return;
-    BOOL wantVideo = DYFallbackIsVideoURL(urlString);
-    NSLog(@"[DouyinSave] fallback GET %@ video=%d", urlString, (int)wantVideo);
-    DYFallbackToast(wantVideo ? @"\u6b63\u5728\u4e0b\u8f7d\u89c6\u9891\u2026" : @"\u6b63\u5728\u4e0b\u8f7d\u56fe\u7247\u2026");
+    DYFallbackDownloadVideosTry(@[urlString], 0);
+}
 
-    // local file path / file URL - probe image first to avoid HEIC->video 3302
+static void DYFallbackDownloadVideosTry(NSArray<NSString *> *urls, NSUInteger idx) {
+    if (!urls.count) {
+        DYFallbackToast(@"未找到可下载的视频地址");
+        return;
+    }
+    if (idx >= urls.count) {
+        DYFallbackToast([NSString stringWithFormat:@"视频保存失败（已尝试 %lu 个地址）",
+                          (unsigned long)urls.count]);
+        return;
+    }
+    NSString *urlString = urls[idx];
+    NSLog(@"[DouyinSave] try video[%lu/%lu] %@",
+          (unsigned long)(idx + 1), (unsigned long)urls.count,
+          urlString.length > 160 ? [[urlString substringToIndex:160] stringByAppendingString:@"..."] : urlString);
+    if (idx == 0) {
+        DYFallbackToast(@"正在下载视频…");
+    } else {
+        DYFallbackToast([NSString stringWithFormat:@"换源重试 %lu/%lu…",
+                          (unsigned long)(idx + 1), (unsigned long)urls.count]);
+    }
+    DYFallbackDownloadOneVideo(urlString, ^(BOOL ok, NSString *msg) {
+        if (ok) {
+            DYFallbackToast(msg.length ? msg : @"✅ 视频已保存到相册");
+            return;
+        }
+        NSLog(@"[DouyinSave] video try fail[%lu]: %@", (unsigned long)idx, msg ?: @"?");
+        DYFallbackDownloadVideosTry(urls, idx + 1);
+    });
+}
+
+static void DYFallbackDownloadOneVideo(NSString *urlString, void (^done)(BOOL ok, NSString *msg)) {
+    if (!urlString.length) {
+        if (done) done(NO, @"empty url");
+        return;
+    }
+    BOOL wantVideo = DYFallbackIsVideoURL(urlString) || [urlString hasPrefix:@"file:"] ||
+                     [urlString hasPrefix:@"/"];
+    NSLog(@"[DouyinSave] fallback GET %@ video=%d", urlString, (int)wantVideo);
+
     void (^saveLocalPath)(NSString *) = ^(NSString *path) {
         if (path.length == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:path]) {
-            DYFallbackToast(@"\u4fdd\u5b58\u5931\u8d25: file missing");
+            if (done) done(NO, @"file missing");
             return;
         }
         NSData *probe = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
-        NSString *mime = @"";
-        if (probe.length && !DYFallbackDataLooksVideo(probe, urlString, mime)) {
-            DYFallbackSaveData(probe, ^(BOOL ok, NSError *e) {
-                DYFallbackToast(ok ? @"\u2705 \u5df2\u4fdd\u5b58\u5230\u76f8\u518c" :
-                                 [NSString stringWithFormat:@"\u4fdd\u5b58\u5931\u8d25: %@",
-                                  e.localizedDescription ?: @"?"]);
-            });
+        if (probe.length && DYFallbackDataLooksTextPayload(probe)) {
+            if (done) done(NO, @"local file is text");
+            return;
+        }
+        if (!DYFallbackFileLooksPlayableVideo(path)) {
+            if (done) done(NO, @"local file not video");
             return;
         }
         DYFallbackSaveVideoFile(path, ^(BOOL ok, NSError *e) {
-            DYFallbackToast(ok ? @"\u2705 \u89c6\u9891\u5df2\u4fdd\u5b58\u5230\u76f8\u518c" :
-                             [NSString stringWithFormat:@"\u4fdd\u5b58\u5931\u8d25: %@",
-                              e.localizedDescription ?: @"?"]);
+            if (done) done(ok, ok ? @"✅ 视频已保存到相册" :
+                           (e.localizedDescription ?: @"photos write fail"));
         });
     };
 
@@ -2070,140 +2281,143 @@ static void DYFallbackDownloadAndSave(NSString *urlString) {
         saveLocalPath(urlString);
         return;
     }
-
-    // HLS playlists cannot be written to Photos as-is
     if ([urlString.lowercaseString containsString:@".m3u8"]) {
-        DYFallbackToast(@"\u6682\u4e0d\u652f\u6301 HLS(m3u8) \u89c6\u9891");
+        if (done) done(NO, @"m3u8 unsupported");
         return;
     }
 
     NSURL *url = [NSURL URLWithString:urlString];
     if (!url) {
-        DYFallbackToast(@"URL \u65e0\u6548");
+        if (done) done(NO, @"bad url");
         return;
     }
 
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
                                                        cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
-                                                   timeoutInterval:wantVideo ? 90 : 30];
-    [req setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+                                                   timeoutInterval:120];
+    [req setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Aweme 38.7.0"
 forHTTPHeaderField:@"User-Agent"];
     [req setValue:@"https://www.douyin.com/" forHTTPHeaderField:@"Referer"];
-    [req setValue:wantVideo ? @"*/*" : @"image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
-forHTTPHeaderField:@"Accept"];
+    [req setValue:@"https://www.douyin.com" forHTTPHeaderField:@"Origin"];
+    [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
+
+    NSMutableArray *allCookies = [NSMutableArray array];
+    @try {
+        NSArray *c1 = [[NSHTTPCookieStorage sharedHTTPCookieStorage] cookiesForURL:url];
+        if (c1.count) [allCookies addObjectsFromArray:c1];
+        NSArray *c2 = [[NSHTTPCookieStorage sharedHTTPCookieStorage]
+                       cookiesForURL:[NSURL URLWithString:@"https://www.douyin.com/"]];
+        for (NSHTTPCookie *c in c2) {
+            BOOL exists = NO;
+            for (NSHTTPCookie *e in allCookies) {
+                if ([e.name isEqualToString:c.name] && [e.domain isEqualToString:c.domain]) {
+                    exists = YES; break;
+                }
+            }
+            if (!exists) [allCookies addObject:c];
+        }
+    } @catch (__unused NSException *e) {}
+    if (allCookies.count) {
+        NSDictionary *hdrs = [NSHTTPCookie requestHeaderFieldsWithCookies:allCookies];
+        NSString *cookie = hdrs[@"Cookie"];
+        if (cookie.length) [req setValue:cookie forHTTPHeaderField:@"Cookie"];
+    }
 
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
     cfg.HTTPShouldSetCookies = YES;
     cfg.HTTPCookieAcceptPolicy = NSHTTPCookieAcceptPolicyAlways;
     NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
 
-    if (wantVideo) {
-        [[session downloadTaskWithRequest:req completionHandler:^(NSURL *location, NSURLResponse *resp, NSError *err) {
-            NSHTTPURLResponse *http = (NSHTTPURLResponse *)resp;
-            NSString *mime = http.MIMEType ?: @"";
-            NSLog(@"[DouyinSave] fallback video resp %ld mime=%@ err=%@ loc=%@",
-                  (long)http.statusCode, mime, err, location.path);
-            if (err || !location) {
-                DYFallbackToast([NSString stringWithFormat:@"\u89c6\u9891\u4e0b\u8f7d\u5931\u8d25: %@",
-                                  err.localizedDescription ?: @"empty"]);
-                return;
-            }
-            NSString *ext = location.pathExtension.lowercaseString;
-            if (ext.length == 0 ||
-                !([ext isEqualToString:@"mp4"] || [ext isEqualToString:@"mov"] ||
-                  [ext isEqualToString:@"m4v"] || [ext isEqualToString:@"m3u8"])) {
-                ext = @"mp4";
-            }
-            if ([ext isEqualToString:@"m3u8"]) {
-                DYFallbackToast(@"\u6682\u4e0d\u652f\u6301 HLS(m3u8) \u89c6\u9891");
-                return;
-            }
-            // Probe first: HEIC/AVIF mislabeled as video URL must go image path
-            NSData *probe = [NSData dataWithContentsOfURL:location options:NSDataReadingMappedIfSafe error:nil];
-            if (probe.length >= 7 && DYFallbackDataLooksPlaylist(probe)) {
-                DYFallbackToast(@"\u6682\u4e0d\u652f\u6301 HLS(m3u8) \u89c6\u9891");
-                return;
-            }
-            if (probe.length >= 64 && !DYFallbackDataLooksVideo(probe, urlString, mime)) {
-                NSLog(@"[DouyinSave] video URL was actually image mime=%@ bytes=%lu",
-                      mime, (unsigned long)probe.length);
-                DYFallbackSaveData(probe, ^(BOOL ok, NSError *e) {
-                    DYFallbackToast(ok ? @"\u2705 \u5df2\u4fdd\u5b58\u5230\u76f8\u518c" :
-                                     [NSString stringWithFormat:@"\u4fdd\u5b58\u5931\u8d25: %@",
-                                      e.localizedDescription ?: @"?"]);
-                });
-                return;
-            }
-            NSLog(@"[DouyinSave] video download probe bytes=%lu mime=%@ head=%@",
-                  (unsigned long)probe.length, mime,
-                  probe.length >= 12 ? [[NSString alloc] initWithBytes:probe.bytes length:12 encoding:NSASCIIStringEncoding] : @"?");
-            NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
-                             [NSString stringWithFormat:@"dy_vid_%@.%@", NSUUID.UUID.UUIDString, ext]];
-            NSError *moveErr = nil;
-            [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
-            if (![[NSFileManager defaultManager] moveItemAtPath:location.path toPath:tmp error:&moveErr]) {
-                if (![[NSFileManager defaultManager] copyItemAtPath:location.path toPath:tmp error:&moveErr]) {
-                    DYFallbackToast([NSString stringWithFormat:@"\u5199\u4e34\u65f6\u6587\u4ef6\u5931\u8d25: %@",
-                                      moveErr.localizedDescription ?: @"?"]);
-                    return;
-                }
-            }
-            unsigned long long sz = [[[NSFileManager defaultManager] attributesOfItemAtPath:tmp error:nil] fileSize];
-            if (sz < 1024) {
-                [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
-                DYFallbackToast(@"\u89c6\u9891\u6570\u636e\u8fc7\u5c0f");
-                return;
-            }
-            DYFallbackSaveVideoFile(tmp, ^(BOOL ok, NSError *e) {
-                [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
-                DYFallbackToast(ok ? @"\u2705 \u89c6\u9891\u5df2\u4fdd\u5b58\u5230\u76f8\u518c" :
-                                 [NSString stringWithFormat:@"\u4fdd\u5b58\u5931\u8d25: %@",
-                                  e.localizedDescription ?: @"?"]);
-            });
-        }] resume];
-        return;
-    }
-
-    [[session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+    [[session downloadTaskWithRequest:req completionHandler:^(NSURL *location, NSURLResponse *resp, NSError *err) {
         NSHTTPURLResponse *http = (NSHTTPURLResponse *)resp;
+        NSInteger code = [http isKindOfClass:[NSHTTPURLResponse class]] ? http.statusCode : 0;
         NSString *mime = http.MIMEType ?: @"";
-        NSLog(@"[DouyinSave] fallback resp %ld bytes=%lu mime=%@ err=%@",
-              (long)http.statusCode, (unsigned long)data.length, mime, err);
-        if (err || data.length < 64) {
-            DYFallbackToast([NSString stringWithFormat:@"\u4e0b\u8f7d\u5931\u8d25: %@",
-                              err.localizedDescription ?: @"empty"]);
+        NSLog(@"[DouyinSave] download resp %ld mime=%@ err=%@ loc=%@",
+              (long)code, mime, err, location.path);
+        if (err || !location) {
+            if (done) done(NO, err.localizedDescription ?: @"empty");
             return;
         }
-        // Always try image path unless content really looks like video.
-        // Fixes HEIC ftyp false-positive -> PHPhotosErrorDomain 3302.
-        if (DYFallbackDataLooksVideo(data, urlString, mime)) {
-            NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
-                             [NSString stringWithFormat:@"dy_vid_%@.mp4", NSUUID.UUID.UUIDString]];
-            if ([data writeToFile:tmp atomically:YES]) {
-                DYFallbackSaveVideoFile(tmp, ^(BOOL ok, NSError *e) {
-                    [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
-                    if (ok) {
-                        DYFallbackToast(@"\u2705 \u89c6\u9891\u5df2\u4fdd\u5b58\u5230\u76f8\u518c");
-                        return;
-                    }
-                    // last resort: maybe it was still an image container
-                    DYFallbackSaveData(data, ^(BOOL ok2, NSError *e2) {
-                        DYFallbackToast(ok2 ? @"\u2705 \u5df2\u4fdd\u5b58\u5230\u76f8\u518c" :
-                                         [NSString stringWithFormat:@"\u4fdd\u5b58\u5931\u8d25: %@",
-                                          (e2.localizedDescription ?: e.localizedDescription) ?: @"?"]);
-                    });
-                });
+        if (code >= 400) {
+            if (done) done(NO, [NSString stringWithFormat:@"HTTP %ld", (long)code]);
+            return;
+        }
+        NSString *ml = mime.lowercaseString;
+        if ([ml hasPrefix:@"text/"] || [ml containsString:@"json"] || [ml containsString:@"html"]) {
+            if (done) done(NO, [NSString stringWithFormat:@"bad mime %@", mime]);
+            return;
+        }
+
+        NSData *probe = [NSData dataWithContentsOfURL:location options:NSDataReadingMappedIfSafe error:nil];
+        unsigned long long sz = (unsigned long long)probe.length;
+        @try {
+            NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:location.path error:nil];
+            if (attr.fileSize > sz) sz = attr.fileSize;
+        } @catch (__unused NSException *e) {}
+
+        if (probe.length >= 8 && (DYFallbackDataLooksPlaylist(probe) || DYFallbackDataLooksTextPayload(probe))) {
+            if (done) done(NO, @"got playlist/text not mp4");
+            return;
+        }
+
+        NSString *ext = @"mp4";
+        NSString *pe = location.pathExtension.lowercaseString;
+        if ([pe isEqualToString:@"mov"] || [pe isEqualToString:@"m4v"] || [pe isEqualToString:@"mp4"]) ext = pe;
+        else if ([ml containsString:@"quicktime"]) ext = @"mov";
+
+        NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                         [NSString stringWithFormat:@"dy_vid_%@.%@", NSUUID.UUID.UUIDString, ext]];
+        [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
+        NSError *cpErr = nil;
+        if (![[NSFileManager defaultManager] copyItemAtURL:location toURL:[NSURL fileURLWithPath:tmp] error:&cpErr]) {
+            if (![[NSFileManager defaultManager] moveItemAtURL:location toURL:[NSURL fileURLWithPath:tmp] error:&cpErr]) {
+                if (done) done(NO, cpErr.localizedDescription ?: @"copy fail");
                 return;
             }
         }
-        DYFallbackSaveData(data, ^(BOOL ok, NSError *e) {
-            DYFallbackToast(ok ? @"\u2705 \u5df2\u4fdd\u5b58\u5230\u76f8\u518c" :
-                             [NSString stringWithFormat:@"\u4fdd\u5b58\u5931\u8d25: %@",
-                              e.localizedDescription ?: @"?"]);
+
+        if (!DYFallbackFileLooksPlayableVideo(tmp)) {
+            [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
+            NSLog(@"[DouyinSave] not playable video mime=%@ bytes=%llu", mime, sz);
+            if (done) done(NO, @"content is not playable video");
+            return;
+        }
+
+        NSLog(@"[DouyinSave] video file ready bytes=%llu", sz);
+        DYFallbackSaveVideoFile(tmp, ^(BOOL ok, NSError *e) {
+            [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
+            if (done) done(ok, ok ? @"✅ 视频已保存到相册" :
+                           (e.localizedDescription ?: @"photos failed"));
         });
     }] resume];
 }
 
+static void DYFallbackDownloadAndSaveImage(NSString *urlString) {
+    if (!urlString.length) return;
+    DYFallbackToast(@"正在下载图片…");
+    NSURL *url = [NSURL URLWithString:urlString];
+    if (!url) { DYFallbackToast(@"URL 无效"); return; }
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
+                                                       cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                                   timeoutInterval:30];
+    [req setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Aweme 38.7.0"
+forHTTPHeaderField:@"User-Agent"];
+    [req setValue:@"https://www.douyin.com/" forHTTPHeaderField:@"Referer"];
+    NSURLSession *session = [NSURLSession sharedSession];
+    [[session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        NSHTTPURLResponse *http = (NSHTTPURLResponse *)resp;
+        NSInteger code = [http isKindOfClass:[NSHTTPURLResponse class]] ? http.statusCode : 0;
+        if (err || data.length < 32 || code >= 400) {
+            DYFallbackToast([NSString stringWithFormat:@"图片下载失败: %@",
+                              err.localizedDescription ?: [NSString stringWithFormat:@"HTTP %ld", (long)code]]);
+            return;
+        }
+        DYFallbackSaveData(data, ^(BOOL ok, NSError *e) {
+            DYFallbackToast(ok ? @"✅ 图片已保存到相册" :
+                             [NSString stringWithFormat:@"保存失败: %@", e.localizedDescription ?: @"?"]);
+        });
+    }] resume];
+}
 
 static void DYFallbackCollectFromView(UIView *root, NSMutableSet<NSString *> *set) {
     UIView *v = root;
@@ -2317,6 +2531,126 @@ static void DYFallbackCollectFromResponder(UIResponder *r, NSMutableSet<NSString
     }
 }
 
+static void DYFallbackCollectPlayersInView(UIView *root, NSMutableSet<NSString *> *set) {
+    if (!root) return;
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
+    NSInteger steps = 0;
+    while (stack.count && steps < 500) {
+        steps++;
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        // AVPlayerLayer
+        @try {
+            CALayer *layer = v.layer;
+            if ([layer isKindOfClass:[AVPlayerLayer class]]) {
+                AVPlayer *pl = [(AVPlayerLayer *)layer player];
+                DYFallbackCollect(pl, set, 0);
+            }
+            // some custom layers keep player on view
+            DYFallbackCollect([v valueForKey:@"player"], set, 0);
+            DYFallbackCollect([v valueForKey:@"videoPlayer"], set, 0);
+            DYFallbackCollect([v valueForKey:@"videoEngine"], set, 0);
+            DYFallbackCollect([v valueForKey:@"ttVideoEngine"], set, 0);
+            DYFallbackCollect([v valueForKey:@"awemeModel"], set, 0);
+            DYFallbackCollect([v valueForKey:@"model"], set, 0);
+            DYFallbackCollect([v valueForKey:@"context"], set, 0);
+        } @catch (__unused NSException *e) {}
+        for (UIView *sub in v.subviews) [stack addObject:sub];
+    }
+}
+
+static UIViewController *DYTopViewController(void) {
+    UIWindow *win = DYFallbackKeyWindow();
+    if (!win) return nil;
+    UIViewController *root = win.rootViewController;
+    while (root.presentedViewController) root = root.presentedViewController;
+    if ([root isKindOfClass:[UINavigationController class]]) {
+        root = ((UINavigationController *)root).visibleViewController ?: root;
+    }
+    if ([root isKindOfClass:[UITabBarController class]]) {
+        root = ((UITabBarController *)root).selectedViewController ?: root;
+        if ([root isKindOfClass:[UINavigationController class]]) {
+            root = ((UINavigationController *)root).visibleViewController ?: root;
+        }
+    }
+    // drill into child VCs (feed containers)
+    NSInteger hops = 0;
+    while (root.childViewControllers.count && hops++ < 6) {
+        UIViewController *best = nil;
+        for (UIViewController *c in root.childViewControllers) {
+            if (c.isViewLoaded && c.view.window) { best = c; break; }
+        }
+        if (!best) best = root.childViewControllers.lastObject;
+        if (!best || best == root) break;
+        root = best;
+        if ([root isKindOfClass:[UINavigationController class]]) {
+            root = ((UINavigationController *)root).visibleViewController ?: root;
+        }
+    }
+    return root;
+}
+
+static void DYFallbackCollectFromScrollViews(UIView *root, NSMutableSet<NSString *> *set) {
+    if (!root || !set) return;
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
+    NSInteger steps = 0;
+    while (stack.count && steps < 400) {
+        steps++;
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        if ([v isKindOfClass:[UITableView class]]) {
+            UITableView *tv = (UITableView *)v;
+            for (UITableViewCell *cell in tv.visibleCells) {
+                for (NSString *k in @[@"awemeModel", @"aweme", @"model", @"viewModel",
+                                      @"currentAweme", @"playingAweme", @"context",
+                                      @"video", @"videoModel", @"pageContext"]) {
+                    @try { DYFallbackCollect([cell valueForKey:k], set, 0); } @catch (__unused NSException *e) {}
+                }
+                DYFallbackCollectFromView(cell, set);
+                DYFallbackCollectPlayersInView(cell, set);
+            }
+        } else if ([v isKindOfClass:[UICollectionView class]]) {
+            UICollectionView *cv = (UICollectionView *)v;
+            for (UICollectionViewCell *cell in cv.visibleCells) {
+                for (NSString *k in @[@"awemeModel", @"aweme", @"model", @"viewModel",
+                                      @"currentAweme", @"playingAweme", @"context",
+                                      @"video", @"videoModel", @"pageContext"]) {
+                    @try { DYFallbackCollect([cell valueForKey:k], set, 0); } @catch (__unused NSException *e) {}
+                }
+                DYFallbackCollectFromView(cell, set);
+                DYFallbackCollectPlayersInView(cell, set);
+            }
+        }
+        for (UIView *sub in v.subviews) [stack addObject:sub];
+    }
+}
+
+static void DYFallbackCollectClassNamedModels(id obj, NSMutableSet<NSString *> *set, NSInteger depth) {
+    if (!obj || depth > 4 || set.count > 120) return;
+    const char *cn = object_getClassName(obj);
+    if (!cn) return;
+    if (strstr(cn, "AwemeModel") || strstr(cn, "AWEVideoModel") ||
+        strstr(cn, "AWEURLModel") || strstr(cn, "VideoModel")) {
+        DYFallbackCollect(obj, set, 0);
+        for (NSString *k in @[@"video", @"videoModel", @"downloadAddr", @"downloadAddrModel",
+                              @"playAddr", @"playAddrModel", @"playAddrH264Model",
+                              @"playAddrBytevc1Model", @"originDownloadAddr",
+                              @"urlList", @"url_list", @"originURLList"]) {
+            @try {
+                id v = [obj valueForKey:k];
+                if (v) DYFallbackCollect(v, set, depth + 1);
+            } @catch (__unused NSException *e) {}
+        }
+    }
+    if ([obj isKindOfClass:[NSArray class]] && depth < 3) {
+        NSInteger n = 0;
+        for (id x in (NSArray *)obj) {
+            if (++n > 30) break;
+            DYFallbackCollectClassNamedModels(x, set, depth + 1);
+        }
+    }
+}
+
 static void DYFallbackForceSaveFromView(UIView *view) {
     if (!view) {
         DYFallbackToast(@"\u672a\u627e\u5230\u53ef\u4fdd\u5b58\u7684\u5a92\u4f53");
@@ -2324,11 +2658,48 @@ static void DYFallbackForceSaveFromView(UIView *view) {
     }
 
     NSMutableSet<NSString *> *set = [NSMutableSet set];
+    UIWindow *win = view.window ?: DYFallbackKeyWindow();
+
+    // 1) players / models on view tree (video first) — prefer window, not cover UIImageView
+    if (win) {
+        DYFallbackCollectPlayersInView(win, set);
+        DYFallbackCollectFromScrollViews(win, set);
+    } else {
+        DYFallbackCollectPlayersInView(view, set);
+        DYFallbackCollectFromScrollViews(view, set);
+    }
+
     DYFallbackCollectFromView(view, set);
     DYFallbackCollectFromResponder(view, set);
 
-    // also probe best image view under current window + top VC
-    UIWindow *win = view.window ?: DYFallbackKeyWindow();
+    UIViewController *top = DYTopViewController();
+    if (top) {
+        DYFallbackCollectFromResponder(top, set);
+        DYFallbackCollectClassNamedModels(top, set, 0);
+        if (top.isViewLoaded) {
+            DYFallbackCollectPlayersInView(top.view, set);
+            DYFallbackCollectFromScrollViews(top.view, set);
+        }
+        for (NSString *k in @[@"awemeModel", @"aweme", @"currentAweme", @"playingAweme",
+                              @"model", @"viewModel", @"context", @"pageContext",
+                              @"interactionContext", @"videoController", @"player",
+                              @"currentModel", @"data", @"item"]) {
+            @try { DYFallbackCollect([top valueForKey:k], set, 0); } @catch (__unused NSException *e) {}
+        }
+        for (UIViewController *c in top.childViewControllers) {
+            DYFallbackCollectFromResponder(c, set);
+            DYFallbackCollectClassNamedModels(c, set, 0);
+            for (NSString *k in @[@"awemeModel", @"aweme", @"currentAweme", @"playingAweme",
+                                  @"model", @"viewModel", @"context"]) {
+                @try { DYFallbackCollect([c valueForKey:k], set, 0); } @catch (__unused NSException *e) {}
+            }
+            if (c.isViewLoaded) {
+                DYFallbackCollectPlayersInView(c.view, set);
+                DYFallbackCollectFromScrollViews(c.view, set);
+            }
+        }
+    }
+
     if (win) {
         CGPoint prefer = CGPointMake(CGRectGetMidX(win.bounds), CGRectGetMidY(win.bounds) - 40);
         UIImageView *best = DYFallbackPickBestImageView(win, prefer);
@@ -2336,58 +2707,106 @@ static void DYFallbackForceSaveFromView(UIView *view) {
             DYFallbackCollectFromView(best, set);
             DYFallbackCollectFromResponder(best, set);
         }
-        UIViewController *root = win.rootViewController;
-        while (root.presentedViewController) root = root.presentedViewController;
-        if ([root isKindOfClass:[UINavigationController class]]) {
-            root = ((UINavigationController *)root).visibleViewController ?: root;
-        }
-        if ([root isKindOfClass:[UITabBarController class]]) {
-            root = ((UITabBarController *)root).selectedViewController ?: root;
-        }
-        if (root) DYFallbackCollectFromResponder(root, set);
     }
 
-    if (set.count) {
-        NSArray *sorted = [set.allObjects sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
-            NSInteger sa = DYFallbackURLScore(a), sb = DYFallbackURLScore(b);
-            if (sa > sb) return NSOrderedAscending;
-            if (sa < sb) return NSOrderedDescending;
-            return NSOrderedSame;
-        }];
-        NSString *pick = sorted.firstObject;
-        // Prefer video only when it is the top URL or within ~8 score of top image.
-        // Avoid blindly taking a weak video URL over a clear image note.
-        NSInteger topScore = DYFallbackURLScore(pick);
+    NSLog(@"[DouyinSave] collected %lu urls", (unsigned long)set.count);
+    for (NSString *u in set) {
+        NSLog(@"[DouyinSave]  candidate score=%ld video=%d %@",
+              (long)DYFallbackURLScore(u), (int)DYFallbackIsVideoURL(u),
+              u.length > 180 ? [[u substringToIndex:180] stringByAppendingString:@"..."] : u);
+    }
+
+    // VIDEO FIRST: if any non-m3u8 video URL exists, only consider videos
+    NSMutableArray<NSString *> *videos = [NSMutableArray array];
+    NSMutableArray<NSString *> *images = [NSMutableArray array];
+    for (NSString *u in set) {
+        if (DYFallbackIsVideoURL(u)) {
+            if (![u.lowercaseString containsString:@".m3u8"]) [videos addObject:u];
+        } else if (DYFallbackIsImageURL(u)) {
+            [images addObject:u];
+        }
+    }
+
+    NSComparator cmp = ^NSComparisonResult(NSString *a, NSString *b) {
+        NSInteger sa = DYFallbackURLScore(a), sb = DYFallbackURLScore(b);
+        if (sa > sb) return NSOrderedAscending;
+        if (sa < sb) return NSOrderedDescending;
+        return NSOrderedSame;
+    };
+
+    if (videos.count) {
+        NSArray *sorted = [videos sortedArrayUsingComparator:cmp];
+        NSMutableArray<NSString *> *tryList = [NSMutableArray array];
         for (NSString *u in sorted) {
-            if (!DYFallbackIsVideoURL(u)) continue;
-            NSInteger vs = DYFallbackURLScore(u);
-            if (vs + 8 >= topScore) {
-                pick = u;
-                break;
+            if (tryList.count >= 6) break;
+            BOOL dup = NO;
+            for (NSString *e in tryList) {
+                if ([e isEqualToString:u]) { dup = YES; break; }
+            }
+            if (!dup) [tryList addObject:u];
+        }
+        NSLog(@"[DouyinSave] VIDEO pick top=%@ (try %lu)",
+              tryList.firstObject, (unsigned long)tryList.count);
+        DYFallbackDownloadVideosTry(tryList, 0);
+        return;
+    }
+
+    // No video URL: do NOT silently save cover as "success"
+    // Last attempt: local mp4 under tmp/cache recently written
+    @autoreleasepool {
+        NSMutableArray<NSString *> *roots = [NSMutableArray array];
+        if (NSTemporaryDirectory().length) [roots addObject:NSTemporaryDirectory()];
+        NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+        if (caches.length) [roots addObject:caches];
+        NSString *lib = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject;
+        if (lib.length) [roots addObject:lib];
+        NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        if (docs.length) [roots addObject:docs];
+        NSString *bestFile = nil;
+        unsigned long long bestScore = 0;
+        NSFileManager *fm = [NSFileManager defaultManager];
+        for (NSString *root in roots) {
+            if (root.length == 0) continue;
+            NSDirectoryEnumerator *en = [fm enumeratorAtPath:root];
+            NSInteger seen = 0;
+            for (NSString *rel in en) {
+                if (++seen > 2500) break;
+                NSString *low = rel.lowercaseString;
+                if (!([low hasSuffix:@".mp4"] || [low hasSuffix:@".mov"] || [low hasSuffix:@".m4v"])) continue;
+                if ([low containsString:@"snap"] || [low containsString:@"thumb"] ||
+                    [low containsString:@"cover"] || [low containsString:@"gif"]) continue;
+                NSString *full = [root stringByAppendingPathComponent:rel];
+                NSDictionary *attr = [fm attributesOfItemAtPath:full error:nil];
+                unsigned long long sz = attr.fileSize;
+                if (sz < 300 * 1024) continue;
+                NSDate *mod = attr.fileModificationDate;
+                NSTimeInterval age = mod ? [[NSDate date] timeIntervalSinceDate:mod] : 1e12;
+                if (age > 2 * 3600) continue;
+                unsigned long long sc = sz + (unsigned long long)MAX(0.0, (2 * 3600 - age)) * 1000ULL;
+                if (sc > bestScore && DYFallbackFileLooksPlayableVideo(full)) {
+                    bestScore = sc;
+                    bestFile = full;
+                }
             }
         }
-        NSLog(@"[DouyinSave] fallback picked url score=%ld video=%d %@",
-              (long)DYFallbackURLScore(pick), (int)DYFallbackIsVideoURL(pick), pick);
-        DYFallbackDownloadAndSave(pick);
+        if (bestFile.length) {
+            NSLog(@"[DouyinSave] local cache video %@", bestFile);
+            DYFallbackDownloadVideosTry(@[[NSURL fileURLWithPath:bestFile].absoluteString], 0);
+            return;
+        }
+    }
+
+    if (images.count) {
+        // Explicit: only image notes; toast makes clear it's image
+        NSArray *sorted = [images sortedArrayUsingComparator:cmp];
+        NSString *pick = sorted.firstObject;
+        NSLog(@"[DouyinSave] IMAGE-only pick %@", pick);
+        DYFallbackToast(@"\u672a\u627e\u5230\u89c6\u9891\u5730\u5740\uff0c\u6539\u4e3a\u4fdd\u5b58\u5c01\u9762\u56fe\u2026");
+        DYFallbackDownloadAndSaveImage(pick);
         return;
     }
 
-UIImage *img = DYFallbackBestImageNear(view);
-    if (!img && win) {
-        CGPoint prefer = CGPointMake(CGRectGetMidX(win.bounds), CGRectGetMidY(win.bounds) - 40);
-        UIImageView *best = DYFallbackPickBestImageView(win, prefer);
-        img = best.image;
-        view = best ?: view;
-    }
-    if (img) {
-        DYFallbackSaveImage(img, ^(BOOL ok, NSError *e) {
-            DYFallbackToast(ok ? @"\u2705 \u5df2\u4ece\u5f53\u524d\u753b\u9762\u4fdd\u5b58" :
-                             [NSString stringWithFormat:@"\u4fdd\u5b58\u5931\u8d25: %@",
-                              e.localizedDescription ?: @"?"]);
-        });
-        return;
-    }
-
+    // last resort screenshot marked as non-original
     if (view.bounds.size.width > 48 && view.bounds.size.height > 48) {
         if (@available(iOS 10.0, *)) {
             UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:view.bounds.size];
@@ -2396,7 +2815,7 @@ UIImage *img = DYFallbackBestImageNear(view);
             }];
             if (snap) {
                 DYFallbackSaveImage(snap, ^(BOOL ok, NSError *e) {
-                    DYFallbackToast(ok ? @"\u2705 \u5df2\u622a\u53d6\u89c6\u56fe\u4fdd\u5b58(\u975e\u539f\u56fe)" :
+                    DYFallbackToast(ok ? @"\u2705 \u4ec5\u622a\u56fe\u4fdd\u5b58(\u975e\u89c6\u9891\u539f\u6587\u4ef6)" :
                                      [NSString stringWithFormat:@"\u4fdd\u5b58\u5931\u8d25: %@",
                                       e.localizedDescription ?: @"?"]);
                 });
@@ -2404,8 +2823,9 @@ UIImage *img = DYFallbackBestImageNear(view);
             }
         }
     }
-    DYFallbackToast(@"\u672a\u627e\u5230\u53ef\u4fdd\u5b58\u7684\u5a92\u4f53");
+    DYFallbackToast(@"\u672a\u627e\u5230\u53ef\u4fdd\u5b58\u7684\u89c6\u9891\u5730\u5740");
 }
+
 
 @interface DYFallbackFloatUI : NSObject
 + (void)install;
@@ -2480,16 +2900,8 @@ UIImage *img = DYFallbackBestImageNear(view);
 + (void)tap:(UIButton *)sender {
     UIWindow *win = sender.window ?: DYFallbackKeyWindow();
     if (!win) return;
-    CGPoint prefer = CGPointMake(CGRectGetMidX(win.bounds), CGRectGetMidY(win.bounds) - 50);
-    UIImageView *best = DYFallbackPickBestImageView(win, prefer);
-    if (best) {
-        DYFallbackForceSaveFromView(best);
-        return;
-    }
-    UIView *hit = [win hitTest:prefer withEvent:nil] ?: win;
-    UIView *img = hit;
-    while (img && ![img isKindOfClass:[UIImageView class]]) img = img.superview;
-    DYFallbackForceSaveFromView(img ?: hit);
+    // Prefer full window graph so feed video models are collected (not cover UIImageView only)
+    DYFallbackForceSaveFromView(win);
 }
 
 + (void)twoFinger:(UILongPressGestureRecognizer *)g {
@@ -2530,7 +2942,7 @@ static void DYDeferredHeavyInstall(void) {
                 DYScanToastFilters();
                 DYScanI18nFilters();
                 DYScanAuthorityPatches();
-                LOG(@"v1 deferred heavy install done");
+                LOG(@"v1.2 deferred heavy install done");
             }
         });
     });
@@ -2542,8 +2954,8 @@ __attribute__((constructor))
 static void DYInit(void) {
     @autoreleasepool {
         if (!DYIsTarget()) return;
-        LOG(@"v1 load pid=%d", getpid());
-        NSLog(@"[DouyinSave] v1 load pid=%d", getpid());
+        LOG(@"v1.2 load pid=%d", getpid());
+        NSLog(@"[DouyinSave] v1.2 load pid=%d", getpid());
 
         // known-class only; no objc_copyClassList / no NSBundle / no session wrap
         DYInstallClassHooks();
@@ -2561,7 +2973,7 @@ static void DYInit(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             DYRepatchCore();
-            LOG(@"v1 delayed light patch 1.2s");
+            LOG(@"v1.2 delayed light patch 1.2s");
         });
         // one heavy background scan after home is likely up
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)),

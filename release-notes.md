@@ -1,3 +1,14 @@
+## Douyin.dylib v1.2
+
+- 真正按**视频**保存：多地址重试，下载内容必须是可播放视频才会写相册
+- 不再把封面/图床 URL 误判成视频后提示“已保存”
+- 写入相册后校验 `localIdentifier` + `mediaType == Video`
+- 从可见 cell / 顶层 VC / 播放器缓存更积极收集 `downloadAddr` / `playAddr`
+- 仅封面可取时明确提示“未找到视频，改为保存封面图”
+
+使用：TrollFools 注入 `Douyin.dylib` 到抖音 → 点悬浮 ↓ 或双指长按 → 允许相册权限 → 到系统相册「视频」里查看。
+
+
 按**注入目标（App 产品名）** 命名的 dylib（TrollFools，无 Substrate）。
 
 > GitHub Release 资源名使用**产品名拼音/英文**（中文文件名会被 GitHub 改成 default.dylib）。
