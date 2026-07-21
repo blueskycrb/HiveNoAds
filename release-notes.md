@@ -1,3 +1,11 @@
+## Douyin.dylib v1.3
+
+- **防闪退**：关闭危险全量 class 扫描后的收尾；收窄 NSUserDefaults 匹配；KVC 仅扫 Player/Video/Aweme 等视图
+- **保存后不再先转码**：Photos 直写优先，失败再 AV 转码（降低 OOM / watchdog）
+- **去水印优先**：`downloadAddr` 高分；`playwm` 重罚；候选 URL 自动生成 `play` / `watermark=0` 变体并重排
+- **缓存扫描**：移到后台线程，只扫 tmp/Caches、限深度与候选数
+- 使用：TrollFools 移除旧 `Douyin.dylib` 后注入新包 → 彻底杀进程冷启动 → 点悬浮 ↓ 保存
+
 ## Douyin.dylib v1.2
 
 - 真正按**视频**保存：多地址重试，下载内容必须是可播放视频才会写相册
