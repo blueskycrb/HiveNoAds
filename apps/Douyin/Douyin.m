@@ -2,6 +2,11 @@
 // Douyin.dylib - unlock video/image save for Douyin (Aweme)
 // Bundle: com.ss.iphone.ugc.Aweme | executable: Aweme | analyzed: 38.7.0
 //
+// v1.6:
+//   - Prefer original/high quality: downloadAddr/bitRate > adaptive play stream
+//   - Stronger res/bitrate scoring; export uses Passthrough/Highest first (not Medium)
+//   - Still current-item only + safe boot
+//
 // v1.5:
 //   - Current-item only: most-visible feed cell + active player (fix next-video save)
 //   - Still SAFE boot (no global JSON/UserDefaults/toast hooks)
@@ -1844,7 +1849,10 @@ static void DYFallbackCollect(id obj, NSMutableSet<NSString *> *out, NSInteger d
                 @"awemeModel", @"aweme", @"video", @"videoModel", @"currentAweme",
                 @"currentPlayURL", @"playbackURL", @"videoURLString", @"playURLString",
                 @"downloadAddrModel", @"playAddrModel", @"playAddrH264Model",
-                @"originDownloadAddr", @"originDownloadAddrModel"
+                @"originDownloadAddr", @"originDownloadAddrModel",
+                @"bitRate", @"bit_rate", @"bitRateList", @"bit_rate_list",
+                @"playAddrList", @"downloadAddrList", @"videoBitRate",
+                @"h264DownloadAddr", @"h265DownloadAddr", @"HDRBitRateList"
             ];
         });
         for (NSString *k in engineKeys) {
@@ -1890,6 +1898,9 @@ static void DYFallbackCollect(id obj, NSMutableSet<NSString *> *out, NSInteger d
             @"playAddrBytevc1", @"downloadAddr", @"downloadAddrModel",
             @"originDownloadAddr", @"downloadURL", @"playURL",
             @"urlList", @"url_list", @"originURLList", @"originUrlList",
+            @"bitRate", @"bit_rate", @"bitRateList", @"bit_rate_list",
+            @"playAddrList", @"downloadAddrList", @"videoBitRateList",
+            @"h264DownloadAddr", @"h265DownloadAddr", @"HDRBitRateList",
             @"statusModel", @"shareInfo", @"interactionContext",
             @"url", @"urlString", @"imageUrl", @"imageURL", @"image_url",
             @"originUrl", @"originalUrl", @"origin_url", @"original_url",
@@ -1924,20 +1935,59 @@ static void DYFallbackCollect(id obj, NSMutableSet<NSString *> *out, NSInteger d
 static NSInteger DYFallbackURLScore(NSString *u) {
     if (u.length == 0) return -10000;
     NSString *l = u.lowercaseString;
-    NSInteger s = (NSInteger)u.length / 40;
+    NSInteger s = (NSInteger)u.length / 50;
     BOOL isVideo = DYFallbackIsVideoURL(u);
     BOOL isImage = DYFallbackIsImageURL(u);
     if (isVideo) s += 80;
     if (isImage && !isVideo) s -= 40;
-    if ([l hasPrefix:@"file:"]) s += 40; // local cache ok but may be play-stream with wm
-    // Prefer official download addresses (usually less / no watermark)
-    if ([l containsString:@"download_addr"] || [l containsString:@"downloadaddr"] ||
+
+    // === Quality source class (most important) ===
+    // Official download / origin >> adaptive in-app play stream
+    BOOL isDownload = [l containsString:@"download_addr"] || [l containsString:@"downloadaddr"] ||
         [l containsString:@"origin_download"] || [l containsString:@"origindownload"] ||
-        [l containsString:@"download_url"] || [l containsString:@"downloadurl"]) s += 90;
-    else if ([l containsString:@"download"]) s += 45;
-    if ([l containsString:@"play_addr"] || [l containsString:@"playaddr"]) s += 20;
-    if ([l containsString:@"/aweme/v1/play/"] || [l containsString:@"/aweme/v1/play?"]) s += 50;
-    if ([l containsString:@"/aweme/v1/play"] && ![l containsString:@"playwm"]) s += 40;
+        [l containsString:@"download_url"] || [l containsString:@"downloadurl"] ||
+        [l containsString:@"/download/"] || [l containsString:@"downloadaddr"];
+    BOOL isOrigin = [l containsString:@"origin_download"] || [l containsString:@"origindownload"] ||
+        [l containsString:@"originurl"] || [l containsString:@"origin_url"] ||
+        ([l containsString:@"origin"] && [l containsString:@"download"]);
+    if (isOrigin) s += 220;
+    else if (isDownload) s += 180;
+    else if ([l containsString:@"download"]) s += 70;
+
+    // play stream is OK fallback but usually ABR / not original
+    if ([l containsString:@"play_addr"] || [l containsString:@"playaddr"]) s += 15;
+    if ([l containsString:@"/aweme/v1/play/"] || [l containsString:@"/aweme/v1/play?"]) s += 35;
+    if ([l containsString:@"/aweme/v1/play"] && ![l containsString:@"playwm"]) s += 25;
+    // Adaptive / low ladders often used by the on-screen player
+    if ([l containsString:@"lowbr"] || [l containsString:@"low_br"] ||
+        [l containsString:@"playaddrlow"] || [l containsString:@"play_addr_low"] ||
+        [l containsString:@"adapt"] || [l containsString:@"abr"] ||
+        [l containsString:@"_ld"] || [l containsString:@"_sd"]) s -= 90;
+    if ([l containsString:@"360p"] || [l containsString:@"480p"] ||
+        [l containsString:@"540p"] || [l containsString:@"540x"] ||
+        [l containsString:@"x540"] || [l containsString:@"x480"] ||
+        [l containsString:@"x360"]) s -= 100;
+    if ([l containsString:@"720p"] || [l containsString:@"x720"] || [l containsString:@"720x"]) s += 35;
+    if ([l containsString:@"1080"] || [l containsString:@"x1080"] || [l containsString:@"1080p"]) s += 95;
+    if ([l containsString:@"1440"] || [l containsString:@"2k"] || [l containsString:@"x1440"]) s += 120;
+    if ([l containsString:@"2160"] || [l containsString:@"4k"] || [l containsString:@"x2160"]) s += 150;
+
+    // bitrate hints in query (Douyin often has br= / bt= kbps-ish)
+    NSRegularExpression *brRe = [NSRegularExpression regularExpressionWithPattern:@"(?:^|[?&_])br=(\\d+)" options:NSRegularExpressionCaseInsensitive error:nil];
+    NSTextCheckingResult *brm = [brRe firstMatchInString:l options:0 range:NSMakeRange(0, l.length)];
+    if (brm && brm.numberOfRanges > 1) {
+        NSInteger br = [[l substringWithRange:[brm rangeAtIndex:1]] integerValue];
+        if (br >= 4000) s += 110;
+        else if (br >= 2500) s += 80;
+        else if (br >= 1500) s += 45;
+        else if (br >= 800) s += 10;
+        else if (br > 0 && br < 500) s -= 60;
+    }
+    // codec: h265/bytevc1 often higher quality at same size; still prefer download class above
+    if ([l containsString:@"bytevc1"] || [l containsString:@"h265"] ||
+        [l containsString:@"hevc"] || [l containsString:@"h.265"]) s += 18;
+    if ([l containsString:@"hdr"]) s += 25;
+
     // Hard penalty for watermark play URLs
     if ([l containsString:@"playwm"] || [l containsString:@"play_wm"] ||
         [l containsString:@"watermark=1"] || [l containsString:@"watermark=true"] ||
@@ -1947,14 +1997,19 @@ static NSInteger DYFallbackURLScore(NSString *u) {
         [l containsString:@"nowm"] || [l containsString:@"without_watermark"] ||
         [l containsString:@"withoutwatermark"] || [l containsString:@"no-watermark"] ||
         [l containsString:@"watermark=0"] || [l containsString:@"wm=0"]) s += 80;
-    if ([l containsString:@"origin"] || [l containsString:@"original"]) s += 18;
+
+    if ([l containsString:@"origin"] || [l containsString:@"original"]) s += 25;
     if ([l containsString:@".mp4"] || [l containsString:@".mov"]) s += 20;
-    if ([l containsString:@".m3u8"]) s -= 500;
+    if ([l containsString:@".m3u8"] || [l containsString:@"dash"] || [l containsString:@"m4s"]) s -= 500;
+
+    // Cover / image hosts
     if ([l containsString:@"cover"] || [l containsString:@"avatar"] ||
         [l containsString:@"thumb"] || [l containsString:@"byteimg"] ||
         [l containsString:@"douyinpic"] || [l containsString:@"~tplv-"] ||
         [l containsString:@"icon"] || [l containsString:@"head"]) s -= 80;
-    if ([l containsString:@"1080"] || [l containsString:@"720"] || [l containsString:@"4k"]) s += 6;
+
+    // Local cache: useful fallback, but often ABR already-transcoded play file
+    if ([l hasPrefix:@"file:"]) s += 25;
     if ([l hasPrefix:@"https://"]) s += 2;
     return s;
 }
@@ -2096,12 +2151,13 @@ static void DYFallbackExportVideoThen(NSString *path, void (^done)(NSString *out
     }];
     NSArray *presets = [AVAssetExportSession exportPresetsCompatibleWithAsset:asset];
     NSString *preset = nil;
+    // Prefer no re-encode / max quality. NEVER pick Medium/Low before Highest.
     for (NSString *p in @[AVAssetExportPresetPassthrough,
-                          AVAssetExportPresetMediumQuality,
-                          AVAssetExportPreset1280x720,
-                          AVAssetExportPresetLowQuality,
                           AVAssetExportPresetHighestQuality,
-                          AVAssetExportPreset1920x1080]) {
+                          AVAssetExportPreset1920x1080,
+                          AVAssetExportPreset1280x720,
+                          AVAssetExportPresetMediumQuality,
+                          AVAssetExportPresetLowQuality]) {
         if ([presets containsObject:p]) { preset = p; break; }
     }
     if (!preset && presets.count) preset = presets.firstObject;
@@ -2134,7 +2190,7 @@ static void DYFallbackExportVideoThen(NSString *path, void (^done)(NSString *out
                                userInfo:@{NSLocalizedDescriptionKey: @"no export file type"}]);
         return;
     }
-    ex.shouldOptimizeForNetworkUse = YES;
+    ex.shouldOptimizeForNetworkUse = NO; // keep quality
     NSLog(@"[DouyinSave] export start preset=%@ types=%@", preset, types);
     [ex exportAsynchronouslyWithCompletionHandler:^{
         if (ex.status == AVAssetExportSessionStatusCompleted &&
@@ -2330,33 +2386,35 @@ static void DYFallbackDownloadAndSave(NSString *urlString) {
 
 static void DYFallbackDownloadVideosTry(NSArray<NSString *> *urls, NSUInteger idx) {
     if (!urls.count) {
-        DYFallbackToast(@"未找到可下载的视频地址");
+        DYFallbackToast(@"\u672a\u627e\u5230\u53ef\u4e0b\u8f7d\u7684\u89c6\u9891\u5730\u5740");
         return;
     }
     if (idx >= urls.count) {
-        DYFallbackToast([NSString stringWithFormat:@"视频保存失败（已尝试 %lu 个地址）",
+        DYFallbackToast([NSString stringWithFormat:@"\u89c6\u9891\u4fdd\u5b58\u5931\u8d25\uff08\u5df2\u5c1d\u8bd5 %lu \u4e2a\u5730\u5740\uff09",
                           (unsigned long)urls.count]);
         return;
     }
     NSString *urlString = urls[idx];
-    NSLog(@"[DouyinSave] try video[%lu/%lu] %@",
+    NSLog(@"[DouyinSave] try video[%lu/%lu] score=%ld %@",
           (unsigned long)(idx + 1), (unsigned long)urls.count,
+          (long)DYFallbackURLScore(urlString),
           urlString.length > 160 ? [[urlString substringToIndex:160] stringByAppendingString:@"..."] : urlString);
     if (idx == 0) {
-        DYFallbackToast(@"正在下载视频…");
+        DYFallbackToast(@"\u6b63\u5728\u4e0b\u8f7d\u9ad8\u6e05\u89c6\u9891\u2026");
     } else {
-        DYFallbackToast([NSString stringWithFormat:@"换源重试 %lu/%lu…",
+        DYFallbackToast([NSString stringWithFormat:@"\u6362\u6e90\u91cd\u8bd5 %lu/%lu\u2026",
                           (unsigned long)(idx + 1), (unsigned long)urls.count]);
     }
     DYFallbackDownloadOneVideo(urlString, ^(BOOL ok, NSString *msg) {
         if (ok) {
-            DYFallbackToast(msg.length ? msg : @"✅ 视频已保存到相册");
+            DYFallbackToast(msg.length ? msg : @"\u2705\u89c6\u9891\u5df2\u4fdd\u5b58\u5230\u76f8\u518c");
             return;
         }
         NSLog(@"[DouyinSave] video try fail[%lu]: %@", (unsigned long)idx, msg ?: @"?");
         DYFallbackDownloadVideosTry(urls, idx + 1);
     });
 }
+
 
 static void DYFallbackDownloadOneVideo(NSString *urlString, void (^done)(BOOL ok, NSString *msg)) {
     if (!urlString.length) {
@@ -2503,12 +2561,38 @@ forHTTPHeaderField:@"User-Agent"];
             return;
         }
 
+        // Reject obvious low-ladder streams so caller can try next (download/origin) URL
+        {
+            double sec = 0;
+            @try {
+                AVURLAsset *a = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:tmp] options:nil];
+                sec = CMTimeGetSeconds(a.duration);
+            } @catch (__unused NSException *e) {}
+            if (sec > 2.5 && sec < 600) {
+                double kbps = (sz * 8.0) / (sec * 1000.0);
+                // Mobile feed play often ~400-900kbps; original download usually >>1500
+                if (sz < 500ull * 1024ull || kbps < 700.0) {
+                    NSLog(@"[DouyinSave] reject low quality bytes=%llu sec=%.1f kbps=%.0f",
+                          sz, sec, kbps);
+                    [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
+                    if (done) done(NO, @"low quality stream");
+                    return;
+                }
+            } else if (sz < 350ull * 1024ull) {
+                NSLog(@"[DouyinSave] reject tiny video bytes=%llu", sz);
+                [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
+                if (done) done(NO, @"tiny video");
+                return;
+            }
+        }
+
         NSLog(@"[DouyinSave] video file ready bytes=%llu", sz);
         DYFallbackSaveVideoFile(tmp, ^(BOOL ok, NSError *e) {
             [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
-            if (done) done(ok, ok ? @"✅ 视频已保存到相册" :
+            if (done) done(ok, ok ? @"\u2705\u89c6\u9891\u5df2\u4fdd\u5b58\u5230\u76f8\u518c" :
                            (e.localizedDescription ?: @"photos failed"));
         });
+
     }] resume];
 }
 
@@ -2884,7 +2968,10 @@ static void DYFallbackCollectClassNamedModels(id obj, NSMutableSet<NSString *> *
                               @"playAddrBytevc1Model", @"originDownloadAddr",
                               @"downloadURL", @"downloadUrl", @"download_url",
                               @"h264URL", @"bytevc1URL", @"playURL", @"playUrl",
-                              @"urlList", @"url_list", @"originURLList", @"origin_url_list"]) {
+                              @"urlList", @"url_list", @"originURLList", @"origin_url_list",
+                              @"bitRate", @"bit_rate", @"bitRateList", @"bit_rate_list",
+                              @"playAddrList", @"downloadAddrList", @"videoBitRateList",
+                              @"h264DownloadAddr", @"h265DownloadAddr"]) {
             @try {
                 id v = [obj valueForKey:k];
                 if (v) DYFallbackCollect(v, set, depth + 1);
@@ -3016,20 +3103,32 @@ static void DYFallbackForceSaveFromView(UIView *view) {
             for (NSString *v in DYNoWatermarkURLVariants(u)) {
                 if (v.length) [expanded addObject:v];
             }
-            if (expanded.count > 40) break;
+            if (expanded.count > 60) break;
         }
         NSArray *rescored = [expanded.allObjects sortedArrayUsingComparator:cmp];
         NSMutableArray<NSString *> *tryList = [NSMutableArray array];
+        // Pass 1: download/origin only (original / high quality)
         for (NSString *u in rescored) {
-            if (tryList.count >= 8) break;
+            if (tryList.count >= 10) break;
+            NSString *l = u.lowercaseString;
+            BOOL isDL = [l containsString:@"download"] || [l containsString:@"origin_download"] ||
+                        [l containsString:@"origindownload"];
+            if (!isDL) continue;
             BOOL dup = NO;
-            for (NSString *e in tryList) {
-                if ([e isEqualToString:u]) { dup = YES; break; }
-            }
+            for (NSString *e in tryList) { if ([e isEqualToString:u]) { dup = YES; break; } }
             if (!dup) [tryList addObject:u];
         }
-        NSLog(@"[DouyinSave] VIDEO pick top=%@ (try %lu, expanded %lu)",
-              tryList.firstObject, (unsigned long)tryList.count, (unsigned long)expanded.count);
+        // Pass 2: high-res / high-br play URLs
+        for (NSString *u in rescored) {
+            if (tryList.count >= 14) break;
+            BOOL dup = NO;
+            for (NSString *e in tryList) { if ([e isEqualToString:u]) { dup = YES; break; } }
+            if (!dup) [tryList addObject:u];
+        }
+        NSLog(@"[DouyinSave] VIDEO pick top=%@ score=%ld (try %lu, expanded %lu)",
+              tryList.firstObject,
+              (long)DYFallbackURLScore(tryList.firstObject),
+              (unsigned long)tryList.count, (unsigned long)expanded.count);
         DYFallbackDownloadVideosTry(tryList, 0);
         return;
     }
@@ -3251,7 +3350,7 @@ static void DYInstallMinimalAwemeGates(void) {
             DYPatchBool(cls, "disableWatermark", YES);
             DYPatchBool(cls, "disableWatermarkWhenSavingAlbum", YES);
         }
-        NSLog(@"[DouyinSave] v1.5 minimal AWE gates installed");
+        NSLog(@"[DouyinSave] v1.6 minimal AWE gates installed");
     });
 }
 
@@ -3272,7 +3371,7 @@ static void DYInit(void) {
         if (!DYIsTarget()) return;
         // v1.4 SAFE BOOT: do NOT touch JSON / UserDefaults / toast / i18n / XHS save services.
         // Those global hooks are the main cause of immediate Aweme crash-on-launch.
-        NSLog(@"[DouyinSave] v1.5 current-item load pid=%d (float-save only)", getpid());
+        NSLog(@"[DouyinSave] v1.6 quality load pid=%d (float-save only)", getpid());
 
         // Float UI only — after app UI is up
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),

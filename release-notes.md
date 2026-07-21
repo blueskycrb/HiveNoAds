@@ -1,3 +1,17 @@
+## Douyin.dylib v1.6
+
+- **画质优先**：`downloadAddr` / origin / 高分辨率 / 高 `br=` 码率优先于播放器自适应流
+- 下载后若体积/码率过低自动换下一条候选（避免糊糊的 play 流当成功）
+- 相册转码预设：Passthrough → Highest → 1080p（不再先 Medium）
+- 仍只采当前 feed 条 + 安全启动
+
+## Douyin.dylib v1.5
+
+- **当前条优先**：只从最居中的 feed cell + 正在播放的 player 取 URL，避免保存成下一条预加载视频
+- 仍安全启动：默认不 hook JSON / NSUserDefaults / toast / i18n
+- 保留 Photos 直写优先、无水印 URL 变体
+- 使用：TrollFools 移除旧插件 → 注入新 Douyin.dylib → 彻底杀进程冷启动
+
 ## Douyin.dylib v1.4
 
 - **安全启动**：默认不再 hook JSON / NSUserDefaults / toast / i18n（解决一打开就闪退）
