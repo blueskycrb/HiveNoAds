@@ -2,6 +2,11 @@
 // Douyin.dylib - unlock video/image save for Douyin (Aweme)
 // Bundle: com.ss.iphone.ugc.Aweme | executable: Aweme | analyzed: 38.7.0
 //
+// v1.5:
+//   - Current-item only: most-visible feed cell + active player (fix next-video save)
+//   - Still SAFE boot (no global JSON/UserDefaults/toast hooks)
+//   - Keep Photos-first save + no-wm URL variants
+//
 // v1.4:
 //   - SAFE boot: NO JSON/UserDefaults/toast/i18n hooks (they crash Aweme 38.x)
 //   - Only floating save UI + download pipeline; optional minimal AWE gate patch
@@ -2719,6 +2724,40 @@ static UIViewController *DYTopViewController(void) {
     return root;
 }
 
+// How much of `v` is on-screen / centered inside `container`. Higher = more "current".
+static CGFloat DYVisibilityScore(UIView *v, UIView *container) {
+    if (!v || !container || v.hidden || v.alpha < 0.02) return -1e9;
+    CGRect r = [v convertRect:v.bounds toView:container];
+    CGRect bounds = container.bounds;
+    if (CGRectIsEmpty(r) || CGRectIsEmpty(bounds)) return -1e9;
+    CGRect inter = CGRectIntersection(r, bounds);
+    if (CGRectIsEmpty(inter) || inter.size.width < 8 || inter.size.height < 8) return -1e9;
+    CGFloat area = inter.size.width * inter.size.height;
+    CGFloat cx = CGRectGetMidX(r), cy = CGRectGetMidY(r);
+    CGFloat dx = cx - CGRectGetMidX(bounds);
+    CGFloat dy = cy - CGRectGetMidY(bounds);
+    CGFloat dist = sqrt(dx * dx + dy * dy);
+    // Full-screen feed cells: area dominates; slight center bias for mid-swipe
+    return area - dist * 24.0;
+}
+
+static void DYFallbackCollectCellKeys(UIView *cell, NSMutableSet<NSString *> *set) {
+    if (!cell || !set) return;
+    for (NSString *k in @[@"awemeModel", @"aweme", @"model", @"viewModel",
+                          @"currentAweme", @"playingAweme", @"context",
+                          @"video", @"videoModel", @"pageContext",
+                          @"playAddr", @"downloadAddr", @"player"]) {
+        @try {
+            if ([cell respondsToSelector:NSSelectorFromString(k)]) {
+                DYFallbackCollect([cell valueForKey:k], set, 0);
+            }
+        } @catch (__unused NSException *e) {}
+    }
+    DYFallbackCollectFromView(cell, set);
+    DYFallbackCollectFromResponder(cell, set);
+}
+
+// v1.5: ONLY the most-visible cell per scroll view (Douyin preloads next/prev)
 static void DYFallbackCollectFromScrollViews(UIView *root, NSMutableSet<NSString *> *set) {
     if (!root || !set) return;
     NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
@@ -2729,27 +2768,108 @@ static void DYFallbackCollectFromScrollViews(UIView *root, NSMutableSet<NSString
         [stack removeLastObject];
         if ([v isKindOfClass:[UITableView class]]) {
             UITableView *tv = (UITableView *)v;
+            UITableViewCell *best = nil;
+            CGFloat bestScore = -1e9;
             for (UITableViewCell *cell in tv.visibleCells) {
-                for (NSString *k in @[@"awemeModel", @"aweme", @"model", @"viewModel",
-                                      @"currentAweme", @"playingAweme", @"context",
-                                      @"video", @"videoModel", @"pageContext"]) {
-                    @try { DYFallbackCollect([cell valueForKey:k], set, 0); } @catch (__unused NSException *e) {}
-                }
-                DYFallbackCollectFromView(cell, set);
+                CGFloat sc = DYVisibilityScore(cell, tv);
+                if (sc > bestScore) { bestScore = sc; best = cell; }
             }
+            if (best) DYFallbackCollectCellKeys(best, set);
         } else if ([v isKindOfClass:[UICollectionView class]]) {
             UICollectionView *cv = (UICollectionView *)v;
+            UICollectionViewCell *best = nil;
+            CGFloat bestScore = -1e9;
             for (UICollectionViewCell *cell in cv.visibleCells) {
-                for (NSString *k in @[@"awemeModel", @"aweme", @"model", @"viewModel",
-                                      @"currentAweme", @"playingAweme", @"context",
-                                      @"video", @"videoModel", @"pageContext"]) {
-                    @try { DYFallbackCollect([cell valueForKey:k], set, 0); } @catch (__unused NSException *e) {}
-                }
-                DYFallbackCollectFromView(cell, set);
+                CGFloat sc = DYVisibilityScore(cell, cv);
+                if (sc > bestScore) { bestScore = sc; best = cell; }
             }
+            if (best) DYFallbackCollectCellKeys(best, set);
         }
         for (UIView *sub in v.subviews) [stack addObject:sub];
     }
+}
+
+// Prefer the single most-centered / actually-playing AVPlayerLayer
+static void DYFallbackCollectActivePlayersInView(UIView *root, NSMutableSet<NSString *> *set) {
+    if (!root || !set) return;
+    UIView *container = root.window ?: root;
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
+    NSInteger steps = 0;
+    AVPlayer *bestPlayer = nil;
+    UIView *bestEngineView = nil;
+    id bestEngine = nil;
+    CGFloat bestPlayerScore = -1e9;
+    CGFloat bestEngineScore = -1e9;
+    while (stack.count && steps < 320) {
+        steps++;
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        @try {
+            CALayer *layer = v.layer;
+            if ([layer isKindOfClass:[AVPlayerLayer class]]) {
+                AVPlayer *pl = [(AVPlayerLayer *)layer player];
+                if (pl) {
+                    CGFloat sc = DYVisibilityScore(v, container);
+                    if (pl.rate > 0.01) sc += 500000; // currently playing wins
+                    if (pl.currentItem) sc += 50000;
+                    if (sc > bestPlayerScore) {
+                        bestPlayerScore = sc;
+                        bestPlayer = pl;
+                    }
+                }
+            }
+            const char *cn = object_getClassName(v);
+            if (cn && (strstr(cn, "Player") || strstr(cn, "Video") || strstr(cn, "TTVideo") ||
+                       strstr(cn, "IES") || strstr(cn, "Engine") || strstr(cn, "Play"))) {
+                for (NSString *k in @[@"player", @"videoPlayer", @"ttPlayer", @"iesPlayer"]) {
+                    @try {
+                        if (![v respondsToSelector:NSSelectorFromString(k)]) continue;
+                        id p = [v valueForKey:k];
+                        if (!p) continue;
+                        CGFloat sc = DYVisibilityScore(v, container);
+                        if ([p isKindOfClass:[AVPlayer class]]) {
+                            AVPlayer *ap = (AVPlayer *)p;
+                            if (ap.rate > 0.01) sc += 500000;
+                            if (ap.currentItem) sc += 50000;
+                            if (sc > bestPlayerScore) {
+                                bestPlayerScore = sc;
+                                bestPlayer = ap;
+                            }
+                        } else if (sc > bestEngineScore) {
+                            bestEngineScore = sc;
+                            bestEngineView = v;
+                            bestEngine = p;
+                        }
+                    } @catch (__unused NSException *e) {}
+                }
+            }
+        } @catch (__unused NSException *e) {}
+        for (UIView *sub in v.subviews) [stack addObject:sub];
+    }
+    // Only the single best player / engine — never all preloaded ones
+    if (bestPlayer) {
+        DYFallbackCollect(bestPlayer, set, 0);
+        @try {
+            AVPlayerItem *item = bestPlayer.currentItem;
+            if (item) DYFallbackCollect(item, set, 0);
+            id asset = item.asset;
+            if ([asset isKindOfClass:[AVURLAsset class]]) {
+                NSURL *u = [(AVURLAsset *)asset URL];
+                if (u.absoluteString.length) [set addObject:u.absoluteString];
+            }
+        } @catch (__unused NSException *e) {}
+    }
+    if (bestEngine) {
+        DYFallbackCollect(bestEngine, set, 0);
+        if (bestEngineView) DYFallbackCollectFromView(bestEngineView, set);
+    }
+}
+
+static BOOL DYSetHasVideoURL(NSSet<NSString *> *set) {
+    for (NSString *u in set) {
+        if (DYFallbackIsVideoURL(u) && ![u.lowercaseString containsString:@".m3u8"]) return YES;
+    }
+    return NO;
 }
 
 static void DYFallbackCollectClassNamedModels(id obj, NSMutableSet<NSString *> *set, NSInteger depth) {
@@ -2789,57 +2909,81 @@ static void DYFallbackForceSaveFromView(UIView *view) {
 
     NSMutableSet<NSString *> *set = [NSMutableSet set];
     UIWindow *win = view.window ?: DYFallbackKeyWindow();
+    UIView *scope = win ?: view;
 
-    // 1) players / models on view tree (video first) — prefer window, not cover UIImageView
-    if (win) {
-        DYFallbackCollectPlayersInView(win, set);
-        DYFallbackCollectFromScrollViews(win, set);
-    } else {
-        DYFallbackCollectPlayersInView(view, set);
-        DYFallbackCollectFromScrollViews(view, set);
+    // v1.5 PHASE A: current item only (active player + most-visible cell + VC currentAweme)
+    // Avoid pulling preloaded next/prev feed cells into the URL set.
+    if (scope) {
+        DYFallbackCollectActivePlayersInView(scope, set);
+        DYFallbackCollectFromScrollViews(scope, set);
     }
-
     DYFallbackCollectFromView(view, set);
     DYFallbackCollectFromResponder(view, set);
 
     UIViewController *top = DYTopViewController();
     if (top) {
+        // Prefer current/playing keys only (do not walk generic model lists)
+        for (NSString *k in @[@"currentAweme", @"playingAweme", @"currentModel",
+                              @"playingModel", @"currentVideo", @"playingVideo",
+                              @"currentItem", @"playingItem"]) {
+            @try {
+                if ([top respondsToSelector:NSSelectorFromString(k)]) {
+                    DYFallbackCollect([top valueForKey:k], set, 0);
+                }
+            } @catch (__unused NSException *e) {}
+        }
         DYFallbackCollectFromResponder(top, set);
-        DYFallbackCollectClassNamedModels(top, set, 0);
         if (top.isViewLoaded) {
-            DYFallbackCollectPlayersInView(top.view, set);
+            DYFallbackCollectActivePlayersInView(top.view, set);
             DYFallbackCollectFromScrollViews(top.view, set);
         }
-        for (NSString *k in @[@"awemeModel", @"aweme", @"currentAweme", @"playingAweme",
-                              @"model", @"viewModel", @"context", @"pageContext",
-                              @"interactionContext", @"videoController", @"player",
-                              @"currentModel", @"data", @"item"]) {
-            @try { DYFallbackCollect([top valueForKey:k], set, 0); } @catch (__unused NSException *e) {}
-        }
         for (UIViewController *c in top.childViewControllers) {
-            DYFallbackCollectFromResponder(c, set);
-            DYFallbackCollectClassNamedModels(c, set, 0);
-            for (NSString *k in @[@"awemeModel", @"aweme", @"currentAweme", @"playingAweme",
-                                  @"model", @"viewModel", @"context"]) {
-                @try { DYFallbackCollect([c valueForKey:k], set, 0); } @catch (__unused NSException *e) {}
+            for (NSString *k in @[@"currentAweme", @"playingAweme", @"currentModel",
+                                  @"playingModel", @"currentVideo", @"playingVideo",
+                                  @"currentItem", @"playingItem"]) {
+                @try {
+                    if ([c respondsToSelector:NSSelectorFromString(k)]) {
+                        DYFallbackCollect([c valueForKey:k], set, 0);
+                    }
+                } @catch (__unused NSException *e) {}
             }
+            DYFallbackCollectFromResponder(c, set);
             if (c.isViewLoaded) {
-                DYFallbackCollectPlayersInView(c.view, set);
+                DYFallbackCollectActivePlayersInView(c.view, set);
                 DYFallbackCollectFromScrollViews(c.view, set);
             }
         }
     }
 
-    if (win) {
-        CGPoint prefer = CGPointMake(CGRectGetMidX(win.bounds), CGRectGetMidY(win.bounds) - 40);
-        UIImageView *best = DYFallbackPickBestImageView(win, prefer);
-        if (best) {
-            DYFallbackCollectFromView(best, set);
-            DYFallbackCollectFromResponder(best, set);
+    // PHASE B only if current-scope found no video (e.g. photo post / odd page)
+    if (!DYSetHasVideoURL(set)) {
+        NSLog(@"[DouyinSave] phaseA empty video; broaden collect");
+        if (scope) {
+            DYFallbackCollectPlayersInView(scope, set);
+            DYFallbackCollectFromScrollViews(scope, set);
+        }
+        if (top) {
+            DYFallbackCollectClassNamedModels(top, set, 0);
+            if (top.isViewLoaded) {
+                DYFallbackCollectPlayersInView(top.view, set);
+            }
+            for (UIViewController *c in top.childViewControllers) {
+                DYFallbackCollectClassNamedModels(c, set, 0);
+                if (c.isViewLoaded) DYFallbackCollectPlayersInView(c.view, set);
+            }
+        }
+        if (win) {
+            CGPoint prefer = CGPointMake(CGRectGetMidX(win.bounds), CGRectGetMidY(win.bounds) - 40);
+            UIImageView *best = DYFallbackPickBestImageView(win, prefer);
+            if (best) {
+                DYFallbackCollectFromView(best, set);
+                DYFallbackCollectFromResponder(best, set);
+            }
         }
     }
 
-    NSLog(@"[DouyinSave] collected %lu urls", (unsigned long)set.count);
+    NSLog(@"[DouyinSave] collected %lu urls (current-first)", (unsigned long)set.count);
+
     for (NSString *u in set) {
         NSLog(@"[DouyinSave]  candidate score=%ld video=%d %@",
               (long)DYFallbackURLScore(u), (int)DYFallbackIsVideoURL(u),
@@ -2892,7 +3036,7 @@ static void DYFallbackForceSaveFromView(UIView *view) {
 
         // No video URL: do NOT silently save cover as "success"
     // v1.3: scan local cache OFF main thread (was watchdog crash after save / on open)
-    DYFallbackToast(@"未找到直链，扫描本地缓存…");
+    DYFallbackToast(@"\u672a\u627e\u5230\u76f4\u94fe\uff0c\u626b\u63cf\u672c\u5730\u7f13\u5b58\u2026");
     NSArray *imageCopy = [images copy];
     NSComparator cmpCopy = cmp;
     UIView *viewRef = view;
@@ -3107,7 +3251,7 @@ static void DYInstallMinimalAwemeGates(void) {
             DYPatchBool(cls, "disableWatermark", YES);
             DYPatchBool(cls, "disableWatermarkWhenSavingAlbum", YES);
         }
-        NSLog(@"[DouyinSave] v1.4 minimal AWE gates installed");
+        NSLog(@"[DouyinSave] v1.5 minimal AWE gates installed");
     });
 }
 
@@ -3128,7 +3272,7 @@ static void DYInit(void) {
         if (!DYIsTarget()) return;
         // v1.4 SAFE BOOT: do NOT touch JSON / UserDefaults / toast / i18n / XHS save services.
         // Those global hooks are the main cause of immediate Aweme crash-on-launch.
-        NSLog(@"[DouyinSave] v1.4 safe load pid=%d (float-save only)", getpid());
+        NSLog(@"[DouyinSave] v1.5 current-item load pid=%d (float-save only)", getpid());
 
         // Float UI only — after app UI is up
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
