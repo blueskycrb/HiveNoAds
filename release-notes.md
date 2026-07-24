@@ -98,3 +98,5 @@
 - 取消全进程类扫描（各 App 按自身实现）
 - 取消 UIView 全局 swizzle
 - 默认关闭日志
+
+- WeAppHelper: crash-safe WeChat mini program helper deb (Bootstrap/RootHide, WeChat 8.0.71)

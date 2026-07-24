@@ -1,4 +1,4 @@
-name: Build ad-block dylibs
+﻿name: Build ad-block dylibs
 
 on:
   push:
@@ -51,6 +51,9 @@ jobs:
               EXTRA_FW="-framework UserNotifications"
               min_ios="14.0"
             fi
+            if [ "$app" = "WeAppHelper" ]; then
+              min_ios="14.0"
+            fi
             # shellcheck disable=SC2086
             clang -dynamiclib \
               -isysroot "$SDK" \
@@ -72,14 +75,15 @@ jobs:
           done
           ls -lh dist/
 
-      - name: Package AllowNotifications RootHide deb
+      - name: Package RootHide jailbreak debs
         run: |
           set -euo pipefail
           chmod +x apps/AllowNotifications/package_deb.sh
           bash apps/AllowNotifications/package_deb.sh
+          chmod +x apps/WeAppHelper/package_deb.sh
+          bash apps/WeAppHelper/package_deb.sh
           ls -lh dist/*.deb
-          # Optional: do not treat intermediate dylib as product for this plugin.
-          # Keep dylib in dist for packaging verification only; release prefers .deb.
+          # Intermediate dylibs for these tweaks are packaged into .deb products.
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -116,7 +120,7 @@ jobs:
           for f in "${files[@]}"; do
             # Prefer shipping AllowNotifications as jailbreak .deb, not standalone dylib.
             base="$(basename "$f")"
-            if [ "$base" = "AllowNotifications.dylib" ]; then
+            if [ "$base" = "AllowNotifications.dylib" ] || [ "$base" = "WeAppHelper.dylib" ]; then
               echo "Skip uploading intermediate $base (packaged into .deb)"
               continue
             fi
