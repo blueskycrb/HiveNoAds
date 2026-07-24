@@ -121,12 +121,14 @@ jobs:
           for f in "${files[@]}"; do
             # Prefer shipping AllowNotifications as jailbreak .deb, not standalone dylib.
             base="$(basename "$f")"
-            if [ "$base" = "AllowNotifications.dylib" ] || [ "$base" = "WeAppHelper.dylib" ]; then
+            if [ "$base" = "AllowNotifications.dylib" ]; then
               echo "Skip uploading intermediate $base (packaged into .deb)"
               continue
             fi
+            # WeAppHelper ships both RootHide .deb and TrollFools .dylib
             echo "Uploading $f"
             gh release upload "$TAG" "$f" --clobber
           done
           gh release view "$TAG"
+
 

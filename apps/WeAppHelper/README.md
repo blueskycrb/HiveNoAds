@@ -54,3 +54,18 @@ dist/com.blueskycrb.weapptool-rootless_<ver>_iphoneos-arm64e.deb
 
 - `WeAppHelper.m`
 - `control` / `WeAppHelper.plist` / `package_deb.sh`
+
+## TrollFools dylib
+
+也提供可注入微信的独立 dylib（无需越狱 deb）：
+
+`	ext
+dist/WeAppHelper.dylib
+`
+
+1. 下载 WeAppHelper.dylib
+2. TrollFools → 选择 **微信** → 注入
+3. 彻底划掉微信后重开
+4. 微信 → 我 → 设置 → 右上角「小程序」
+
+> 与越狱 deb 二选一即可，不要重复注入/安装。
