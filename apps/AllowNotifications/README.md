@@ -5,7 +5,7 @@
 - `xxx 想给你发送通知`
 - `Would Like to Send You Notifications`
 
-对应 **GHAllowNetwork（自动允许网络）** 的通知版。
+功能对标自动允许网络权限类插件，但本包为独立实现，包名使用本仓库作者命名空间。
 
 ## Bootstrap / RootHide 格式（重要）
 
@@ -16,20 +16,12 @@ Bootstrap 使用 **RootHide** 包格式，不是 Dopamine 的 `/var/jb` rootless
 | Architecture | **`iphoneos-arm64e`**（不是 `iphoneos-arm64`） |
 | 安装布局 | **无 `/var/jb` 前缀** 的 rootful 路径 |
 | 安装路径 | `/Library/MobileSubstrate/DynamicLibraries/AllowNotifications.{dylib,plist}` |
-| 说明 | RootHide 的 dpkg 会把路径安装进随机 `jbroot` |
-
-错误示例（无法在 Bootstrap 安装）：
-
-```text
-Architecture: iphoneos-arm64
-/var/jb/Library/MobileSubstrate/...
-```
 
 ## 包信息
 
 | 字段 | 值 |
 |------|----|
-| Package | `byg.iosios.net.ghallownotifications-rootless` |
+| Package | `com.blueskycrb.allownotifications-rootless` |
 | Architecture | `iphoneos-arm64e` |
 | Scheme | Bootstrap / RootHide |
 | Depends | `mobilesubstrate (>= 0.9.5000)`, `firmware (>= 14.0)` |
@@ -39,7 +31,7 @@ Filter：`com.apple.UIKit` + `com.apple.springboard`
 ## 构建产物
 
 ```text
-dist/byg.iosios.net.ghallownotifications-rootless_<ver>_iphoneos-arm64e.deb
+dist/com.blueskycrb.allownotifications-rootless_<ver>_iphoneos-arm64e.deb
 ```
 
 ## 安装

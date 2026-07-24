@@ -88,7 +88,7 @@ apps/
 
 自动允许「xxx 想给你发送通知」权限弹窗，对应 **GHAllowNetwork（自动允许网络）** 的通知版。
 
-- 产物：`byg.iosios.net.ghallownotifications-rootless_<ver>_iphoneos-arm64e.deb`
+- 产物：`com.blueskycrb.allownotifications-rootless_<ver>_iphoneos-arm64e.deb`
 - 格式：**RootHide / Bootstrap**（`Architecture: iphoneos-arm64e`，路径无 `/var/jb`）
 - 安装：Sileo / Filza 安装 deb → respring
 - 路径：`/Library/MobileSubstrate/DynamicLibraries/AllowNotifications.{dylib,plist}`

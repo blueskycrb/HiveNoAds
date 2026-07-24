@@ -1,7 +1,7 @@
 ## AllowNotifications 越狱插件（Bootstrap / RootHide）
 
-- 包名：`byg.iosios.net.ghallownotifications-rootless`
-- 产物：`byg.iosios.net.ghallownotifications-rootless_1.0.1_iphoneos-arm64e.deb`
+- 包名：`com.blueskycrb.allownotifications-rootless`
+- 产物：`com.blueskycrb.allownotifications-rootless_1.0.2_iphoneos-arm64e.deb`
 - 功能：自动允许「想给你发送通知」权限弹窗（对应 GHAllowNetwork 的通知版）
 - 安装：Sileo / Filza 安装 deb → respring
 - 路径：`/Library/MobileSubstrate/DynamicLibraries/AllowNotifications.{dylib,plist} (RootHide jbroot, no /var/jb)`
