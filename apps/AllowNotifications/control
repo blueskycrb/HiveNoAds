@@ -7,7 +7,7 @@ Description: Auto-allow app notification permission prompts on Bootstrap/RootHid
 Maintainer: blueskycrb <blueskycrb@users.noreply.github.com>
 Author: blueskycrb <blueskycrb@users.noreply.github.com>
 Section: Tweaks
-Conflicts: byg.iosios.net.ghallownotifications-rootless, byg.iosios.net.ghallownotifications, net.iosios.ghallownotifications-rootless
+Conflicts: byg.iosios.net.ghallownotifications-rootless
 Replaces: byg.iosios.net.ghallownotifications-rootless
 Provides: com.blueskycrb.allownotifications-rootless
 Tag: role::enduser purpose::extension

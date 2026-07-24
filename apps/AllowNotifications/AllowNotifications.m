@@ -2,7 +2,7 @@
 // AllowNotifications — auto-allow notification permission
 //
 // Delivered as Bootstrap/RootHide jailbreak tweak package:
-//   byg.iosios.net.ghallownotifications-rootless (iphoneos-arm64)
+//   com.blueskycrb.allownotifications-rootless (iphoneos-arm64e)
 // Install:
 //   /var/jb/Library/MobileSubstrate/DynamicLibraries/AllowNotifications.{dylib,plist}
 //
