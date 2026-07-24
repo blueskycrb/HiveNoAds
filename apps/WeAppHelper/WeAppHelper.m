@@ -163,6 +163,7 @@ static id WAHGetService(Class serviceClass) {
                     }
                 }
             }
+        }
 
         Class MSC = NSClassFromString(@"MMServiceCenter");
         if (MSC) {
