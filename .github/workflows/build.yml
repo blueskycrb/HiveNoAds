@@ -72,11 +72,22 @@ jobs:
           done
           ls -lh dist/
 
+      - name: Package AllowNotifications RootHide deb
+        run: |
+          set -euo pipefail
+          chmod +x apps/AllowNotifications/package_deb.sh
+          bash apps/AllowNotifications/package_deb.sh
+          ls -lh dist/*.deb
+          # Optional: do not treat intermediate dylib as product for this plugin.
+          # Keep dylib in dist for packaging verification only; release prefers .deb.
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: noads-dylibs
-          path: dist/*.dylib
+          path: |
+            dist/*.dylib
+            dist/*.deb
           if-no-files-found: error
 
       - name: Release
@@ -96,13 +107,19 @@ jobs:
             gh release create "$TAG" --title "$TITLE" --notes-file release-notes.md
           fi
           shopt -s nullglob
-          files=(dist/*.dylib)
+          files=(dist/*.dylib dist/*.deb)
           if [ ${#files[@]} -eq 0 ]; then
-            echo "No dylibs in dist/" >&2
+            echo "No release assets in dist/" >&2
             exit 1
           fi
           ls -lh dist/
           for f in "${files[@]}"; do
+            # Prefer shipping AllowNotifications as jailbreak .deb, not standalone dylib.
+            base="$(basename "$f")"
+            if [ "$base" = "AllowNotifications.dylib" ]; then
+              echo "Skip uploading intermediate $base (packaged into .deb)"
+              continue
+            fi
             echo "Uploading $f"
             gh release upload "$TAG" "$f" --clobber
           done

@@ -1,0 +1,13 @@
+Package: byg.iosios.net.ghallownotifications-rootless
+Name: Allow Notifications (Bootstrap/RootHide)
+Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 14.0)
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Auto-allow app notification permission prompts on Bootstrap/RootHide. Counterpart of GHAllowNetwork.
+Homepage: https://iosios.net/
+Maintainer: blueskycrb <local@localhost>
+Author: blueskycrb <local@localhost>
+Section: Tweaks
+Conflicts: byg.iosios.net.ghallownotifications, net.iosios.ghallownotifications-rootless
+Provides: byg.iosios.net.ghallownotifications-rootless
+Tag: role::enduser purpose::extension

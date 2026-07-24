@@ -1,10 +1,15 @@
 //
-// AllowNotifications.dylib — auto-allow notification permission (HiveNoAds apps build)
+// AllowNotifications — auto-allow notification permission
 //
-// Inject into target App (TrollFools). Automatically handles:
+// Delivered as Bootstrap/RootHide jailbreak tweak package:
+//   byg.iosios.net.ghallownotifications-rootless (iphoneos-arm64)
+// Install:
+//   /var/jb/Library/MobileSubstrate/DynamicLibraries/AllowNotifications.{dylib,plist}
+//
+// Automatically handles:
 //   "xxx 想给你发送通知" / Would Like to Send You Notifications
 //
-// Pure Objective-C runtime hooks (no Substrate/Logos), same style as other apps/*.
+// Pure Objective-C runtime hooks (no Substrate/Logos required at link time).
 //
 
 #import <Foundation/Foundation.h>
@@ -37,6 +42,7 @@ static BOOL ALNIsNotificationPromptText(NSString *text) {
         cn = @[
             @"想给你发送通知",
             @"想給你發送通知",
+            @"想给你传送通知",
             @"发送通知",
             @"發送通知",
             @"傳送通知",
@@ -100,6 +106,10 @@ static BOOL ALNIsDenyTitle(NSString *title) {
     return NO;
 }
 
+static NSString *ALNJoin(NSString *a, NSString *b) {
+    return [NSString stringWithFormat:@"%@\n%@", a ?: @"", b ?: @""];
+}
+
 #pragma mark - 1) Short-circuit authorization request
 
 static void (*orig_requestAuthorization)(id, SEL, NSUInteger, id) = NULL;
@@ -148,14 +158,17 @@ static BOOL patchInstanceIntGetter(Class cls, const char *selName) {
     IMP prev = method_getImplementation(m);
     if (prev == (IMP)aln_ret2) return YES;
     method_setImplementation(m, (IMP)aln_ret2);
-    ALNLog(@"patched %s -%s => 2", class_getName(cls), selName);
+    ALNLog(@"patched %s", selName);
     return YES;
 }
 
-static void installSettingsHooks(void) {
+static void patchNotificationSettings(void) {
     Class cls = objc_getClass("UNNotificationSettings");
-    if (!cls) return;
-
+    if (!cls) {
+        ALNLog(@"UNNotificationSettings missing");
+        return;
+    }
+    // UNAuthorizationStatusAuthorized = 2; UNNotificationSettingEnabled = 2
     const char *sels[] = {
         "authorizationStatus",
         "soundSetting",
@@ -163,6 +176,7 @@ static void installSettingsHooks(void) {
         "alertSetting",
         "notificationCenterSetting",
         "lockScreenSetting",
+        "carPlaySetting",
         "criticalAlertSetting",
         "announcementSetting",
         "scheduledDeliverySetting",
@@ -170,17 +184,17 @@ static void installSettingsHooks(void) {
         "directMessagesSetting",
         NULL
     };
-    for (int i = 0; sels[i]; i++) {
-        patchInstanceIntGetter(cls, sels[i]);
+    for (const char **p = sels; *p; p++) {
+        patchInstanceIntGetter(cls, *p);
     }
 }
 
-#pragma mark - 3) Auto-tap Allow on remaining alerts
+#pragma mark - 3) Fallback auto-tap alerts
 
-static void aln_autoTapAllow(UIAlertController *alert) {
+static void ALNAutoTapAllow(UIAlertController *alert) {
     if (![alert isKindOfClass:[UIAlertController class]]) return;
 
-    NSString *blob = [NSString stringWithFormat:@"%@\n%@", alert.title ?: @"", alert.message ?: @""];
+    NSString *blob = ALNJoin(alert.title, alert.message);
     if (!ALNIsNotificationPromptText(blob)) return;
 
     static const void *kFlag = &kFlag;
@@ -215,7 +229,6 @@ static void aln_autoTapAllow(UIAlertController *alert) {
             handler = nil;
         }
 
-        ALNLog(@"auto-tap allow: %@", actionToRun.title ?: @"?");
         [strongAlert dismissViewControllerAnimated:NO completion:^{
             if (handler) handler(actionToRun);
         }];
@@ -227,58 +240,151 @@ static void (*orig_viewDidAppear)(id, SEL, BOOL) = NULL;
 
 static void aln_viewWillAppear(id self, SEL cmd, BOOL animated) {
     if (orig_viewWillAppear) orig_viewWillAppear(self, cmd, animated);
+    else {
+        struct objc_super superInfo = { self, class_getSuperclass(object_getClass(self)) };
+        ((void (*)(struct objc_super *, SEL, BOOL))objc_msgSendSuper)(&superInfo, cmd, animated);
+    }
     if ([self isKindOfClass:[UIAlertController class]]) {
-        aln_autoTapAllow((UIAlertController *)self);
+        ALNAutoTapAllow((UIAlertController *)self);
     }
 }
 
 static void aln_viewDidAppear(id self, SEL cmd, BOOL animated) {
     if (orig_viewDidAppear) orig_viewDidAppear(self, cmd, animated);
+    else {
+        struct objc_super superInfo = { self, class_getSuperclass(object_getClass(self)) };
+        ((void (*)(struct objc_super *, SEL, BOOL))objc_msgSendSuper)(&superInfo, cmd, animated);
+    }
     if ([self isKindOfClass:[UIAlertController class]]) {
-        aln_autoTapAllow((UIAlertController *)self);
+        ALNAutoTapAllow((UIAlertController *)self);
     }
 }
 
-static BOOL hookInstance(Class cls, SEL sel, IMP neu, IMP *outOrig) {
-    if (!cls || !sel || !neu) return NO;
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return NO;
-    IMP prev = method_getImplementation(m);
-    if (prev == neu) return YES;
-    if (outOrig) *outOrig = prev;
-    method_setImplementation(m, neu);
+static BOOL installAlertControllerHooks(void) {
+    Class cls = objc_getClass("UIAlertController");
+    if (!cls) return NO;
+
+    Method m1 = class_getInstanceMethod(cls, @selector(viewWillAppear:));
+    Method m2 = class_getInstanceMethod(cls, @selector(viewDidAppear:));
+    if (m1) {
+        IMP prev = method_getImplementation(m1);
+        if (prev != (IMP)aln_viewWillAppear) {
+            orig_viewWillAppear = (void *)prev;
+            method_setImplementation(m1, (IMP)aln_viewWillAppear);
+        }
+    }
+    if (m2) {
+        IMP prev = method_getImplementation(m2);
+        if (prev != (IMP)aln_viewDidAppear) {
+            orig_viewDidAppear = (void *)prev;
+            method_setImplementation(m2, (IMP)aln_viewDidAppear);
+        }
+    }
     return YES;
 }
 
-static void installAlertHooks(void) {
-    Class cls = objc_getClass("UIAlertController");
-    if (!cls) return;
-    hookInstance(cls, @selector(viewWillAppear:), (IMP)aln_viewWillAppear, (IMP *)&orig_viewWillAppear);
-    hookInstance(cls, @selector(viewDidAppear:), (IMP)aln_viewDidAppear, (IMP *)&orig_viewDidAppear);
-    ALNLog(@"hooked UIAlertController appear");
+#pragma mark - 4) SpringBoard system user-notification alert (optional)
+
+static void ALNTryAcceptUserNotificationAlert(id selfObj) {
+    if (!selfObj) return;
+
+    NSString *header = nil;
+    NSString *message = nil;
+    @try { header = [selfObj valueForKey:@"alertHeader"]; } @catch (__unused NSException *e) {}
+    @try { if (!header) header = [selfObj valueForKey:@"title"]; } @catch (__unused NSException *e) {}
+    @try { message = [selfObj valueForKey:@"alertMessage"]; } @catch (__unused NSException *e) {}
+    @try { if (!message) message = [selfObj valueForKey:@"message"]; } @catch (__unused NSException *e) {}
+
+    NSString *blob = ALNJoin(header, message);
+    if (!ALNIsNotificationPromptText(blob)) return;
+
+    static const void *kSBFlag = &kSBFlag;
+    if (objc_getAssociatedObject(selfObj, kSBFlag)) return;
+    objc_setAssociatedObject(selfObj, kSBFlag, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    ALNLog(@"accept SBUserNotificationAlert: %@", blob);
+
+    // Prefer default/OK button activation paths used by SpringBoard alerts.
+    SEL candidates[] = {
+        sel_registerName("_defaultButtonPressed"),
+        sel_registerName("defaultButtonPressed"),
+        sel_registerName("_accept"),
+        sel_registerName("accept"),
+        sel_registerName("_buttonPressed:"),
+        NULL
+    };
+
+    __weak id weakSelf = selfObj;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        id strong = weakSelf;
+        if (!strong) return;
+        for (SEL *s = candidates; *s; s++) {
+            if ([strong respondsToSelector:*s]) {
+                @try {
+                    if (*s == sel_registerName("_buttonPressed:")) {
+                        ((void (*)(id, SEL, NSInteger))objc_msgSend)(strong, *s, 0);
+                    } else {
+                        ((void (*)(id, SEL))objc_msgSend)(strong, *s);
+                    }
+                    return;
+                } @catch (__unused NSException *ex) {
+                }
+            }
+        }
+    });
 }
 
-#pragma mark - Entry
+static void (*orig_sb_willActivate)(id, SEL) = NULL;
+static void (*orig_sb_didActivate)(id, SEL) = NULL;
 
-static void applyAll(const char *phase) {
-    BOOL a = installRequestAuthorizationHook();
-    installSettingsHooks();
-    installAlertHooks();
-    ALNLog(@"%s authHook=%d", phase, (int)a);
+static void aln_sb_willActivate(id self, SEL cmd) {
+    if (orig_sb_willActivate) orig_sb_willActivate(self, cmd);
+    ALNTryAcceptUserNotificationAlert(self);
 }
+
+static void aln_sb_didActivate(id self, SEL cmd) {
+    if (orig_sb_didActivate) orig_sb_didActivate(self, cmd);
+    ALNTryAcceptUserNotificationAlert(self);
+}
+
+static BOOL installSpringBoardAlertHooks(void) {
+    Class cls = objc_getClass("SBUserNotificationAlert");
+    if (!cls) {
+        ALNLog(@"SBUserNotificationAlert not present in this process");
+        return NO;
+    }
+
+    Method m1 = class_getInstanceMethod(cls, sel_registerName("willActivate"));
+    Method m2 = class_getInstanceMethod(cls, sel_registerName("didActivate"));
+    if (m1) {
+        IMP prev = method_getImplementation(m1);
+        if (prev != (IMP)aln_sb_willActivate) {
+            orig_sb_willActivate = (void *)prev;
+            method_setImplementation(m1, (IMP)aln_sb_willActivate);
+        }
+    }
+    if (m2) {
+        IMP prev = method_getImplementation(m2);
+        if (prev != (IMP)aln_sb_didActivate) {
+            orig_sb_didActivate = (void *)prev;
+            method_setImplementation(m2, (IMP)aln_sb_didActivate);
+        }
+    }
+    ALNLog(@"hooked SBUserNotificationAlert");
+    return YES;
+}
+
+#pragma mark - ctor
 
 __attribute__((constructor))
 static void AllowNotificationsInit(void) {
     @autoreleasepool {
-        applyAll("constructor");
-
-        dispatch_async(dispatch_get_main_queue(), ^{
-            applyAll("main");
-        });
-
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            applyAll("delayed");
-        });
+        NSString *bid = [NSBundle mainBundle].bundleIdentifier ?: @"?";
+        ALNLog(@"loaded in %@", bid);
+        installRequestAuthorizationHook();
+        patchNotificationSettings();
+        installAlertControllerHooks();
+        installSpringBoardAlertHooks();
     }
 }
