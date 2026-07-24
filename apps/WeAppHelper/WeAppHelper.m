@@ -346,14 +346,14 @@ static BOOL WAHOpenMiniProgram(NSString *userName, NSString *path) {
 }
 
 - (UISwitch *)wah_switch:(BOOL)on action:(SEL)action {
-    UISwitch *s = [[UISwitch alloc] initWithFrame:CGRectZero];
+    UISwitch *s = [[UISwitch alloc] init];
     s.on = on;
     [s addTarget:self action:action forControlEvents:UIControlEventValueChanged];
     return s;
 }
 
 - (UITextField *)wah_field:(NSString *)placeholder text:(NSString *)text {
-    UITextField *tf = [[UITextField alloc] initWithFrame:CGRectZero];
+    UITextField *tf = [[UITextField alloc] init];
     tf.placeholder = placeholder;
     tf.text = text;
     tf.autocapitalizationType = UITextAutocapitalizationTypeNone;

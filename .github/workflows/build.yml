@@ -52,6 +52,7 @@ jobs:
               min_ios="14.0"
             fi
             if [ "$app" = "WeAppHelper" ]; then
+              EXTRA_FW="-framework CoreGraphics"
               min_ios="14.0"
             fi
             # shellcheck disable=SC2086
@@ -128,3 +129,4 @@ jobs:
             gh release upload "$TAG" "$f" --clobber
           done
           gh release view "$TAG"
+
