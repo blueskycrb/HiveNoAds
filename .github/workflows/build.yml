@@ -47,6 +47,10 @@ jobs:
               # fallback save: Photos write + AVFoundation re-export + CoreGraphics
               EXTRA_FW="-framework Photos -framework AVFoundation -framework CoreGraphics -framework CoreMedia"
             fi
+            if [ "$app" = "AllowNotifications" ]; then
+              EXTRA_FW="-framework UserNotifications"
+              min_ios="14.0"
+            fi
             # shellcheck disable=SC2086
             clang -dynamiclib \
               -isysroot "$SDK" \
