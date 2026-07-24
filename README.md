@@ -21,7 +21,7 @@
 | **Xiaohongshu.dylib** | 小红书 | `com.xingin.discover` / `discover`（9.38.1） | **图片+视频保存解锁** |
 | **Douyin.dylib** | 抖音 | `com.ss.iphone.ugc.Aweme` / `Aweme`（38.7.0） | **视频/图片保存解锁** |
 | **AllowNotifications**（`.deb`） | **全局（Bootstrap/RootHide 越狱插件）** | Filter: `com.apple.UIKit` + `com.apple.springboard` | **自动允许通知权限弹窗**（对应 GHAllowNetwork） |
-| **WeAppHelper**（`.deb`） | **微信（Bootstrap/RootHide 越狱插件）** | Filter: `com.tencent.xin` | **小程序助手（防闪退重写，适配 8.0.71）** |
+| **WeAppHelper**（.deb / .dylib） | **微信** | Bundle: com.tencent.xin | **小程序助手（防闪退重写，8.0.71）**：RootHide deb 或 TrollFools dylib |
 
 
 ## 使用 (TrollFools)
@@ -105,7 +105,8 @@ apps/
 - 格式：**RootHide / Bootstrap**（`Architecture: iphoneos-arm64e`，路径无 `/var/jb`）
 - 安装：先卸载旧 WeAppTool → 安装 deb → respring
 - 入口：微信 → 我 → 设置 → 右上角「小程序」
-- 说明：这是**越狱插件**，不是 TrollFools dylib
+- 同时提供：WeAppHelper.dylib（TrollFools 注入微信）
+- 越狱 deb 与 TrollFools dylib **二选一**
 
 详见 `apps/WeAppHelper/README.md`。
 
