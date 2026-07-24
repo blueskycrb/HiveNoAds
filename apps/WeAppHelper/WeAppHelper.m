@@ -162,19 +162,7 @@ static id WAHGetService(Class serviceClass) {
                         if (svc) return svc;
                     }
                 }
-            }) {
-                if (!name) break;
-                SEL s = sel_registerName(name);
-                if ([MMContext respondsToSelector:s]) {
-                    id ctx = ((id(*)(id, SEL))objc_msgSend)(MMContext, s);
-                    SEL getService = sel_registerName("getService:");
-                    if (ctx && [ctx respondsToSelector:getService]) {
-                        id svc = ((id(*)(id, SEL, Class))objc_msgSend)(ctx, getService, serviceClass);
-                        if (svc) return svc;
-                    }
-                }
             }
-        }
 
         Class MSC = NSClassFromString(@"MMServiceCenter");
         if (MSC) {
