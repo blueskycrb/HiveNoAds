@@ -305,31 +305,31 @@ static void ALNTryAcceptUserNotificationAlert(id selfObj) {
     ALNLog(@"accept SBUserNotificationAlert: %@", blob);
 
     // Prefer default/OK button activation paths used by SpringBoard alerts.
-    SEL candidates[] = {
-        sel_registerName("_defaultButtonPressed"),
-        sel_registerName("defaultButtonPressed"),
-        sel_registerName("_accept"),
-        sel_registerName("accept"),
-        sel_registerName("_buttonPressed:"),
-        NULL
-    };
+    // Capture SELs as scalars so the block does not reference a stack array.
+    SEL selDefault1 = sel_registerName("_defaultButtonPressed");
+    SEL selDefault2 = sel_registerName("defaultButtonPressed");
+    SEL selAccept1 = sel_registerName("_accept");
+    SEL selAccept2 = sel_registerName("accept");
+    SEL selButton = sel_registerName("_buttonPressed:");
 
     __weak id weakSelf = selfObj;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         id strong = weakSelf;
         if (!strong) return;
-        for (SEL *s = candidates; *s; s++) {
-            if ([strong respondsToSelector:*s]) {
-                @try {
-                    if (*s == sel_registerName("_buttonPressed:")) {
-                        ((void (*)(id, SEL, NSInteger))objc_msgSend)(strong, *s, 0);
-                    } else {
-                        ((void (*)(id, SEL))objc_msgSend)(strong, *s);
-                    }
-                    return;
-                } @catch (__unused NSException *ex) {
+
+        SEL sels[5] = { selDefault1, selDefault2, selAccept1, selAccept2, selButton };
+        for (NSUInteger i = 0; i < 5; i++) {
+            SEL s = sels[i];
+            if (![strong respondsToSelector:s]) continue;
+            @try {
+                if (s == selButton) {
+                    ((void (*)(id, SEL, NSInteger))objc_msgSend)(strong, s, 0);
+                } else {
+                    ((void (*)(id, SEL))objc_msgSend)(strong, s);
                 }
+                return;
+            } @catch (__unused NSException *ex) {
             }
         }
     });
