@@ -1,9 +1,9 @@
 Package: com.blueskycrb.weapptool-rootless
-Name: WeApp Helper (Bootstrap/RootHide)
+Name: Mini Program Helper
 Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 14.0)
-Version: 1.0.0
+Version: 1.0.1
 Architecture: iphoneos-arm64e
-Description: Crash-safe WeChat mini program helper for Bootstrap/RootHide (iOS 16+ / WeChat 8.0.71+). Enables vConsole/debug and provides a settings entry. Does not hook MMServiceCenter/NewMainFrameViewController.
+Description: Mini Program Helper (crash-safe). Bootstrap/RootHide jailbreak tweak for iOS 16+ / WeChat 8.0.71+. Force vConsole/debug, open mini programs from Settings. Does not hook MMServiceCenter/NewMainFrameViewController.
 Maintainer: blueskycrb <blueskycrb@users.noreply.github.com>
 Author: blueskycrb <blueskycrb@users.noreply.github.com>
 Section: Tweaks

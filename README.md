@@ -21,7 +21,7 @@
 | **Xiaohongshu.dylib** | 小红书 | `com.xingin.discover` / `discover`（9.38.1） | **图片+视频保存解锁** |
 | **Douyin.dylib** | 抖音 | `com.ss.iphone.ugc.Aweme` / `Aweme`（38.7.0） | **视频/图片保存解锁** |
 | **AllowNotifications**（`.deb`） | **全局（Bootstrap/RootHide 越狱插件）** | Filter: `com.apple.UIKit` + `com.apple.springboard` | **自动允许通知权限弹窗**（对应 GHAllowNetwork） |
-| **WeAppHelper**（.deb / .dylib） | **微信** | Bundle: com.tencent.xin | **小程序助手（防闪退重写，8.0.71）**：RootHide deb 或 TrollFools dylib |
+| **Mini Program Helper**（WeAppHelper .deb/.dylib） | **WeChat** | Bundle: com.tencent.xin | **Mini Program Helper (crash-safe rewrite, 8.0.71)** |
 
 
 ## 使用 (TrollFools)
@@ -97,18 +97,18 @@ apps/
 
 详见 `apps/AllowNotifications/README.md`。
 
-## WeAppHelper（Bootstrap / RootHide 越狱插件）
+## Mini Program Helper（WeAppHelper）
 
-旧版「微信小程序助手」在微信 8.0.71 会闪退。本仓库提供防闪退重写版：
+Crash-safe rewrite of the old WeChat mini-program helper for WeChat 8.0.71:
 
-- 产物：`com.blueskycrb.weapptool-rootless_<ver>_iphoneos-arm64e.deb`
-- 格式：**RootHide / Bootstrap**（`Architecture: iphoneos-arm64e`，路径无 `/var/jb`）
-- 安装：先卸载旧 WeAppTool → 安装 deb → respring
-- 入口：微信 → 我 → 设置 → 右上角「小程序」
-- 同时提供：WeAppHelper.dylib（TrollFools 注入微信）
-- 越狱 deb 与 TrollFools dylib **二选一**
+- Artifact: `com.blueskycrb.weapptool-rootless_<ver>_iphoneos-arm64e.deb`
+- Format: **RootHide / Bootstrap** (`Architecture: iphoneos-arm64e`, no `/var/jb`)
+- Install: uninstall old WeAppTool first → install deb → respring
+- Entry: WeChat → Me → Settings → top-right **Helper**
+- Also ships: `WeAppHelper.dylib` (TrollFools inject into WeChat)
+- Use either the jailbreak deb or the TrollFools dylib
 
-详见 `apps/WeAppHelper/README.md`。
+See `apps/WeAppHelper/README.md`.
 
 ## 小红书 `Xiaohongshu.dylib`（解锁保存别人帖子图片 / 视频）
 

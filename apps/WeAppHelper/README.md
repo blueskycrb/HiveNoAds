@@ -1,71 +1,37 @@
-﻿# WeApp Helper（Bootstrap / RootHide 越狱插件）
+# Mini Program Helper (Bootstrap / RootHide + TrollFools)
 
-针对旧版 **微信小程序助手**（`com.25mao.weapptool`）在 **iOS 16.5.1 + 微信 8.0.71** 闪退的问题重写。
+Display name: **Mini Program Helper**  
+Technical name: `WeAppHelper` (ASCII artifact names for GitHub releases)
 
-## 旧插件为什么闪退
+Crash-safe rewrite of the old WeChat mini-program helper for **iOS 16.5.1 + WeChat 8.0.71**.
 
-1. 全局 hook `MMServiceCenter defaultCenter`（微信 8.0.x 服务体系已变）
-2. 启动即 hook `NewMainFrameViewController viewDidLoad`
-3. 依赖过时私有 UI / WCPlugins 接口
-4. Debug MonkeyDev 构建 + Dopamine `/var/jb` 包格式（不适合 Bootstrap）
+## Artifacts
 
-## 本插件策略
+| Type | File | Use |
+|------|------|-----|
+| Jailbreak deb | `com.blueskycrb.weapptool-rootless_<ver>_iphoneos-arm64e.deb` | Bootstrap/RootHide; Sileo shows **Mini Program Helper** |
+| dylib | `WeAppHelper.dylib` | Inject into WeChat with TrollFools |
 
-- **不 hook** `MMServiceCenter` / `NewMainFrameViewController`
-- 每个 hook 前检查 class / selector 是否存在
-- 设置页用 **原生 UIKit**（不依赖 `WCTableViewManager`）
-- 服务查找优先 `MMContext`，失败再回退 `MMServiceCenter`
-- 私有 API 调用包在 `@try/@catch` 中
+Use either the deb or the dylib, not both.
 
-## 功能
+## Install
 
-| 功能 | 说明 |
-|------|------|
-| 强制调试 / vConsole | hook `WAWebViewController isOpenDebugAndVConsole` |
-| 设置入口 | 微信「我 → 设置」导航栏右侧「小程序」按钮 |
-| 打开小程序 | 设置页输入 userName / path |
-| jumpWxa 改写 | 可选：自定义 AppId 改写跳转链接 |
+### Jailbreak deb
+1. Uninstall old WeAppTool / 25mao packages
+2. Install the deb → respring
+3. WeChat → Me → Settings → top-right **Helper**
 
-## Bootstrap / RootHide 格式
+### TrollFools dylib
+1. Inject `WeAppHelper.dylib` into WeChat
+2. Force-quit WeChat and reopen
+3. WeChat → Me → Settings → top-right **Helper**
 
-| 字段 | 值 |
-|------|----|
-| Package | `com.blueskycrb.weapptool-rootless` |
-| Architecture | `iphoneos-arm64e` |
-| 路径 | `/Library/MobileSubstrate/DynamicLibraries/WeAppHelper.{dylib,plist}` |
-| Filter | `com.tencent.xin` |
-| Conflicts | `com.25mao.weapptool.rootless` 等旧包 |
+## Features
+- Force debug / vConsole
+- Open a mini program from Settings
+- Optional jumpWxa AppId rewrite
 
-## 安装
-
-1. **先卸载** 旧的「微信小程序助手 / WeAppTool」并 respring  
-2. Sileo / Filza 安装  
-   `com.blueskycrb.weapptool-rootless_<ver>_iphoneos-arm64e.deb`  
-3. respring  
-4. 打开微信 → 我 → 设置 → 右上角「小程序」
-
-## 构建产物
-
-```text
-dist/com.blueskycrb.weapptool-rootless_<ver>_iphoneos-arm64e.deb
-```
-
-## 源码
-
-- `WeAppHelper.m`
-- `control` / `WeAppHelper.plist` / `package_deb.sh`
-
-## TrollFools dylib
-
-也提供可注入微信的独立 dylib（无需越狱 deb）：
-
-`	ext
-dist/WeAppHelper.dylib
-`
-
-1. 下载 WeAppHelper.dylib
-2. TrollFools → 选择 **微信** → 注入
-3. 彻底划掉微信后重开
-4. 微信 → 我 → 设置 → 右上角「小程序」
-
-> 与越狱 deb 二选一即可，不要重复注入/安装。
+## Package
+- Package: `com.blueskycrb.weapptool-rootless`
+- Name: **Mini Program Helper**
+- Architecture: `iphoneos-arm64e`

@@ -99,4 +99,4 @@
 - 取消 UIView 全局 swizzle
 - 默认关闭日志
 
-- WeAppHelper: crash-safe WeChat mini program helper deb (Bootstrap/RootHide, WeChat 8.0.71)
+- Mini Program Helper (WeAppHelper): crash-safe helper deb + dylib (Bootstrap/RootHide / TrollFools, WeChat 8.0.71)

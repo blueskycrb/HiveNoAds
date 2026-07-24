@@ -8,7 +8,7 @@
 // Target environment (verified design goals):
 //   iOS 16.5.1 + WeChat 8.0.71
 //
-// Why the old "微信小程序助手" (com.25mao.weapptool) crashes:
+// Why the old Chinese WeChat mini-program helper (com.25mao.weapptool) crashes:
 //   1) Hooks MMServiceCenter defaultCenter globally
 //   2) Hooks NewMainFrameViewController viewDidLoad at launch
 //   3) Relies on old private table/plugin APIs
@@ -235,7 +235,7 @@ static BOOL WAHOpenMiniProgram(NSString *userName, NSString *path) {
     @try {
         Class Param = NSClassFromString(@"WAAppOpenParameter");
         if (!Param) {
-            WAHToast(@"当前微信缺少 WAAppOpenParameter");
+            WAHToast(@"Current WeChat is missing WAAppOpenParameter");
             return NO;
         }
 
@@ -278,14 +278,14 @@ static BOOL WAHOpenMiniProgram(NSString *userName, NSString *path) {
         Class Loader = NSClassFromString(@"WAAppContactPreLoader");
         id loader = WAHGetService(Loader);
         if (!loader) {
-            WAHToast(@"无法获取 WAAppContactPreLoader");
+            WAHToast(@"Unable to get WAAppContactPreLoader");
             return NO;
         }
 
         SEL open4 = sel_registerName("openApp:taskExtInfo:onSuccess:onFailed:");
         if ([loader respondsToSelector:open4]) {
-            void (^ok)(void) = ^{ WAHToast(@"已打开小程序"); };
-            void (^fail)(void) = ^{ WAHToast(@"打开小程序失败"); };
+            void (^ok)(void) = ^{ WAHToast(@"Mini program opened"); };
+            void (^fail)(void) = ^{ WAHToast(@"Failed to open mini program"); };
             ((void(*)(id, SEL, id, id, id, id))objc_msgSend)(loader, open4, param, nil, ok, fail);
             return YES;
         }
@@ -296,11 +296,11 @@ static BOOL WAHOpenMiniProgram(NSString *userName, NSString *path) {
             return YES;
         }
 
-        WAHToast(@"当前微信 openApp API 不兼容");
+        WAHToast(@"Current WeChat openApp API is incompatible");
         return NO;
     } @catch (NSException *e) {
         WAHLog("open exception: %@", e);
-        WAHToast(@"打开小程序异常");
+        WAHToast(@"Exception while opening mini program");
         return NO;
     }
 }
@@ -323,7 +323,7 @@ static BOOL WAHOpenMiniProgram(NSString *userName, NSString *path) {
 - (instancetype)init {
     self = [super initWithStyle:UITableViewStyleInsetGrouped];
     if (self) {
-        self.title = @"小程序助手";
+        self.title = @"Mini Program Helper";
     }
     return self;
 }
@@ -331,7 +331,7 @@ static BOOL WAHOpenMiniProgram(NSString *userName, NSString *path) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.navigationItem.rightBarButtonItem =
-        [[UIBarButtonItem alloc] initWithTitle:@"完成"
+        [[UIBarButtonItem alloc] initWithTitle:@"Done"
                                          style:UIBarButtonItemStyleDone
                                         target:self
                                         action:@selector(wah_close)];
@@ -377,22 +377,22 @@ static BOOL WAHOpenMiniProgram(NSString *userName, NSString *path) {
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    if (section == 0) return @"总开关";
-    if (section == 1) return @"功能";
-    if (section == 2) return @"自定义 AppId（跳转改写）";
-    if (section == 3) return @"打开小程序";
+    if (section == 0) return @"Master Switch";
+    if (section == 1) return @"Features";
+    if (section == 2) return @"Custom AppId (jump rewrite)";
+    if (section == 3) return @"Open Mini Program";
     return nil;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (section == 0) {
-        return @"兼容 iOS 16.5.1 / 微信 8.0.71。已移除旧版会闪退的 MMServiceCenter 与主界面 hook。";
+        return @"Compatible with iOS 16.5.1 / WeChat 8.0.71. Removed crashy MMServiceCenter and main UI hooks.";
     }
     if (section == 1) {
-        return @"开启调试后，小程序内可使用 vConsole。";
+        return @"When enabled, mini programs can use vConsole.";
     }
     if (section == 3) {
-        return @"userName 一般为 gh_ 开头原始 ID；path 可留空。";
+        return @"userName is usually the original ID starting with gh_; path is optional.";
     }
     return nil;
 }
@@ -415,7 +415,7 @@ static BOOL WAHOpenMiniProgram(NSString *userName, NSString *path) {
     }
 
     if (indexPath.section == 0) {
-        cell.textLabel.text = @"启用小程序助手";
+        cell.textLabel.text = @"Enable Mini Program Helper";
         if (!_enabledSwitch) _enabledSwitch = [self wah_switch:WAHPluginEnabled() action:@selector(onEnabled:)];
         _enabledSwitch.on = WAHPluginEnabled();
         cell.accessoryView = _enabledSwitch;
@@ -424,17 +424,17 @@ static BOOL WAHOpenMiniProgram(NSString *userName, NSString *path) {
 
     if (indexPath.section == 1) {
         if (indexPath.row == 0) {
-            cell.textLabel.text = @"强制开启调试 / vConsole";
+            cell.textLabel.text = @"Force debug / vConsole";
             if (!_debugSwitch) _debugSwitch = [self wah_switch:WAHBool(kWAHDebugKey, YES) action:@selector(onDebug:)];
             _debugSwitch.on = WAHBool(kWAHDebugKey, YES);
             cell.accessoryView = _debugSwitch;
         } else if (indexPath.row == 1) {
-            cell.textLabel.text = @"增强 jumpWxa 跳转";
+            cell.textLabel.text = @"Enhance jumpWxa navigation";
             if (!_jumpSwitch) _jumpSwitch = [self wah_switch:WAHBool(kWAHJumpKey, YES) action:@selector(onJump:)];
             _jumpSwitch.on = WAHBool(kWAHJumpKey, YES);
             cell.accessoryView = _jumpSwitch;
         } else {
-            cell.textLabel.text = @"自定义 AppId 改写";
+            cell.textLabel.text = @"Custom AppId rewrite";
             if (!_customSwitch) _customSwitch = [self wah_switch:WAHBool(kWAHCustomKey, NO) action:@selector(onCustom:)];
             _customSwitch.on = WAHBool(kWAHCustomKey, NO);
             cell.accessoryView = _customSwitch;
@@ -443,7 +443,7 @@ static BOOL WAHOpenMiniProgram(NSString *userName, NSString *path) {
     }
 
     if (indexPath.section == 2) {
-        if (!_customField) _customField = [self wah_field:@"wx 开头的 appid" text:WAHString(kWAHCustomID)];
+        if (!_customField) _customField = [self wah_field:@"AppId starting with wx" text:WAHString(kWAHCustomID)];
         _customField.frame = CGRectMake(16, 0, tableView.bounds.size.width - 64, 44);
         _customField.autoresizingMask = UIViewAutoresizingFlexibleWidth;
         [cell.contentView addSubview:_customField];
@@ -452,17 +452,17 @@ static BOOL WAHOpenMiniProgram(NSString *userName, NSString *path) {
 
     if (indexPath.section == 3) {
         if (indexPath.row == 0) {
-            if (!_userNameField) _userNameField = [self wah_field:@"小程序 userName (gh_...)" text:@""];
+            if (!_userNameField) _userNameField = [self wah_field:@"Mini program userName (gh_...)" text:@""];
             _userNameField.frame = CGRectMake(16, 0, tableView.bounds.size.width - 64, 44);
             _userNameField.autoresizingMask = UIViewAutoresizingFlexibleWidth;
             [cell.contentView addSubview:_userNameField];
         } else if (indexPath.row == 1) {
-            if (!_pathField) _pathField = [self wah_field:@"页面 path（可选）" text:@""];
+            if (!_pathField) _pathField = [self wah_field:@"Page path (optional)" text:@""];
             _pathField.frame = CGRectMake(16, 0, tableView.bounds.size.width - 64, 44);
             _pathField.autoresizingMask = UIViewAutoresizingFlexibleWidth;
             [cell.contentView addSubview:_pathField];
         } else {
-            cell.textLabel.text = @"立即打开";
+            cell.textLabel.text = @"Open Now";
             cell.textLabel.textAlignment = NSTextAlignmentCenter;
             cell.textLabel.textColor = [UIColor systemBlueColor];
             cell.selectionStyle = UITableViewCellSelectionStyleDefault;
@@ -479,7 +479,7 @@ static BOOL WAHOpenMiniProgram(NSString *userName, NSString *path) {
         NSString *user = [_userNameField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         NSString *path = [_pathField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if (user.length == 0) {
-            WAHToast(@"请输入 userName");
+            WAHToast(@"Please enter userName");
             return;
         }
         WAHOpenMiniProgram(user, path);
@@ -560,7 +560,7 @@ static void WAH_repl_setting_viewDidAppear(id self, SEL _cmd, BOOL animated) {
         target.host = vc;
         objc_setAssociatedObject(vc, &kWAHBarTargetKey, target, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-        UIBarButtonItem *btn = [[UIBarButtonItem alloc] initWithTitle:@"小程序"
+        UIBarButtonItem *btn = [[UIBarButtonItem alloc] initWithTitle:@"Helper"
                                                                 style:UIBarButtonItemStylePlain
                                                                target:target
                                                                action:@selector(open)];
@@ -594,7 +594,7 @@ static void WAHTryRegisterPlugin(void) {
         if (!mgr) return;
         SEL reg = sel_registerName("registerControllerWithTitle:version:controller:");
         if (![mgr respondsToSelector:reg]) return;
-        ((void(*)(id, SEL, id, id, id))objc_msgSend)(mgr, reg, @"小程序助手", @"1.0.0", @"WAHSettingViewController");
+        ((void(*)(id, SEL, id, id, id))objc_msgSend)(mgr, reg, @"Mini Program Helper", @"1.0.1", @"WAHSettingViewController");
     } @catch (__unused NSException *e) {}
 }
 
