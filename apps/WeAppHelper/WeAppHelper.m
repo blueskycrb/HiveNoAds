@@ -151,7 +151,18 @@ static id WAHGetService(Class serviceClass) {
                 }
             }
             // Some builds use +activeUserContext / +mainContext
-            for (const char *name in (const char *[]){"activeUserContext", "mainContext", "sharedContext", NULL}) {
+            const char *ctxSels[] = {"activeUserContext", "mainContext", "sharedContext"};
+            for (size_t si = 0; si < sizeof(ctxSels) / sizeof(ctxSels[0]); si++) {
+                SEL s = sel_registerName(ctxSels[si]);
+                if ([MMContext respondsToSelector:s]) {
+                    id ctx = ((id(*)(id, SEL))objc_msgSend)(MMContext, s);
+                    SEL getService = sel_registerName("getService:");
+                    if (ctx && [ctx respondsToSelector:getService]) {
+                        id svc = ((id(*)(id, SEL, Class))objc_msgSend)(ctx, getService, serviceClass);
+                        if (svc) return svc;
+                    }
+                }
+            }) {
                 if (!name) break;
                 SEL s = sel_registerName(name);
                 if ([MMContext respondsToSelector:s]) {
