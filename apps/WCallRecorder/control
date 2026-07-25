@@ -1,0 +1,9 @@
+Package: com.blueskycrb.wcallrecorder-rootless
+Name: WCallRecorder (Free)
+Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 14.0)
+Version: 0.3.0
+Architecture: iphoneos-arm64e
+Description: Free WeChat 8.0.71 VoIP/MultiTalk call recorder rewrite for Bootstrap/RootHide. No license server. Dual-track WAV to Documents/WCallRecorder.
+Maintainer: blueskycrb
+Author: blueskycrb
+Section: Tweaks
