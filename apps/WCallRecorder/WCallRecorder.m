@@ -54,6 +54,9 @@ static NSString * const kWCRPluginVersion = @"0.3.0";
 
 static void WCRShowToast(NSString *text);
 static void WCRUpdateIndicator(BOOL on);
+static void WCRInstallLifecycle(void);
+static void WCRInstallManualAudioHooks(void);
+static void WCRAutoScanAudioHooks(void);
 
 // Optional manual audio hooks after Frida recon for your WeChat build:
 // @[@"ClassName", @"selector:name:", @"mic"|"remote"]
@@ -650,6 +653,7 @@ static void WCRUpdateIndicator(BOOL on) {
 
 static void WCRAutoScanAudioHooks(void);
 static void WCRInstallLifecycle(void);
+static void WCRInstallManualAudioHooks(void);
 
 static void WCROnCallMaybeStarted(void) {
     // VoIP dylibs/classes often appear only after first call entry on 8.0.71.
