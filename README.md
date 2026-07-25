@@ -18,6 +18,7 @@
 | **Zhiyuanhui.dylib** | 志愿汇 | `Volunteer`（分析版本 5.8.4） | 去广告 |
 | **ChinaMobileCloud.dylib** | 中国移动云盘 | `com.chinamobile.mcloud` / `mCloud_iPhone`（3.0.0） | 去广告 |
 | **ChinaRadio.dylib** | 中国广播 | `com.cbn.app` / `ChinaRadio`（1.0.8） | 去广告 |
+| **QQMusic.dylib** | QQ音乐 | `com.tencent.QQMusic` / `QQMusic`（20.6.0） | 去广告 |
 | **Xiaohongshu.dylib** | 小红书 | `com.xingin.discover` / `discover`（9.38.1） | **图片+视频保存解锁** |
 | **Douyin.dylib** | 抖音 | `com.ss.iphone.ugc.Aweme` / `Aweme`（38.7.0） | **视频/图片保存解锁** |
 | **AllowNotifications**（`.deb`） | **全局（Bootstrap/RootHide 越狱插件）** | Filter: `com.apple.UIKit` + `com.apple.springboard` | **自动允许通知权限弹窗**（对应 GHAllowNetwork） |
@@ -66,6 +67,8 @@ apps/
     ChinaMobileCloud.m   → ChinaMobileCloud.dylib（中国移动云盘）
   ChinaRadio/
     ChinaRadio.m         → ChinaRadio.dylib（中国广播）
+  QQMusic/
+    QQMusic.m            → QQMusic.dylib（QQ音乐）
   Xiaohongshu/
     Xiaohongshu.m        → Xiaohongshu.dylib（小红书图片/视频保存）
   Douyin/

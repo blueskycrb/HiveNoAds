@@ -1,3 +1,13 @@
+## QQMusic.dylib v1
+
+- QQ音乐 (`com.tencent.QQMusic` 20.6.0) 去广告
+- 定点 hook：`QMTMEAdSplash` / `QMGDTSplash` 开屏、`FlashWindow` 热启动闪屏
+- Banner / 挂件 / 腰封 / 歌前贴片 / 激励视频 / TME+GDT SDK 入口
+- present 拦截广告 VC；折叠 Belt/SongFront/Banner 等广告 View
+- v4 安全：本类 method list only、void/BOOL/id 签名校验、主线程延迟补 hook、前台再补
+- 默认拦激励视频；源码 `kKeepReward=YES` 可保留看广告领免费听的 load
+- 使用：TrollFools 注入 `QQMusic.dylib` → 彻底杀进程冷启动
+
 ## AllowNotifications 越狱插件（Bootstrap / RootHide）
 
 - 包名：`com.blueskycrb.allownotifications-rootless`
@@ -7,6 +17,7 @@
 - 路径：`/Library/MobileSubstrate/DynamicLibraries/AllowNotifications.{dylib,plist} (RootHide jbroot, no /var/jb)`
 
 ---
+
 ## Douyin.dylib v1.7
 
 - **严格当前条**：全窗口只锁一个居中 feed cell + 与之重叠的播放器（不再合并多 VC / 多列表）
@@ -66,6 +77,7 @@
 | `Zhiyuanhui.dylib` | 志愿汇 (`Volunteer` 5.8.4) | 去广告 |
 | `ChinaMobileCloud.dylib` | 中国移动云盘 (`com.chinamobile.mcloud` / `mCloud_iPhone`) | 去广告 |
 | `ChinaRadio.dylib` | 中国广播 (`com.cbn.app` / `ChinaRadio`) | 去广告 |
+| `QQMusic.dylib` | QQ音乐 (`com.tencent.QQMusic` / `QQMusic`) | 去广告 |
 | **`Xiaohongshu.dylib`** | **小红书** (`com.xingin.discover` / `discover`) | **解锁保存别人帖子图片/视频** |
 | **`Douyin.dylib`** | **抖音** (`com.ss.iphone.ugc.Aweme` / `Aweme` 38.7.0) | **解锁保存视频/图片** |
 
