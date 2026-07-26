@@ -1,4 +1,4 @@
-﻿name: Build ad-block dylibs
+name: Build ad-block dylibs
 
 on:
   push:
@@ -55,6 +55,17 @@ jobs:
               EXTRA_FW="-framework CoreGraphics"
               min_ios="14.0"
             fi
+            EXTRA_SRC=""
+            EXTRA_INC=""
+            if [ "$app" = "WCallRecorder" ]; then
+              # AVAudioPlayer playback + Shine MP3 encode helpers
+              EXTRA_FW="-framework AVFoundation -framework AudioToolbox"
+              EXTRA_INC="-Iapps/WCallRecorder/third_party/shine"
+              if compgen -G "apps/WCallRecorder/third_party/shine/*.c" > /dev/null; then
+                EXTRA_SRC=$(ls apps/WCallRecorder/third_party/shine/*.c)
+              fi
+              min_ios="14.0"
+            fi
             # shellcheck disable=SC2086
             clang -dynamiclib \
               -isysroot "$SDK" \
@@ -67,9 +78,11 @@ jobs:
               -framework Foundation \
               -framework UIKit \
               $EXTRA_FW \
+              $EXTRA_INC \
               -install_name "@rpath/${app}.dylib" \
               -o "$out" \
-              "$src"
+              "$src" \
+              $EXTRA_SRC
             codesign -f -s - "$out" 2>/dev/null || true
             file "$out"
             ls -lh "$out"

@@ -1,17 +1,20 @@
 //
 // WCallRecorder - free rewrite for HiveNoAds (no license / no auth)
 // Target: WeChat 8.0.71 + Bootstrap/RootHide / TrollFools
-// Pure ObjC runtime hooks, no license/auth. v0.4.1
+// Pure ObjC runtime hooks, no license/auth. v0.5.0
+// Features: remark filename, MP3 export (Shine), playback UI, hangup auto-stop
 //
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <string.h>
 #import <math.h>
 #import <stdatomic.h>
 #import <ctype.h>
+#include "layer3.h"
 
 #pragma mark - Config
 
@@ -26,7 +29,7 @@ static NSString * const kWCRPrivateKey    = @"WCR.PrivateMode";
 static NSString * const kWCRSampleRateKey = @"WCR.SampleRate";
 static NSString * const kWCRWriteMixedKey = @"WCR.WriteMixed";
 static NSString * const kWCRVerboseKey    = @"WCR.Verbose";
-static NSString * const kWCRPluginVersion = @"0.4.1";
+static NSString * const kWCRPluginVersion = @"0.5.0";
 
 static void WCRShowToast(NSString *text);
 static void WCRUpdateIndicator(BOOL on);
@@ -240,15 +243,72 @@ static NSString *WCRSanitizeName(NSString *name) {
         if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
             (c >= '0' && c <= '9') || c == '-' || c == '_') {
             [out appendFormat:@"%C", c];
+        } else if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            [out appendString:@"_"];
+        } else if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
+                   c == '"' || c == '<' || c == '>' || c == '|' || c == '.') {
+            [out appendString:@"_"];
         } else if (c > 127) {
-            [out appendFormat:@"u%04x", c];
+            // Keep CJK / unicode so remark names stay readable.
+            [out appendFormat:@"%C", c];
         } else {
             [out appendString:@"_"];
         }
     }
+    while ([out rangeOfString:@"__"].location != NSNotFound) {
+        [out replaceOccurrencesOfString:@"__" withString:@"_" options:0 range:NSMakeRange(0, out.length)];
+    }
+    while (out.length && [out characterAtIndex:0] == '_') [out deleteCharactersInRange:NSMakeRange(0, 1)];
+    while (out.length && [out characterAtIndex:out.length - 1] == '_') [out deleteCharactersInRange:NSMakeRange(out.length - 1, 1)];
     if (out.length == 0) return @"unknown";
-    if (out.length > 48) return [out substringToIndex:48];
+    if (out.length > 64) return [out substringToIndex:64];
     return out;
+}
+
+static id WCRServiceOfClass(NSString *className) {
+    if (className.length == 0) return nil;
+    Class centerCls = NSClassFromString(@"MMServiceCenter");
+    if (!centerCls) return nil;
+    @try {
+        id center = ((id(*)(id, SEL))objc_msgSend)(centerCls, NSSelectorFromString(@"defaultCenter"));
+        if (!center) return nil;
+        Class svcCls = NSClassFromString(className);
+        if (!svcCls) return nil;
+        SEL getSvc = NSSelectorFromString(@"getService:");
+        if (![center respondsToSelector:getSvc]) return nil;
+        return ((id(*)(id, SEL, Class))objc_msgSend)(center, getSvc, svcCls);
+    } @catch (__unused NSException *e) {
+        return nil;
+    }
+}
+
+static NSString *WCRContactDisplayNameFromContact(id contact) {
+    if (!contact) return nil;
+    // Prefer remark (user note) over nick / wxid.
+    NSString *remark = WCRPropString(contact, @[@"m_nsRemark", @"m_nsRemarkName", @"remark", @"remarkName"]);
+    if (remark.length) return remark;
+    NSString *nick = WCRPropString(contact, @[@"m_nsNickName", @"nickName", @"nickname", @"displayName", @"m_nsFullName"]);
+    if (nick.length) return nick;
+    NSString *usr = WCRPropString(contact, @[@"m_nsUsrName", @"userName", @"username"]);
+    return usr;
+}
+
+static NSString *WCRResolveRemarkName(NSString *hintOrWxid) {
+    if (hintOrWxid.length == 0) return nil;
+    id mgr = WCRServiceOfClass(@"CContactMgr");
+    if (mgr) {
+        NSArray *sels = @[@"getContactByName:", @"getContactByUserName:", @"contactForUserName:"];
+        for (NSString *selName in sels) {
+            @try {
+                SEL sel = NSSelectorFromString(selName);
+                if (![mgr respondsToSelector:sel]) continue;
+                id contact = ((id(*)(id, SEL, id))objc_msgSend)(mgr, sel, hintOrWxid);
+                NSString *name = WCRContactDisplayNameFromContact(contact);
+                if (name.length) return name;
+            } @catch (__unused NSException *e) {}
+        }
+    }
+    return hintOrWxid;
 }
 
 static NSString *WCRPropString(id obj, NSArray<NSString *> *names) {
@@ -280,8 +340,12 @@ static NSString *WCRContactHintFromObject(id obj) {
         if (parts.count) return [parts componentsJoinedByString:@"_"];
         return @"multitalk";
     }
+    NSString *remark = WCRPropString(obj, @[
+        @"m_nsRemark", @"m_nsRemarkName", @"remark", @"remarkName"
+    ]);
+    if (remark.length) return remark;
     NSString *nick = WCRPropString(obj, @[
-        @"m_nsNickName", @"m_nsRemark", @"m_nsUsrName", @"userName",
+        @"m_nsNickName", @"m_nsUsrName", @"userName",
         @"displayName", @"nickname", @"nickName", @"m_nsFullName",
         @"mMultiTalkGroupId", @"groupChatroom", @"m_chatRoomName",
         @"m_roomContact", @"contact", @"remoteContact"
@@ -356,6 +420,8 @@ static NSInteger WCRAudioHookCount(void) {
     for (NSString *key in WCRHookedKeys()) {
         NSString *low = key.lowercaseString;
         if ([low containsString:@"startrecord"] || [low containsString:@"stopforvoip"] ||
+            [low containsString:@"stoprecord"] || [low containsString:@"hangup"] ||
+            [low containsString:@"endcall"] || [low containsString:@"cancelcall"] ||
             [low containsString:@"onenter"] || [low containsString:@"oninvite"] ||
             [low containsString:@"openaudio"] || [low containsString:@"openvideo"] ||
             [low containsString:@"ilinkopen"] || [low containsString:@"createmulti"] ||
@@ -483,6 +549,183 @@ static BOOL WCRWriteMixedPCM16Files(NSString *micPath, NSString *remotePath, NSS
     return YES;
 }
 
+static NSData *WCRReadPCM16Body(NSString *wavPath, double *outSR) {
+    NSData *wav = [NSData dataWithContentsOfFile:wavPath];
+    if (wav.length <= 44) return nil;
+    const uint8_t *b = (const uint8_t *)wav.bytes;
+    if (outSR) {
+        uint32_t sr = 0;
+        memcpy(&sr, b + 24, 4);
+        if (sr >= 8000 && sr <= 48000) *outSR = (double)sr;
+    }
+    NSUInteger body = (wav.length - 44) & ~(NSUInteger)1;
+    if (body == 0) return nil;
+    return [NSData dataWithBytes:b + 44 length:body];
+}
+
+static NSData *WCRMixPCM16Bodies(NSData *mic, NSData *remote) {
+    NSUInteger mLen = mic.length & ~(NSUInteger)1;
+    NSUInteger rLen = remote.length & ~(NSUInteger)1;
+    NSUInteger outLen = MAX(mLen, rLen);
+    if (outLen == 0) return nil;
+    NSMutableData *pcm = [NSMutableData dataWithLength:outLen];
+    int16_t *o = (int16_t *)pcm.mutableBytes;
+    const int16_t *ms = (const int16_t *)(mLen ? mic.bytes : NULL);
+    const int16_t *rs = (const int16_t *)(rLen ? remote.bytes : NULL);
+    NSUInteger mSamples = mLen / 2;
+    NSUInteger rSamples = rLen / 2;
+    NSUInteger samples = outLen / 2;
+    for (NSUInteger i = 0; i < samples; i++) {
+        int32_t a = (i < mSamples && ms) ? ms[i] : 0;
+        int32_t b = (i < rSamples && rs) ? rs[i] : 0;
+        int32_t s = a + b;
+        if (s > 32767) s = 32767;
+        if (s < -32768) s = -32768;
+        o[i] = (int16_t)s;
+    }
+    return pcm;
+}
+
+static int WCRPickShineSampleRate(double sr) {
+    static const int table[] = {8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000};
+    int best = 16000;
+    double bestDiff = 1e18;
+    for (size_t i = 0; i < sizeof(table)/sizeof(table[0]); i++) {
+        double d = fabs((double)table[i] - sr);
+        if (d < bestDiff) { bestDiff = d; best = table[i]; }
+    }
+    return best;
+}
+
+static int WCRPickShineBitrate(int sampleRate) {
+    static const int cands[] = {32, 40, 48, 24, 16, 64, 56, 8};
+    for (size_t i = 0; i < sizeof(cands)/sizeof(cands[0]); i++) {
+        if (shine_check_config(sampleRate, cands[i]) >= 0) return cands[i];
+    }
+    return 32;
+}
+
+static BOOL WCREncodePCM16ToMP3(NSData *pcm, double sampleRate, NSString *outPath) {
+    if (pcm.length < 2 || outPath.length == 0) return NO;
+    int sr = WCRPickShineSampleRate(sampleRate > 0 ? sampleRate : 16000.0);
+    int bitr = WCRPickShineBitrate(sr);
+    if (shine_check_config(sr, bitr) < 0) {
+        WCRInfo("shine config unsupported sr=%d br=%d", sr, bitr);
+        return NO;
+    }
+    shine_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.wave.channels = PCM_MONO;
+    cfg.wave.samplerate = sr;
+    shine_set_config_mpeg_defaults(&cfg.mpeg);
+    cfg.mpeg.mode = MONO;
+    cfg.mpeg.bitr = bitr;
+    cfg.mpeg.emph = NONE;
+    cfg.mpeg.copyright = 0;
+    cfg.mpeg.original = 1;
+    shine_t s = shine_initialise(&cfg);
+    if (!s) {
+        WCRInfo("shine_initialise failed");
+        return NO;
+    }
+    int samplesPerPass = shine_samples_per_pass(s);
+    if (samplesPerPass <= 0 || samplesPerPass > SHINE_MAX_SAMPLES) {
+        shine_close(s);
+        return NO;
+    }
+    NSString *dir = [outPath stringByDeletingLastPathComponent];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:outPath]) {
+        [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
+    }
+    if (![[NSFileManager defaultManager] createFileAtPath:outPath contents:nil attributes:nil]) {
+        shine_close(s);
+        return NO;
+    }
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:outPath];
+    if (!fh) {
+        shine_close(s);
+        return NO;
+    }
+    const int16_t *src = (const int16_t *)pcm.bytes;
+    NSUInteger totalSamples = (pcm.length / 2);
+    NSUInteger offset = 0;
+    int16_t frame[SHINE_MAX_SAMPLES];
+    BOOL ok = YES;
+    @try {
+        while (offset < totalSamples) {
+            NSUInteger remain = totalSamples - offset;
+            NSUInteger n = MIN((NSUInteger)samplesPerPass, remain);
+            memset(frame, 0, sizeof(int16_t) * (size_t)samplesPerPass);
+            memcpy(frame, src + offset, n * sizeof(int16_t));
+            offset += n;
+            int written = 0;
+            unsigned char *mp3 = shine_encode_buffer_interleaved(s, frame, &written);
+            if (mp3 && written > 0) {
+                [fh writeData:[NSData dataWithBytes:mp3 length:(NSUInteger)written]];
+            }
+        }
+        int written = 0;
+        unsigned char *tail = shine_flush(s, &written);
+        if (tail && written > 0) {
+            [fh writeData:[NSData dataWithBytes:tail length:(NSUInteger)written]];
+        }
+        [fh synchronizeFile];
+        [fh closeFile];
+    } @catch (__unused NSException *e) {
+        ok = NO;
+        @try { [fh closeFile]; } @catch (__unused NSException *e2) {}
+    }
+    shine_close(s);
+    if (!ok) return NO;
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:outPath error:nil];
+    unsigned long long sz = [attrs fileSize];
+    WCRInfo("mp3 encoded path=%@ bytes=%llu sr=%d br=%d", outPath, (unsigned long long)sz, sr, bitr);
+    return sz > 0;
+}
+
+static BOOL WCRExportSessionMP3(NSString *sessionDir, NSString *displayName, double sampleRate, NSString **outMP3Path) {
+    if (outMP3Path) *outMP3Path = nil;
+    if (sessionDir.length == 0) return NO;
+    NSString *micPath = [sessionDir stringByAppendingPathComponent:@"mic.wav"];
+    NSString *remotePath = [sessionDir stringByAppendingPathComponent:@"remote.wav"];
+    double sr = sampleRate;
+    NSData *mic = WCRReadPCM16Body(micPath, &sr) ?: [NSData data];
+    NSData *remote = WCRReadPCM16Body(remotePath, &sr) ?: [NSData data];
+    NSData *mixed = WCRMixPCM16Bodies(mic, remote);
+    if (mixed.length < 2) return NO;
+    NSString *mp3InSession = [sessionDir stringByAppendingPathComponent:@"call.mp3"];
+    if (!WCREncodePCM16ToMP3(mixed, sr > 0 ? sr : sampleRate, mp3InSession)) return NO;
+    NSString *root = [sessionDir stringByDeletingLastPathComponent];
+    // Prefer full session id (remark_timestamp) so names stay unique and readable.
+    NSString *safe = WCRSanitizeName(sessionDir.lastPathComponent.length ? sessionDir.lastPathComponent : (displayName ?: @"call"));
+    NSString *rootCopy = [root stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.mp3", safe]];
+    [[NSFileManager defaultManager] removeItemAtPath:rootCopy error:nil];
+    NSError *err = nil;
+    BOOL copied = [[NSFileManager defaultManager] copyItemAtPath:mp3InSession toPath:rootCopy error:&err];
+    if (!copied) {
+        WCRInfo("mp3 root copy failed: %@", err);
+        rootCopy = mp3InSession;
+    }
+    if (outMP3Path) *outMP3Path = rootCopy;
+    return YES;
+}
+
+static BOOL WCRPCMBufferLooksSilent(const void *bytes, NSUInteger len) {
+    if (!bytes || len < 2) return YES;
+    const int16_t *s = (const int16_t *)bytes;
+    NSUInteger n = len / 2;
+    NSUInteger step = n > 512 ? (n / 512) : 1;
+    int32_t peak = 0;
+    for (NSUInteger i = 0; i < n; i += step) {
+        int32_t v = s[i];
+        if (v < 0) v = -v;
+        if (v > peak) peak = v;
+        if (peak >= 180) return NO;
+    }
+    return peak < 180;
+}
+
 #pragma mark - Session manager
 
 @interface WCRSessionManager : NSObject
@@ -490,11 +733,16 @@ static BOOL WCRWriteMixedPCM16Files(NSString *micPath, NSString *remotePath, NSS
 @property (nonatomic, assign) BOOL recording;
 @property (nonatomic, copy) NSString *sessionID;
 @property (nonatomic, copy) NSString *sessionDir;
+@property (nonatomic, copy) NSString *contactDisplayName;
 @property (nonatomic, strong) WCRWavWriter *micWriter;
 @property (nonatomic, strong) WCRWavWriter *remoteWriter;
 @property (nonatomic, assign) double sampleRate;
 @property (nonatomic, assign) uint64_t micBytes;
 @property (nonatomic, assign) uint64_t remoteBytes;
+@property (nonatomic, assign) NSTimeInterval lastPCMAt;
+@property (nonatomic, assign) NSTimeInterval lastVoiceAt;
+@property (nonatomic, assign) BOOL everHadPCM;
+@property (nonatomic, strong) dispatch_source_t idleTimer;
 @property (nonatomic, strong) NSMutableDictionary *meta;
 + (instancetype)shared;
 - (NSString *)rootDir;
@@ -504,6 +752,7 @@ static BOOL WCRWriteMixedPCM16Files(NSString *micPath, NSString *remotePath, NSS
 - (void)appendRemote:(const void *)bytes length:(NSUInteger)len sampleRate:(double)sr;
 - (void)endWithReason:(NSString *)reason;
 - (NSArray<NSDictionary *> *)listSessions;
+- (NSString *)bestPlayablePathForSessionDir:(NSString *)dir;
 @end
 
 @implementation WCRSessionManager
@@ -527,17 +776,50 @@ static BOOL WCRWriteMixedPCM16Files(NSString *micPath, NSString *remotePath, NSS
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     return [docs stringByAppendingPathComponent:@"WCallRecorder"];
 }
+- (void)stopIdleWatchdog {
+    if (self.idleTimer) {
+        dispatch_source_cancel(self.idleTimer);
+        self.idleTimer = nil;
+    }
+}
+- (void)startIdleWatchdog {
+    [self stopIdleWatchdog];
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, self.ioQueue);
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), 2 * NSEC_PER_SEC, (uint64_t)(0.2 * NSEC_PER_SEC));
+    dispatch_source_set_event_handler(timer, ^{
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self || !self.recording) return;
+        NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+        if (!self.everHadPCM) {
+            if (self.lastPCMAt > 0 && (now - self.lastPCMAt) > 90.0) {
+                WCRInfo("idle watchdog: no-pcm-timeout");
+                [self endWithReason:@"no-pcm-timeout"];
+            }
+            return;
+        }
+        NSTimeInterval ref = MAX(self.lastVoiceAt, self.lastPCMAt);
+        if (ref > 0 && (now - ref) > 10.0) {
+            WCRInfo("idle watchdog: idle-silence (%.1fs)", now - ref);
+            [self endWithReason:@"idle-silence"];
+        }
+    });
+    dispatch_resume(timer);
+    self.idleTimer = timer;
+}
 - (void)beginInlineOnIOQueueWithReason:(NSString *)reason contactHint:(NSString *)hint sampleRate:(double)sr {
     if (!WCREnabled()) return;
     if (self.recording) return;
     double useSR = (sr >= 8000.0 && sr <= 48000.0) ? sr : WCRPreferredSampleRate();
     self.sampleRate = useSR;
+    NSString *resolved = WCRResolveRemarkName(hint.length ? hint : reason) ?: (hint.length ? hint : reason);
+    self.contactDisplayName = resolved;
     NSDateFormatter *fmt = [NSDateFormatter new];
     fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
-    fmt.dateFormat = @"yyyyMMdd-HHmmss";
+    fmt.dateFormat = @"yyyyMMdd_HHmmss";
     NSString *ts = [fmt stringFromDate:[NSDate date]];
-    NSString *safeHint = WCRSanitizeName(hint.length ? hint : reason);
-    NSString *sid = [NSString stringWithFormat:@"%@-%@", ts, safeHint];
+    NSString *safeHint = WCRSanitizeName(resolved.length ? resolved : @"unknown");
+    NSString *sid = [NSString stringWithFormat:@"%@_%@", safeHint, ts];
     NSString *dir = [[self rootDir] stringByAppendingPathComponent:sid];
     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     self.sessionID = sid;
@@ -547,20 +829,27 @@ static BOOL WCRWriteMixedPCM16Files(NSString *micPath, NSString *remotePath, NSS
     [self.micWriter openFile];
     [self.remoteWriter openFile];
     self.micBytes = 0; self.remoteBytes = 0;
+    self.everHadPCM = NO;
+    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+    self.lastPCMAt = now;
+    self.lastVoiceAt = now;
     atomic_store(&gWCRLastMicFrames, 0);
     atomic_store(&gWCRLastRemoteFrames, 0);
     self.meta = [@{
         @"id": sid ?: @"",
         @"reason": reason ?: @"",
         @"hint": hint ?: @"",
+        @"displayName": resolved ?: @"",
         @"sampleRate": @(useSR),
-        @"startedAt": @([NSDate date].timeIntervalSince1970),
+        @"startedAt": @(now),
         @"version": kWCRPluginVersion,
         @"auth": @"none",
-        @"wechatTarget": @"8.0.71"
+        @"wechatTarget": @"8.0.71",
+        @"format": @"mp3"
     } mutableCopy];
     self.recording = YES;
-    WCRInfo("session begin id=%@ reason=%@ sr=%.0f", sid, reason, useSR);
+    [self startIdleWatchdog];
+    WCRInfo("session begin id=%@ reason=%@ name=%@ sr=%.0f", sid, reason, resolved, useSR);
     WCRSetLastSessionInfo([NSString stringWithFormat:@"recording %@", sid]);
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
@@ -580,29 +869,40 @@ static BOOL WCRWriteMixedPCM16Files(NSString *micPath, NSString *remotePath, NSS
 - (void)appendMic:(const void *)bytes length:(NSUInteger)len sampleRate:(double)sr {
     if (!bytes || !len) return;
     NSData *data = [NSData dataWithBytes:bytes length:len];
+    BOOL silent = WCRPCMBufferLooksSilent(bytes, len);
     dispatch_async(self.ioQueue, ^{
         if (!self.recording) [self beginInlineOnIOQueueWithReason:@"auto-mic" contactHint:@"auto" sampleRate:sr];
         if (!self.recording) return;
         [self.micWriter writePCM16:data.bytes length:data.length];
         self.micBytes += data.length;
+        NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+        self.lastPCMAt = now;
+        self.everHadPCM = YES;
+        if (!silent) self.lastVoiceAt = now;
         atomic_fetch_add(&gWCRLastMicFrames, 1);
     });
 }
 - (void)appendRemote:(const void *)bytes length:(NSUInteger)len sampleRate:(double)sr {
     if (!bytes || !len) return;
     NSData *data = [NSData dataWithBytes:bytes length:len];
+    BOOL silent = WCRPCMBufferLooksSilent(bytes, len);
     dispatch_async(self.ioQueue, ^{
         if (!self.recording) [self beginInlineOnIOQueueWithReason:@"auto-remote" contactHint:@"auto" sampleRate:sr];
         if (!self.recording) return;
         (void)sr;
         [self.remoteWriter writePCM16:data.bytes length:data.length];
         self.remoteBytes += data.length;
+        NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+        self.lastPCMAt = now;
+        self.everHadPCM = YES;
+        if (!silent) self.lastVoiceAt = now;
         atomic_fetch_add(&gWCRLastRemoteFrames, 1);
     });
 }
 - (void)endWithReason:(NSString *)reason {
     dispatch_async(self.ioQueue, ^{
         if (!self.recording) return;
+        [self stopIdleWatchdog];
         [self.micWriter closeFile]; [self.remoteWriter closeFile];
         NSString *micPath = [self.sessionDir stringByAppendingPathComponent:@"mic.wav"];
         NSString *remotePath = [self.sessionDir stringByAppendingPathComponent:@"remote.wav"];
@@ -611,12 +911,19 @@ static BOOL WCRWriteMixedPCM16Files(NSString *micPath, NSString *remotePath, NSS
             NSString *mixedPath = [self.sessionDir stringByAppendingPathComponent:@"mixed.wav"];
             mixedOK = WCRWriteMixedPCM16Files(micPath, remotePath, mixedPath, self.sampleRate);
         }
+        NSString *mp3Path = nil;
+        BOOL mp3OK = NO;
+        if (self.micBytes > 0 || self.remoteBytes > 0) {
+            mp3OK = WCRExportSessionMP3(self.sessionDir, self.contactDisplayName ?: self.sessionID, self.sampleRate, &mp3Path);
+        }
         self.micWriter = nil; self.remoteWriter = nil;
         self.meta[@"endedAt"] = @([NSDate date].timeIntervalSince1970);
         self.meta[@"endReason"] = reason ?: @"";
         self.meta[@"micBytes"] = @(self.micBytes);
         self.meta[@"remoteBytes"] = @(self.remoteBytes);
         self.meta[@"mixed"] = @(mixedOK);
+        self.meta[@"mp3"] = @(mp3OK);
+        if (mp3Path.length) self.meta[@"mp3Path"] = mp3Path;
         self.meta[@"lifecycleHooks"] = @(WCRLifecycleHookCount());
         self.meta[@"audioHooks"] = @(WCRAudioHookCount());
         self.meta[@"auth"] = @"none";
@@ -626,15 +933,21 @@ static BOOL WCRWriteMixedPCM16Files(NSString *micPath, NSString *remotePath, NSS
         uint64_t micB = self.micBytes;
         uint64_t remoteB = self.remoteBytes;
         NSString *sid = [self.sessionID copy];
+        NSString *mp3Show = [mp3Path.lastPathComponent copy] ?: @"-";
         self.recording = NO; self.sessionID = nil; self.sessionDir = nil;
+        self.contactDisplayName = nil;
         self.micBytes = 0; self.remoteBytes = 0;
-        WCRInfo("session end reason=%@ mic=%llu remote=%llu mixed=%d dir=%@", reason, micB, remoteB, mixedOK, dir);
-        NSString *info = [NSString stringWithFormat:@"%@ mic=%llu remote=%llu", sid ?: dir.lastPathComponent, micB, remoteB];
+        self.everHadPCM = NO;
+        self.lastPCMAt = 0; self.lastVoiceAt = 0;
+        WCRInfo("session end reason=%@ mic=%llu remote=%llu mixed=%d mp3=%d dir=%@", reason, micB, remoteB, mixedOK, mp3OK, dir);
+        NSString *info = [NSString stringWithFormat:@"%@ mic=%llu remote=%llu mp3=%@", sid ?: dir.lastPathComponent, micB, remoteB, mp3Show];
         WCRSetLastSessionInfo(info);
         dispatch_async(dispatch_get_main_queue(), ^{
             if (!WCRBool(kWCRPrivateKey, NO)) {
                 if (micB == 0 && remoteB == 0) {
                     WCRShowToast([NSString stringWithFormat:@"通话录音已结束(无音频)\n%@\n打开悬浮球查看诊断，或用 Frida 补钩", dir.lastPathComponent]);
+                } else if (mp3OK) {
+                    WCRShowToast([NSString stringWithFormat:@"通话录音已保存(MP3)\n%@", mp3Show]);
                 } else {
                     WCRShowToast([NSString stringWithFormat:@"通话录音已保存\n%@", dir.lastPathComponent]);
                 }
@@ -649,6 +962,8 @@ static BOOL WCRWriteMixedPCM16Files(NSString *micPath, NSString *remotePath, NSS
     NSArray *names = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:root error:nil] ?: @[];
     NSMutableArray *items = [NSMutableArray array];
     for (NSString *name in names) {
+        // Skip root-level loose mp3 files in list (shown via session dirs).
+        if ([name.lowercaseString hasSuffix:@".mp3"]) continue;
         NSString *dir = [root stringByAppendingPathComponent:name];
         BOOL isDir = NO;
         if (![[NSFileManager defaultManager] fileExistsAtPath:dir isDirectory:&isDir] || !isDir) continue;
@@ -657,9 +972,11 @@ static BOOL WCRWriteMixedPCM16Files(NSString *micPath, NSString *remotePath, NSS
         NSData *data = [NSData dataWithContentsOfFile:metaPath];
         if (data) meta = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
         NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:dir error:nil];
+        NSString *play = [self bestPlayablePathForSessionDir:dir];
         [items addObject:@{
             @"name": name,
             @"path": dir,
+            @"playPath": play ?: @"",
             @"meta": meta ?: @{},
             @"date": attrs[NSFileModificationDate] ?: [NSDate distantPast]
         }];
@@ -669,7 +986,30 @@ static BOOL WCRWriteMixedPCM16Files(NSString *micPath, NSString *remotePath, NSS
     }];
     return items;
 }
+- (NSString *)bestPlayablePathForSessionDir:(NSString *)dir {
+    if (dir.length == 0) return nil;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSDictionary *meta = nil;
+    NSData *data = [NSData dataWithContentsOfFile:[dir stringByAppendingPathComponent:@"meta.json"]];
+    if (data) meta = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    NSString *mp3Meta = [meta isKindOfClass:[NSDictionary class]] ? meta[@"mp3Path"] : nil;
+    if ([mp3Meta isKindOfClass:[NSString class]] && [fm fileExistsAtPath:mp3Meta]) return mp3Meta;
+    NSArray *cands = @[
+        [dir stringByAppendingPathComponent:@"call.mp3"],
+        [dir stringByAppendingPathComponent:@"mixed.wav"],
+        [dir stringByAppendingPathComponent:@"remote.wav"],
+        [dir stringByAppendingPathComponent:@"mic.wav"],
+    ];
+    for (NSString *p in cands) {
+        if ([fm fileExistsAtPath:p]) {
+            NSDictionary *attrs = [fm attributesOfItemAtPath:p error:nil];
+            if ([attrs fileSize] > 0) return p;
+        }
+    }
+    return nil;
+}
 @end
+
 #pragma mark - UI helpers
 
 static __weak UIWindow *WCRIndicatorWindow = nil;
@@ -826,7 +1166,7 @@ static void WCREnsureFloatingBall(void) {
 
 #pragma mark - Settings UI
 
-@interface WCRSettingViewController : UITableViewController
+@interface WCRSettingViewController : UITableViewController <AVAudioPlayerDelegate>
 @property (nonatomic, strong) NSArray<NSDictionary *> *sessions;
 @property (nonatomic, strong) UISwitch *enabledSwitch;
 @property (nonatomic, strong) UISwitch *floatSwitch;
@@ -834,6 +1174,8 @@ static void WCREnsureFloatingBall(void) {
 @property (nonatomic, strong) UISwitch *privateSwitch;
 @property (nonatomic, strong) UISwitch *mixedSwitch;
 @property (nonatomic, strong) UISwitch *verboseSwitch;
+@property (nonatomic, strong) AVAudioPlayer *player;
+@property (nonatomic, copy) NSString *playingPath;
 @end
 
 @implementation WCRSettingViewController
@@ -976,12 +1318,22 @@ static void WCREnsureFloatingBall(void) {
     }
     NSDictionary *item = self.sessions[indexPath.row];
     NSDictionary *meta = item[@"meta"] ?: @{};
-    cell.textLabel.text = item[@"name"];
-    cell.detailTextLabel.text = [NSString stringWithFormat:@"mic=%@ remote=%@ reason=%@",
-                                 meta[@"micBytes"] ?: @"?", meta[@"remoteBytes"] ?: @"?", meta[@"reason"] ?: @"-"];
+    NSString *title = meta[@"displayName"] ?: item[@"name"];
+    cell.textLabel.text = title;
+    NSString *playPath = item[@"playPath"] ?: @"";
+    NSString *fmt = @"?";
+    if ([playPath.lowercaseString hasSuffix:@".mp3"]) fmt = @"mp3";
+    else if ([playPath.lowercaseString hasSuffix:@".wav"]) fmt = @"wav";
+    else if ([meta[@"mp3"] boolValue]) fmt = @"mp3";
+    cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ · mic=%@ remote=%@ · %@",
+                                 fmt,
+                                 meta[@"micBytes"] ?: @"?",
+                                 meta[@"remoteBytes"] ?: @"?",
+                                 meta[@"endReason"] ?: (meta[@"reason"] ?: @"-")];
     cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     return cell;
 }
+
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     if (indexPath.section == 2) {
@@ -1013,10 +1365,114 @@ static void WCREnsureFloatingBall(void) {
     }
     if (indexPath.section == 3 && self.sessions.count > 0) {
         NSDictionary *item = self.sessions[indexPath.row];
-        UIPasteboard.generalPasteboard.string = item[@"path"] ?: @"";
-        WCRShowToast([NSString stringWithFormat:@"已复制\n%@", item[@"name"]]);
+        [self presentSessionActions:item];
     }
 }
+- (void)stopPlayback {
+    if (self.player) {
+        [self.player stop];
+        self.player = nil;
+    }
+    self.playingPath = nil;
+}
+- (void)playPath:(NSString *)path {
+    if (path.length == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        WCRShowToast(@"没有可播放文件");
+        return;
+    }
+    [self stopPlayback];
+    NSError *err = nil;
+    @try {
+        [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:nil];
+        [[AVAudioSession sharedInstance] setActive:YES error:nil];
+    } @catch (__unused NSException *e) {}
+    AVAudioPlayer *player = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:path] error:&err];
+    if (!player || err) {
+        WCRShowToast([NSString stringWithFormat:@"播放失败\n%@", err.localizedDescription ?: @"unknown"]);
+        return;
+    }
+    player.delegate = self;
+    self.player = player;
+    self.playingPath = path;
+    [player prepareToPlay];
+    if ([player play]) {
+        WCRShowToast([NSString stringWithFormat:@"正在播放\n%@", path.lastPathComponent]);
+    } else {
+        WCRShowToast(@"播放失败");
+        [self stopPlayback];
+    }
+}
+- (void)audioPlayerDidFinishPlaying:(AVAudioPlayer *)player successfully:(BOOL)flag {
+    (void)player; (void)flag;
+    self.player = nil;
+    self.playingPath = nil;
+    WCRShowToast(@"播放结束");
+}
+- (void)sharePath:(NSString *)path fromView:(UIView *)sourceView {
+    if (path.length == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        WCRShowToast(@"文件不存在");
+        return;
+    }
+    NSURL *url = [NSURL fileURLWithPath:path];
+    UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
+    if (avc.popoverPresentationController) {
+        avc.popoverPresentationController.sourceView = sourceView ?: self.view;
+        avc.popoverPresentationController.sourceRect = sourceView ? sourceView.bounds : CGRectMake(self.view.bounds.size.width/2, 80, 1, 1);
+    }
+    [self presentViewController:avc animated:YES completion:nil];
+}
+- (void)deleteSessionItem:(NSDictionary *)item {
+    NSString *dir = item[@"path"];
+    if (dir.length == 0) return;
+    NSString *playPath = item[@"playPath"];
+    if (self.playingPath.length && ([self.playingPath hasPrefix:dir] || [self.playingPath isEqualToString:playPath])) {
+        [self stopPlayback];
+    }
+    NSError *err = nil;
+    [[NSFileManager defaultManager] removeItemAtPath:dir error:&err];
+    NSDictionary *meta = item[@"meta"] ?: @{};
+    NSString *mp3Path = meta[@"mp3Path"];
+    if ([mp3Path isKindOfClass:[NSString class]] && mp3Path.length && [[NSFileManager defaultManager] fileExistsAtPath:mp3Path]) {
+        [[NSFileManager defaultManager] removeItemAtPath:mp3Path error:nil];
+    }
+    if (err) WCRShowToast([NSString stringWithFormat:@"删除失败\n%@", err.localizedDescription]);
+    else WCRShowToast(@"已删除");
+    [self reloadData];
+}
+- (void)presentSessionActions:(NSDictionary *)item {
+    NSString *dir = item[@"path"] ?: @"";
+    NSString *playPath = item[@"playPath"];
+    if (![playPath isKindOfClass:[NSString class]] || playPath.length == 0) {
+        playPath = [[WCRSessionManager shared] bestPlayablePathForSessionDir:dir] ?: @"";
+    }
+    NSString *title = item[@"name"] ?: @"录音";
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:title
+                                                                   message:(playPath.length ? playPath.lastPathComponent : dir)
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) weakSelf = self;
+    if (playPath.length) {
+        [sheet addAction:[UIAlertAction actionWithTitle:@"播放" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+            [weakSelf playPath:playPath];
+        }]];
+        [sheet addAction:[UIAlertAction actionWithTitle:@"分享" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+            [weakSelf sharePath:playPath fromView:weakSelf.view];
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"复制路径" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+        UIPasteboard.generalPasteboard.string = playPath.length ? playPath : dir;
+        WCRShowToast(@"路径已复制");
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *a) {
+        [weakSelf deleteSessionItem:item];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    if (sheet.popoverPresentationController) {
+        sheet.popoverPresentationController.sourceView = self.view;
+        sheet.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width/2, 120, 1, 1);
+    }
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
 - (void)onEnabled:(UISwitch *)sw {
     WCRSetBool(kWCREnabledKey, sw.isOn);
     if (!sw.isOn && [[WCRSessionManager shared] isRecording]) {
@@ -1220,6 +1676,11 @@ static void wcr_stop(id self, SEL cmd) {
     [[WCRSessionManager shared] endWithReason:([NSString stringWithUTF8String:sel_getName(cmd)] ?: @"stop")];
     if (orig) orig(self, cmd);
 }
+static void wcr_stop_id(id self, SEL cmd, id arg) {
+    void (*orig)(id, SEL, id) = (void (*)(id, SEL, id))WCRLookupOrig(self, cmd);
+    [[WCRSessionManager shared] endWithReason:([NSString stringWithUTF8String:sel_getName(cmd)] ?: @"stop")];
+    if (orig) orig(self, cmd, arg);
+}
 
 #pragma mark - Audio hooks
 
@@ -1331,6 +1792,20 @@ static void WCRInstallLifecycle(void) {
         {"StartRecordAndPlayForIlink:", (IMP)wcr_call_id, 1},
         {"StartRecordAndPlayForVoIPWithRoomID:roomKey:", (IMP)wcr_call_room, 2},
         {"StopForVoIP", (IMP)wcr_stop, 0},
+        // Prefer VoIP-specific stop selectors only (generic hangup/reject is crash-prone).
+        {"StopRecordAndPlayForVoIP", (IMP)wcr_stop, 0},
+        {"StopRecordAndPlayForMuTalk", (IMP)wcr_stop, 0},
+        {"StopRecordAndPlayForIlink", (IMP)wcr_stop, 0},
+        {"StopRecordAndPlayForIlink:", (IMP)wcr_stop_id, 1},
+        {"StopRecordAndPlayForVoIPInterruptionRecovery", (IMP)wcr_stop, 0},
+        {"onMultiTalkMainViewControllerHangup", (IMP)wcr_stop, 0},
+        {"onMultiTalkMainViewControllerReject", (IMP)wcr_stop, 0},
+        {"onMultiTalkMainViewControllerCancel", (IMP)wcr_stop, 0},
+        {"onMultiTalkMainViewControllerHangup:", (IMP)wcr_stop_id, 1},
+        {"onMultiTalkMainViewControllerReject:", (IMP)wcr_stop_id, 1},
+        {"onMultiTalkMainViewControllerCancel:", (IMP)wcr_stop_id, 1},
+        {"onMultiTalkMainViewControllerCloseWindow", (IMP)wcr_stop, 0},
+        {"onMultiTalkMainViewControllerCloseWindow:", (IMP)wcr_stop_id, 1},
         {"onEnterMultiTalk:", (IMP)wcr_call_id, 1},
         {"onInviteMultiTalk:", (IMP)wcr_call_id, 1},
         {"onAcceptSubCallMultiTalk:", (IMP)wcr_call_id, 1},
