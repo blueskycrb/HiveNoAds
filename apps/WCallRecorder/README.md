@@ -1,3 +1,12 @@
+## v0.5.7
+
+- **接听必开录**：通话 VC `viewWill/DidAppear` 直接 hook（子类不调 super 也能抓到）
+- 通话 UI 识别增强：窗口/子 VC/挂断扬声器文案/接近传感器
+- 0.8s 轮询：通话 UI **或** PlayAndRecord/VoiceChat 音频都 force-begin
+- 修复 Accept 等 BOOL 返回值 lifecycle 被跳过的问题
+- `beginWithReason` 主线程同步开录，软启动可立刻看到 `isRecording`
+- 修复现代 iOS chained fixups 下 AudioUnit fishhook 失效（按指针值重绑）
+
 ## v0.5.6
 
 - Learn commercial plugin model: ObjC lifecycle + runtime sink discovery (no auth crack)
@@ -11,7 +20,7 @@
 HiveNoAds 内的**免费、无授权**微信通话录音模块。
 根据商业版 `WCallRecorder.dylib` 的公开生命周期选择子做独立重写，**不含授权/联网校验**。
 
-## v0.5.5 修复（学习商业版采集模型）
+## v0.5.7 修复（学习商业版采集模型）
 
 商业版逆向结论：
 1. **只走 ObjC 钩子**（`MSHookMessageEx`），不依赖 AudioUnit C API
@@ -46,10 +55,10 @@ HiveNoAds 内的**免费、无授权**微信通话录音模块。
 1. **先删除旧版** WCallRecorder.dylib / 旧 deb
 2. 注入新 dylib 或安装新 deb
 3. **冷启动微信**（划掉后再开）
-4. Toast 应显示 `WCallRecorder 已加载 v0.5.5`
+4. Toast 应显示 `WCallRecorder 已加载 v0.5.7`
 5. 打一通语音电话，说几句话后挂断
 6. 状态页确认：
-   - 版本 0.5.5
+   - 版本 0.5.7
    - 通话中 `probe` 有 hits 或 mic/remote > 0
    - 若仍为 0，打开微信容器内 `Documents/WCallRecorder/candidates.txt` 发我
 
@@ -59,5 +68,5 @@ Windows 无法本地编 arm64 iOS dylib，请用 GitHub Actions 推送 `apps/WCa
 
 ```bash
 bash apps/WCallRecorder/package_deb.sh
-# => dist/com.blueskycrb.wcallrecorder-rootless_0.5.5_iphoneos-arm64e.deb
+# => dist/com.blueskycrb.wcallrecorder-rootless_0.5.7_iphoneos-arm64e.deb
 ```
