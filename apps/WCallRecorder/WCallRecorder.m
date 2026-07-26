@@ -265,6 +265,20 @@ static NSString *WCRSanitizeName(NSString *name) {
     return out;
 }
 
+static NSString *WCRPropString(id obj, NSArray<NSString *> *names) {
+    if (!obj) return nil;
+    for (NSString *name in names) {
+        @try {
+            SEL sel = NSSelectorFromString(name);
+            if (![obj respondsToSelector:sel]) continue;
+            id v = ((id(*)(id, SEL))objc_msgSend)(obj, sel);
+            NSString *s = WCRSafeDesc(v);
+            if (s.length > 0 && ![s isEqualToString:@"(null)"]) return s;
+        } @catch (__unused NSException *e) {}
+    }
+    return nil;
+}
+
 static id WCRServiceOfClass(NSString *className) {
     if (className.length == 0) return nil;
     Class centerCls = NSClassFromString(@"MMServiceCenter");
@@ -309,20 +323,6 @@ static NSString *WCRResolveRemarkName(NSString *hintOrWxid) {
         }
     }
     return hintOrWxid;
-}
-
-static NSString *WCRPropString(id obj, NSArray<NSString *> *names) {
-    if (!obj) return nil;
-    for (NSString *name in names) {
-        @try {
-            SEL sel = NSSelectorFromString(name);
-            if (![obj respondsToSelector:sel]) continue;
-            id v = ((id(*)(id, SEL))objc_msgSend)(obj, sel);
-            NSString *s = WCRSafeDesc(v);
-            if (s.length > 0 && ![s isEqualToString:@"(null)"]) return s;
-        } @catch (__unused NSException *e) {}
-    }
-    return nil;
 }
 
 static NSString *WCRContactHintFromObject(id obj) {
