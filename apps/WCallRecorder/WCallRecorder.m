@@ -741,7 +741,7 @@ static void WCRUpdateIndicator(BOOL on) {
     if (!v) return;
     CGPoint t = [g translationInView:v.superview];
     v.center = CGPointMake(v.center.x + t.x, v.center.y + t.y);
-    [g setTranslation:CGPointZero inView:v.superview];
+    [g setTranslation:CGPointMake(0, 0) inView:v.superview];
     if (g.state == UIGestureRecognizerStateEnded || g.state == UIGestureRecognizerStateCancelled) {
         CGRect b = v.superview.bounds;
         CGFloat x = MIN(MAX(v.center.x, 36), b.size.width - 36);
