@@ -1,7 +1,10 @@
 //
 // WCallRecorder - free rewrite for HiveNoAds (no license / no auth)
 // Target: WeChat 8.0.71 + Bootstrap/RootHide / TrollFools
-// Pure ObjC runtime hooks, no license/auth. v0.5.4
+// Pure ObjC runtime hooks, no license/auth. v0.5.6
+// v0.5.6: commercial-style ObjC lifecycle + dyld rescan + AVAudioSession detect/stop + remark scrape
+// v0.5.5: Fix probe compile, re-rebind AU on new images, remark rename,
+//         hangup UI detect, commercial-style extra ObjC sinks, playable MP3 guard
 // Features: remark filename, MP3 export (Shine), playback UI, hangup auto-stop
 // v0.5.4: Chained-fixup AudioUnit rebind + signature probe on audio classes + live rescan
 // v0.5.3: Learn commercial ObjC-only capture model — runtime PCM probe + persist hooks,
@@ -45,7 +48,7 @@ static NSString * const kWCRWriteMixedKey = @"WCR.WriteMixed";
 static NSString * const kWCRVerboseKey    = @"WCR.Verbose";
 static NSString * const kWCRDiscoveredKey = @"WCR.DiscoveredAudioHooks"; // [[class, sel, track], ...]
 static NSString * const kWCRProbeKey      = @"WCR.EnableProbe"; // default YES
-static NSString * const kWCRPluginVersion = @"0.5.4";
+static NSString * const kWCRPluginVersion = @"0.5.6";
 
 static void WCRShowToast(NSString *text);
 static void WCRUpdateIndicator(BOOL on);
@@ -54,6 +57,7 @@ static void WCRInstallManualAudioHooks(void);
 static void WCRAutoScanAudioHooks(void);
 static void WCRAggressiveAudioScan(void);
 static void WCRInstallProbeAudioHooks(void);
+static void WCRDumpAudioCandidates(void);
 static void WCRInstallDiscoveredAudioHooks(void);
 static void WCRPersistDiscoveredHook(NSString *cls, NSString *sel, NSString *track);
 static NSArray *WCRLoadDiscoveredHooks(void);
@@ -90,6 +94,24 @@ static NSArray<NSArray<NSString *> *> *WCRExtraAudioHooks(void) {
         @[@"MMAudioDataPipe", @"pushPlayData:length:", @"remote"],
         @[@"WXTalkComponent", @"onMicData:length:", @"mic"],
         @[@"WXTalkComponent", @"onPlayData:length:", @"remote"],
+        @[@"VOIPAudioUnitService", @"NotifyOutputOnIndependentThread:length:", @"remote"],
+        @[@"VOIPAudioUnitService", @"NotifyInputOnIndependentThread:length:", @"mic"],
+        @[@"VOIPAudioUnitService", @"audio_record_callback:length:", @"mic"],
+        @[@"VOIPAudioUnitService", @"audio_play_callback:length:", @"remote"],
+        @[@"AUAudioDevice", @"NearendPcmReady:len:", @"mic"],
+        @[@"AUAudioDevice", @"FarendPcmReady:len:", @"remote"],
+        @[@"AUAudioDevice", @"onRecordData:size:", @"mic"],
+        @[@"AUAudioDevice", @"onPlaybackData:size:", @"remote"],
+        @[@"IlinkAudioMgr", @"onLocalAudioFrame:length:", @"mic"],
+        @[@"IlinkAudioMgr", @"onRemoteAudioFrame:length:", @"remote"],
+        @[@"IlinkAudioDevice", @"sendAudioData:length:", @"mic"],
+        @[@"IlinkAudioDevice", @"recvAudioData:length:", @"remote"],
+        @[@"VoIPMPAudioDevice", @"onCapturedData:length:", @"mic"],
+        @[@"VoIPMPAudioDevice", @"onRenderData:length:", @"remote"],
+        @[@"WCAudioModule", @"deliverRecordedData:length:", @"mic"],
+        @[@"WCAudioModule", @"deliverPlaybackData:length:", @"remote"],
+        @[@"MMAudioDataPipe", @"pushAudioData:length:", @"mic"],
+        @[@"MMAudioDataPipe", @"popAudioData:length:", @"remote"],
     ];
     [hooks addObjectsFromArray:known];
     for (NSArray *item in WCRLoadDiscoveredHooks()) {
@@ -199,6 +221,9 @@ static atomic_int gWCRLifecycleHooksInstalled = 0;
 static atomic_int gWCRLastMicFrames = 0;
 static atomic_int gWCRLastRemoteFrames = 0;
 static atomic_int gWCRAudioUnitHooksInstalled = 0;
+// Probe counters used by status UI (must be declared early).
+static atomic_int gWCRProbeHooksInstalled = 0;
+static atomic_int gWCRProbeHits = 0;
 static NSString *gWCRLastContactHint = nil; // retained manually
 static NSString *gWCRLastContactName = nil;
 static void WCRSetLastContactHint(NSString *hint);
@@ -209,6 +234,11 @@ static NSString *WCRResolveActiveCallContact(void);
 static NSString *WCRBestSessionName(NSString *reason, NSString *hint);
 static void WCRInstallAudioUnitHooks(void);
 static void WCRNoteContactFromObject(id obj);
+static void WCRInstallAVAudioSessionHooks(void);
+static void WCRRegisterDyldObserver(void);
+static void WCRRescanAllHooks(const char *why);
+static NSString *WCRScrapeCallUIContactName(void);
+static BOOL WCRLooksLikeBadDisplayName(NSString *s);
 #pragma mark - Runtime helpers
 
 static BOOL WCRClassHasOwnInstanceMethod(Class cls, SEL sel) {
@@ -499,6 +529,46 @@ static BOOL WCRLooksLikeMethodName(NSString *s) {
     return NO;
 }
 
+static BOOL WCRLooksLikeBadDisplayName(NSString *s) {
+    if (s.length == 0) return YES;
+    if (WCRLooksLikeMethodName(s)) return YES;
+    NSString *t = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (t.length == 0) return YES;
+    NSCharacterSet *nonDigit = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
+    if ([t rangeOfCharacterFromSet:nonDigit].location == NSNotFound && t.length <= 16) return YES;
+    if ([t.lowercaseString hasPrefix:@"room-"]) {
+        NSString *rest = [t substringFromIndex:5];
+        if (rest.length && [rest rangeOfCharacterFromSet:nonDigit].location == NSNotFound) return YES;
+    }
+    NSArray *bad = @[
+        @"\u5fae\u4fe1",
+        @"WeChat",
+        @"\u53d6\u6d88",
+        @"\u6302\u65ad",
+        @"\u63a5\u542c",
+        @"\u514d\u63d0",
+        @"\u9759\u97f3",
+        @"\u6d6e\u7a97",
+        @"\u626b\u58f0\u5668",
+        @"\u5207\u6362\u6444\u50cf\u5934",
+        @"\u6dfb\u52a0\u6210\u5458",
+        @"\u5f55\u97f3\u63d2\u4ef6",
+        @"\u901a\u8bdd\u4e2d",
+        @"\u7b49\u5f85\u63a5\u542c",
+        @"\u6b63\u5728\u901a\u8bdd",
+        @"\u89c6\u9891\u901a\u8bdd",
+        @"\u8bed\u97f3\u901a\u8bdd",
+        @"\u9080\u8bf7\u4f60",
+        @"\u7ed3\u675f",
+        @"\u62d2\u7edd"
+    ];
+    for (NSString *b in bad) {
+        if ([t isEqualToString:b]) return YES;
+        if ([t containsString:b] && t.length <= b.length + 2) return YES;
+    }
+    return NO;
+}
+
 static void WCRSetLastContactHint(NSString *hint) {
     if (hint.length == 0 || WCRLooksLikeMethodName(hint)) return;
     NSString *copy = [hint copy];
@@ -508,7 +578,11 @@ static void WCRSetLastContactHint(NSString *hint) {
     dispatch_once(&onceToken, ^{ lock = [NSObject new]; });
     @synchronized (lock) {
         gWCRLastContactHint = copy;
-        if (resolved.length && !WCRLooksLikeMethodName(resolved)) gWCRLastContactName = [resolved copy];
+        if (resolved.length && !WCRLooksLikeBadDisplayName(resolved)) {
+            gWCRLastContactName = [resolved copy];
+        } else if (!WCRLooksLikeBadDisplayName(copy)) {
+            gWCRLastContactName = copy;
+        }
     }
 }
 
@@ -571,27 +645,8 @@ static NSString *WCRResolveActiveCallContact(void) {
     NSArray *mgrNames = @[
         @"VOIPMgr", @"VoIPMgr", @"VOIPComponentMgr", @"IlinkVoIPMgr", @"MMIlinkService",
         @"IlinkService", @"CloudVoIPMgr", @"MultiTalkMgr", @"VoIPUIManager", @"VoipCXMgr",
-        @"VOIPCSMgr", @"VoIPInvitationService", @"WCCallKitManager",
-
-        @[@"VOIPAudioUnitService", @"NotifyOutputOnIndependentThread:length:", @"remote"],
-        @[@"VOIPAudioUnitService", @"NotifyInputOnIndependentThread:length:", @"mic"],
-        @[@"VOIPAudioUnitService", @"audio_record_callback:length:", @"mic"],
-        @[@"VOIPAudioUnitService", @"audio_play_callback:length:", @"remote"],
-        @[@"AUAudioDevice", @"NearendPcmReady:len:", @"mic"],
-        @[@"AUAudioDevice", @"FarendPcmReady:len:", @"remote"],
-        @[@"AUAudioDevice", @"onRecordData:size:", @"mic"],
-        @[@"AUAudioDevice", @"onPlaybackData:size:", @"remote"],
-        @[@"IlinkAudioMgr", @"onLocalAudioFrame:length:", @"mic"],
-        @[@"IlinkAudioMgr", @"onRemoteAudioFrame:length:", @"remote"],
-        @[@"IlinkAudioDevice", @"sendAudioData:length:", @"mic"],
-        @[@"IlinkAudioDevice", @"recvAudioData:length:", @"remote"],
-        @[@"VoIPMPAudioDevice", @"onCapturedData:length:", @"mic"],
-        @[@"VoIPMPAudioDevice", @"onRenderData:length:", @"remote"],
-        @[@"MMAudioDataPipe", @"pushAudioData:length:", @"mic"],
-        @[@"MMAudioDataPipe", @"popAudioData:length:", @"remote"],
-        @[@"WCAudioModule", @"deliverRecordedData:length:", @"mic"],
-        @[@"WCAudioModule", @"deliverPlaybackData:length:", @"remote"],
-
+        @"VOIPCSMgr", @"VoIPInvitationService", @"WCCallKitManager", @"VoipUIManager",
+        @"VoIPMainViewController", @"IlinkVoIPContext", @"MTVoipMgr"
     ];
     NSArray *propNames = @[
         @"m_currentContact", @"currentContact", @"m_contact", @"contact", @"remoteContact",
@@ -638,31 +693,39 @@ static NSString *WCRResolveActiveCallContact(void) {
             }
         } @catch (__unused NSException *e) {}
     }
+    NSString *uiName = WCRScrapeCallUIContactName();
+    if (uiName.length && !WCRLooksLikeBadDisplayName(uiName)) {
+        WCRSetLastContactHint(uiName);
+        return uiName;
+    }
     return nil;
 }
 
 static NSString *WCRBestSessionName(NSString *reason, NSString *hint) {
     NSString *active = WCRResolveActiveCallContact();
-    if (active.length && !WCRLooksLikeMethodName(active)) return active;
+    if (active.length && !WCRLooksLikeBadDisplayName(active)) return active;
 
-    NSArray *cands = @[
-        hint ?: @"",
-        WCRGetLastContactName() ?: @"",
-        WCRGetLastContactHint() ?: @""
-    ];
-    for (NSString *c in cands) {
-        if (c.length == 0) continue;
-        if (WCRLooksLikeMethodName(c)) continue;
-        NSString *r = WCRResolveRemarkName(c);
-        if (r.length && !WCRLooksLikeMethodName(r)) return r;
-        if (!WCRLooksLikeMethodName(c)) return c;
+    NSString *cached = WCRGetLastContactName();
+    if (cached.length && !WCRLooksLikeBadDisplayName(cached)) return cached;
+
+    if (hint.length && !WCRLooksLikeBadDisplayName(hint)) {
+        NSString *r = WCRResolveRemarkName(hint);
+        if (r.length && !WCRLooksLikeBadDisplayName(r)) return r;
+        if (!WCRLooksLikeBadDisplayName(hint)) return hint;
     }
-    // Never use selector/reason as display name.
-    (void)reason;
-    NSDateFormatter *fmt = [NSDateFormatter new];
-    fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
-    fmt.dateFormat = @"HHmmss";
-    return [NSString stringWithFormat:@"\u901a\u8bdd_%@", [fmt stringFromDate:[NSDate date]]];
+
+    NSString *rawHint = WCRGetLastContactHint();
+    if (rawHint.length && !WCRLooksLikeBadDisplayName(rawHint)) {
+        NSString *r = WCRResolveRemarkName(rawHint);
+        if (r.length && !WCRLooksLikeBadDisplayName(r)) return r;
+        return rawHint;
+    }
+
+    NSString *uiName = WCRScrapeCallUIContactName();
+    if (uiName.length && !WCRLooksLikeBadDisplayName(uiName)) return uiName;
+
+    if (reason.length && !WCRLooksLikeMethodName(reason) && !WCRLooksLikeBadDisplayName(reason)) return reason;
+    return @"\u901a\u8bdd";
 }
 
 static NSString *WCRContactHintFromObject(id obj) {
@@ -762,7 +825,11 @@ static BOOL WCRKeyLooksLifecycle(NSString *low) {
             [low containsString:@"ilinkopen"] || [low containsString:@"createmulti"] ||
             [low containsString:@"joinmulti"] || [low containsString:@"onaccept"] ||
             [low containsString:@"onmultitalk"] || [low containsString:@"stopfor"] ||
-            [low containsString:@"closewindow"]);
+            [low containsString:@"closewindow"] || [low containsString:@"setcategory"] ||
+            [low containsString:@"setactive"] || [low containsString:@"avaudiosession"] ||
+            [low containsString:@"voipview"] || [low containsString:@"onvoipcall"] ||
+            [low containsString:@"oncallend"] || [low containsString:@"rejectcall"] ||
+            [low containsString:@"hangupcall"] || [low containsString:@"dismissvoip"]);
 }
 static BOOL WCRKeyLooksAudio(NSString *low) {
     if (low.length == 0) return NO;
@@ -1093,6 +1160,82 @@ static BOOL WCRPCMBufferLooksSilent(const void *bytes, NSUInteger len) {
     return peak < 180;
 }
 
+
+static BOOL WCRViewTreeHasCallUI(UIView *view, int depth) {
+    if (!view || depth > 8) return NO;
+    const char *cn = class_getName(object_getClass(view));
+    if (cn && (WCRCaseContains(cn, "voip") || WCRCaseContains(cn, "ilink") ||
+               WCRCaseContains(cn, "multitalk") || WCRCaseContains(cn, "talk") ||
+               WCRCaseContains(cn, "callkit") || WCRCaseContains(cn, "confroom"))) {
+        return YES;
+    }
+    for (UIView *sub in view.subviews) {
+        if (WCRViewTreeHasCallUI(sub, depth + 1)) return YES;
+    }
+    return NO;
+}
+
+// Commercial plugin ends on StopForVoIP; free rewrite also watches call UI disappearance.
+static BOOL WCRIsLikelyInCallUI(void) {
+    @try {
+        UIWindow *key = WCRKeyWindow();
+        if (key && WCRViewTreeHasCallUI(key, 0)) return YES;
+        UIViewController *root = key.rootViewController;
+        for (int i = 0; i < 6 && root; i++) {
+            const char *cn = class_getName(object_getClass(root));
+            if (cn && (WCRCaseContains(cn, "voip") || WCRCaseContains(cn, "ilink") ||
+                       WCRCaseContains(cn, "multitalk") || WCRCaseContains(cn, "talk"))) {
+                return YES;
+            }
+            if (root.presentedViewController) root = root.presentedViewController;
+            else if ([root isKindOfClass:[UINavigationController class]])
+                root = ((UINavigationController *)root).visibleViewController;
+            else break;
+        }
+    } @catch (__unused NSException *e) {}
+    return NO;
+}
+
+
+static void WCRCollectLabels(UIView *view, NSMutableArray<NSString *> *out, int depth) {
+    if (!view || depth > 10 || out.count > 40) return;
+    @try {
+        if ([view isKindOfClass:[UILabel class]]) {
+            NSString *t = [((UILabel *)view).text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (t.length >= 1 && t.length <= 24 && !WCRLooksLikeBadDisplayName(t)) {
+                [out addObject:t];
+            }
+        } else if ([view isKindOfClass:[UIButton class]]) {
+            NSString *t = [((UIButton *)view).currentTitle stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (t.length >= 1 && t.length <= 24 && !WCRLooksLikeBadDisplayName(t)) {
+                [out addObject:t];
+            }
+        }
+        for (UIView *sub in view.subviews) WCRCollectLabels(sub, out, depth + 1);
+    } @catch (__unused NSException *e) {}
+}
+
+static NSString *WCRScrapeCallUIContactName(void) {
+    @try {
+        UIWindow *key = WCRKeyWindow();
+        if (!key) return nil;
+        NSMutableArray<NSString *> *labels = [NSMutableArray array];
+        WCRCollectLabels(key, labels, 0);
+        for (NSString *t in labels) {
+            if (WCRLooksLikeBadDisplayName(t)) continue;
+            BOOL hasCJK = NO;
+            for (NSUInteger i = 0; i < t.length; i++) {
+                if ([t characterAtIndex:i] > 0x2E80) { hasCJK = YES; break; }
+            }
+            if (hasCJK) return t;
+        }
+        for (NSString *t in labels) {
+            if (!WCRLooksLikeBadDisplayName(t)) return t;
+        }
+    } @catch (__unused NSException *e) {}
+    return nil;
+}
+
 #pragma mark - Session manager
 
 @interface WCRSessionManager : NSObject
@@ -1157,27 +1300,48 @@ static BOOL WCRPCMBufferLooksSilent(const void *bytes, NSUInteger len) {
     dispatch_source_set_event_handler(timer, ^{
         __strong typeof(weakSelf) self = weakSelf;
         if (!self || !self.recording) return;
-        // Keep hunting ObjC PCM sinks during the call (commercial model).
+        // Commercial model: keep hunting ObjC lifecycle + PCM sinks while call is active.
         dispatch_async(dispatch_get_main_queue(), ^{
             @try {
-                WCRInstallDiscoveredAudioHooks();
-                WCRInstallManualAudioHooks();
-                WCRInstallProbeAudioHooks();
-                WCRAggressiveAudioScan();
-                WCRInstallAudioUnitHooks();
+                WCRRescanAllHooks("idle-watchdog");
             } @catch (__unused NSException *e) {}
         });
         NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+        // Late remark resolve while recording.
+        if (!self.contactDisplayName.length || WCRLooksLikeBadDisplayName(self.contactDisplayName)) {
+            NSString *better = WCRBestSessionName(@"live", WCRGetLastContactHint());
+            if (better.length && !WCRLooksLikeBadDisplayName(better)) {
+                self.contactDisplayName = better;
+                if (self.meta) self.meta[@"displayName"] = better;
+            }
+        }
+        __block BOOL inCallUI = YES;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            inCallUI = WCRIsLikelyInCallUI();
+        });
+        if (!inCallUI) {
+            NSTimeInterval quietFor = (self.lastPCMAt > 0) ? (now - self.lastPCMAt) : 99.0;
+            if (!self.everHadPCM || quietFor > 2.0) {
+                WCRInfo("idle watchdog: call-ui-gone quiet=%.1fs everPCM=%d", quietFor, self.everHadPCM);
+                [self endWithReason:@"call-ui-gone"];
+                return;
+            }
+        }
         if (!self.everHadPCM) {
-            // Ilink path may never hit PCM hooks; don't leave "???" forever after hangup.
-            if (self.lastPCMAt > 0 && (now - self.lastPCMAt) > 25.0) {
+            NSTimeInterval age = now - self.lastPCMAt;
+            if (!inCallUI && age > 1.0) {
+                WCRInfo("idle watchdog: no-pcm-after-hangup");
+                [self endWithReason:@"no-pcm-after-hangup"];
+                return;
+            }
+            if (age > 20.0) {
                 WCRInfo("idle watchdog: no-pcm-timeout");
                 [self endWithReason:@"no-pcm-timeout"];
             }
             return;
         }
         NSTimeInterval ref = MAX(self.lastVoiceAt, self.lastPCMAt);
-        if (ref > 0 && (now - ref) > 8.0) {
+        if (ref > 0 && (now - ref) > 4.0) {
             WCRInfo("idle watchdog: idle-silence (%.1fs)", now - ref);
             [self endWithReason:@"idle-silence"];
         }
@@ -1240,6 +1404,8 @@ static BOOL WCRPCMBufferLooksSilent(const void *bytes, NSUInteger len) {
             // During an active call: commercial-style ObjC sink hunt + AU fallback.
             WCRAggressiveAudioScan();
             WCRInstallProbeAudioHooks();
+            static dispatch_once_t onceDump;
+            dispatch_once(&onceDump, ^{ WCRDumpAudioCandidates(); });
         } @catch (__unused NSException *e) {}
         if (!WCRBool(kWCRPrivateKey, NO)) WCRShowToast([NSString stringWithFormat:@"通话录音已开始\n%@", sid]);
         WCRUpdateIndicator(YES);
@@ -1287,12 +1453,16 @@ static BOOL WCRPCMBufferLooksSilent(const void *bytes, NSUInteger len) {
         if (!self.recording) return;
         [self stopIdleWatchdog];
         // Late contact resolve (Ilink sometimes only has contact after connected).
+        // Commercial plugin uses m_nsRemark / m_nsNickName for display naming.
         NSString *better = WCRBestSessionName(reason, self.contactDisplayName);
         BOOL weakName = (self.contactDisplayName.length == 0 ||
                          WCRLooksLikeMethodName(self.contactDisplayName) ||
-                         [self.contactDisplayName hasPrefix:@"\u901a\u8bdd_"] ||
-                         [self.contactDisplayName hasPrefix:@"通话_"]);
-        if (better.length && weakName && ![better isEqualToString:self.contactDisplayName] && !WCRLooksLikeMethodName(better)) {
+                         [self.contactDisplayName hasPrefix:@"通话_"] ||
+                         [self.contactDisplayName isEqualToString:@"unknown"] ||
+                         [self.contactDisplayName isEqualToString:@"auto"] ||
+                         [self.contactDisplayName isEqualToString:@"manual"]);
+        if (better.length && !WCRLooksLikeMethodName(better) &&
+            (weakName || ![better isEqualToString:self.contactDisplayName])) {
             self.contactDisplayName = better;
             self.meta[@"displayName"] = better;
             WCRInfo("resolved better displayName=%@", better);
@@ -1311,12 +1481,50 @@ static BOOL WCRPCMBufferLooksSilent(const void *bytes, NSUInteger len) {
             mp3OK = WCRExportSessionMP3(self.sessionDir, self.contactDisplayName ?: self.sessionID, self.sampleRate, &mp3Path);
         }
         self.micWriter = nil; self.remoteWriter = nil;
+
+        // Rename session folder to remark-based name (commercial-style display naming).
+        if (self.contactDisplayName.length && self.sessionDir.length && self.sessionID.length) {
+            NSString *safe = WCRSanitizeName(self.contactDisplayName);
+            if (safe.length && ![self.sessionID hasPrefix:safe]) {
+                NSString *ts = nil;
+                if (self.sessionID.length >= 15) {
+                    NSString *tail = [self.sessionID substringFromIndex:self.sessionID.length - 15];
+                    if (tail.length == 15 && [tail characterAtIndex:8] == '_') ts = tail;
+                }
+                NSString *newSid = ts.length ? [NSString stringWithFormat:@"%@_%@", safe, ts] : safe;
+                NSString *newDir = [[self rootDir] stringByAppendingPathComponent:newSid];
+                if (![newDir isEqualToString:self.sessionDir] &&
+                    ![[NSFileManager defaultManager] fileExistsAtPath:newDir]) {
+                    NSError *renErr = nil;
+                    if ([[NSFileManager defaultManager] moveItemAtPath:self.sessionDir toPath:newDir error:&renErr]) {
+                        WCRInfo("renamed session %@ -> %@", self.sessionID, newSid);
+                        self.sessionDir = newDir;
+                        self.sessionID = newSid;
+                        self.meta[@"id"] = newSid;
+                        self.meta[@"displayName"] = self.contactDisplayName;
+                        if (mp3Path.length && [mp3Path hasSuffix:@"/call.mp3"]) {
+                            mp3Path = [newDir stringByAppendingPathComponent:@"call.mp3"];
+                        }
+                        if (mp3OK) {
+                            NSString *fresh = nil;
+                            if (WCRExportSessionMP3(newDir, self.contactDisplayName, self.sampleRate, &fresh) && fresh.length) {
+                                mp3Path = fresh;
+                            }
+                        }
+                    } else {
+                        WCRInfo("session rename failed: %@", renErr);
+                    }
+                }
+            }
+        }
+
         self.meta[@"endedAt"] = @([NSDate date].timeIntervalSince1970);
         self.meta[@"endReason"] = reason ?: @"";
         self.meta[@"micBytes"] = @(self.micBytes);
         self.meta[@"remoteBytes"] = @(self.remoteBytes);
         self.meta[@"mixed"] = @(mixedOK);
         self.meta[@"mp3"] = @(mp3OK);
+        if (self.contactDisplayName.length) self.meta[@"displayName"] = self.contactDisplayName;
         if (mp3Path.length) self.meta[@"mp3Path"] = mp3Path;
         self.meta[@"lifecycleHooks"] = @(WCRLifecycleHookCount());
         self.meta[@"audioHooks"] = @(WCRAudioHookCount());
@@ -1339,11 +1547,11 @@ static BOOL WCRPCMBufferLooksSilent(const void *bytes, NSUInteger len) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (!WCRBool(kWCRPrivateKey, NO)) {
                 if (micB == 0 && remoteB == 0) {
-                    WCRShowToast([NSString stringWithFormat:@"通话录音已结束(无音频)\n%@\n打开悬浮球查看诊断，或用 Frida 补钩", dir.lastPathComponent]);
+                    WCRShowToast([NSString stringWithFormat:@"\u901a\u8bdd\u5f55\u97f3\u5df2\u7ed3\u675f(\u65e0\u97f3\u9891)\n%@\n\u6253\u5f00\u60ac\u6d6e\u7403\u67e5\u770b\u8bca\u65ad", dir.lastPathComponent]);
                 } else if (mp3OK) {
-                    WCRShowToast([NSString stringWithFormat:@"通话录音已保存(MP3)\n%@", mp3Show]);
+                    WCRShowToast([NSString stringWithFormat:@"\u901a\u8bdd\u5f55\u97f3\u5df2\u4fdd\u5b58(MP3)\n%@", mp3Show]);
                 } else {
-                    WCRShowToast([NSString stringWithFormat:@"通话录音已保存\n%@", dir.lastPathComponent]);
+                    WCRShowToast([NSString stringWithFormat:@"\u901a\u8bdd\u5f55\u97f3\u5df2\u4fdd\u5b58\n%@", dir.lastPathComponent]);
                 }
             }
             WCRUpdateIndicator(NO);
@@ -1396,7 +1604,7 @@ static BOOL WCRPCMBufferLooksSilent(const void *bytes, NSUInteger len) {
     NSString *mp3Meta = [meta isKindOfClass:[NSDictionary class]] ? meta[@"mp3Path"] : nil;
     if ([mp3Meta isKindOfClass:[NSString class]] && [fm fileExistsAtPath:mp3Meta]) {
         NSDictionary *attrs = [fm attributesOfItemAtPath:mp3Meta error:nil];
-        if ([attrs fileSize] > 256) return mp3Meta;
+        if ([attrs fileSize] > 1024) return mp3Meta;
     }
     NSArray *cands = @[
         [dir stringByAppendingPathComponent:@"call.mp3"],
@@ -1699,10 +1907,10 @@ static void WCREnsureFloatingBall(void) {
             cell.textLabel.text = [NSString stringWithFormat:@"生命周期钩子: %ld", (long)WCRLifecycleHookCount()];
             cell.detailTextLabel.text = [NSString stringWithFormat:@"音频钩子约: %ld  AU=%d%@  probe=%d/%d  发现=%lu  (总hook=%lu)",
                                         (long)WCRAudioHookCount(),
-                                        atomic_load(&gWCRAudioUnitHooksInstalled),
+                                        (int)atomic_load(&gWCRAudioUnitHooksInstalled),
                                         atomic_load(&gWCRAudioUnitHooksInstalled) ? @" fishhook/MS" : @" 未装",
-                                        atomic_load(&gWCRProbeHooksInstalled),
-                                        atomic_load(&gWCRProbeHits),
+                                        (int)atomic_load(&gWCRProbeHooksInstalled),
+                                        (int)atomic_load(&gWCRProbeHits),
                                         (unsigned long)WCRLoadDiscoveredHooks().count,
                                         (unsigned long)WCRHookedKeys().count];
         } else if (indexPath.row == 2) {
@@ -1764,12 +1972,10 @@ static void WCREnsureFloatingBall(void) {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     if (indexPath.section == 2) {
         if (indexPath.row == 0) {
-            WCRInstallLifecycle();
-            WCRInstallManualAudioHooks();
-            WCRAutoScanAudioHooks();
-            WCRAggressiveAudioScan();
-            WCRShowToast([NSString stringWithFormat:@"已扫描\n生命周期=%ld 音频约=%ld",
-                          (long)WCRLifecycleHookCount(), (long)WCRAudioHookCount()]);
+            WCRRescanAllHooks("manual");
+            WCRShowToast([NSString stringWithFormat:@"\u5df2\u626b\u63cf\n\u751f\u547d\u5468\u671f=%ld \u97f3\u9891\u7ea6=%ld AU=%d",
+                          (long)WCRLifecycleHookCount(), (long)WCRAudioHookCount(),
+                          (int)atomic_load(&gWCRAudioUnitHooksInstalled)]);
             [self reloadData];
         } else if (indexPath.row == 1) {
             if ([[WCRSessionManager shared] isRecording]) {
@@ -1783,7 +1989,7 @@ static void WCREnsureFloatingBall(void) {
             });
         } else if (indexPath.row == 2) {
             UIPasteboard.generalPasteboard.string = [[WCRSessionManager shared] rootDir];
-            WCRShowToast(@"路径已复制");
+            WCRShowToast(@"\u8def\u5f84\u5df2\u590d\u5236");
         } else {
             [self reloadData];
         }
@@ -1826,6 +2032,7 @@ static void WCREnsureFloatingBall(void) {
         return;
     }
     player.delegate = self;
+    player.volume = 1.0;
     self.player = player;
     self.playingPath = path;
     [player prepareToPlay];
@@ -1958,7 +2165,7 @@ static void WCR_repl_setting_viewDidAppear(id self, SEL _cmd, BOOL animated) {
         WCRBarTarget *target = [WCRBarTarget new];
         target.host = vc;
         objc_setAssociatedObject(vc, &kWCRBarTargetKey, target, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        UIBarButtonItem *btn = [[UIBarButtonItem alloc] initWithTitle:@"录音"
+        UIBarButtonItem *btn = [[UIBarButtonItem alloc] initWithTitle:@"\u5f55\u97f3"
                                                                 style:UIBarButtonItemStylePlain
                                                                target:target
                                                                action:@selector(open)];
@@ -2022,22 +2229,24 @@ static void WCRInstallUIEntries(void) {
 static void WCROnCallMaybeStarted(void) {
     static NSTimeInterval last = 0;
     NSTimeInterval now = [NSDate date].timeIntervalSinceReferenceDate;
-    if (now - last < 1.5) return;
+    if (now - last < 0.8) return;
     last = now;
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            // Crash-safe path: known lifecycle + audio hooks during live call accept.
-            WCRInstallLifecycle();
-            WCRInstallManualAudioHooks();
-            WCRAutoScanAudioHooks();
-            WCRInstallAudioUnitHooks();
-            WCRAggressiveAudioScan(); // allowed while recording / hunting PCM
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+            WCRRescanAllHooks("call-start");
+            WCRAggressiveAudioScan();
+            WCRDumpAudioCandidates();
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 @try {
-                    WCRInstallManualAudioHooks();
-                    WCRAutoScanAudioHooks();
-                    WCRInstallAudioUnitHooks();
+                    WCRRescanAllHooks("call-start+0.8");
+                    WCRAggressiveAudioScan();
+                } @catch (__unused NSException *e) {}
+            });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                @try {
+                    WCRRescanAllHooks("call-start+2.5");
                     WCRAggressiveAudioScan();
                 } @catch (__unused NSException *e) {}
             });
@@ -2110,7 +2319,8 @@ static void wcr_call_room(id self, SEL cmd, id roomID, id roomKey) {
     @try {
         if (WCREnabled()) {
             WCROnCallMaybeStarted();
-            NSString *hint = [NSString stringWithFormat:@"room-%@", WCRSafeDesc(roomID) ?: @"?"];
+            NSString *hint = WCRGetLastContactName() ?: WCRGetLastContactHint() ?: WCRScrapeCallUIContactName();
+            if (hint.length == 0 || WCRLooksLikeBadDisplayName(hint)) hint = @"\u901a\u8bdd";
             [[WCRSessionManager shared] beginWithReason:@"StartRecordAndPlayForVoIPWithRoomID" contactHint:hint sampleRate:WCRPreferredSampleRate()];
         }
     } @catch (__unused NSException *e) {}
@@ -2896,8 +3106,7 @@ static int WCRRebindSymbols(WCRRebindEntry *entries, size_t ne) {
 
 
 static void WCRInstallAudioUnitHooks(void) {
-    if (atomic_load(&gWCRAudioUnitHooksInstalled)) return;
-
+    // Do NOT early-return: WeChat may load audio images later; rebind each call.
     void *pStart = dlsym(RTLD_DEFAULT, "AudioOutputUnitStart");
     void *pRender = dlsym(RTLD_DEFAULT, "AudioUnitRender");
     void *pSetProp = dlsym(RTLD_DEFAULT, "AudioUnitSetProperty");
@@ -2908,55 +3117,61 @@ static void WCRInstallAudioUnitHooks(void) {
 
     int ok = 0;
     const char *via = "none";
+    static atomic_int sMSHookDone = 0;
 
-    // 1) Prefer MSHookFunction when Substrate/ElleKit is present.
-    WCRMSHookFunction_t hookFn = (WCRMSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
-    if (!hookFn) {
-        const char *libs[] = {
-            "/usr/lib/libsubstrate.dylib",
-            "/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate",
-            "@rpath/CydiaSubstrate.framework/CydiaSubstrate",
-            "/var/jb/usr/lib/libsubstrate.dylib",
-            "/var/jb/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate",
-            "/usr/lib/libellekit.dylib",
-            "/var/jb/usr/lib/libellekit.dylib",
-            NULL
-        };
-        for (int i = 0; libs[i]; i++) {
-            void *h = dlopen(libs[i], RTLD_LAZY);
-            if (!h) continue;
-            hookFn = (WCRMSHookFunction_t)dlsym(h, "MSHookFunction");
-            if (hookFn) break;
+    // 1) Prefer MSHookFunction when Substrate/ElleKit is present (only once).
+    if (!atomic_load(&sMSHookDone)) {
+        WCRMSHookFunction_t hookFn = (WCRMSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
+        if (!hookFn) {
+            const char *libs[] = {
+                "/usr/lib/libsubstrate.dylib",
+                "/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate",
+                "@rpath/CydiaSubstrate.framework/CydiaSubstrate",
+                "/var/jb/usr/lib/libsubstrate.dylib",
+                "/var/jb/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate",
+                "/usr/lib/libellekit.dylib",
+                "/var/jb/usr/lib/libellekit.dylib",
+                NULL
+            };
+            for (int i = 0; libs[i]; i++) {
+                void *h = dlopen(libs[i], RTLD_LAZY);
+                if (!h) continue;
+                hookFn = (WCRMSHookFunction_t)dlsym(h, "MSHookFunction");
+                if (hookFn) break;
+            }
         }
-    }
-    if (hookFn) {
-        if (pStart) {
-            hookFn(pStart, (void *)WCRRepl_AudioOutputUnitStart, (void **)&gWCROrigAudioOutputUnitStart);
-            if (gWCROrigAudioOutputUnitStart) ok++;
+        if (hookFn) {
+            if (pStart && !gWCROrigAudioOutputUnitStart) {
+                hookFn(pStart, (void *)WCRRepl_AudioOutputUnitStart, (void **)&gWCROrigAudioOutputUnitStart);
+                if (gWCROrigAudioOutputUnitStart) ok++;
+            }
+            if (pRender && !gWCROrigAudioUnitRender) {
+                hookFn(pRender, (void *)WCRRepl_AudioUnitRender, (void **)&gWCROrigAudioUnitRender);
+                if (gWCROrigAudioUnitRender) ok++;
+            }
+            if (pSetProp && !gWCROrigAudioUnitSetProperty) {
+                hookFn(pSetProp, (void *)WCRRepl_AudioUnitSetProperty, (void **)&gWCROrigAudioUnitSetProperty);
+                if (gWCROrigAudioUnitSetProperty) ok++;
+            }
+            if (ok > 0) {
+                via = "MSHookFunction";
+                atomic_store(&sMSHookDone, 1);
+            }
         }
-        if (pRender) {
-            hookFn(pRender, (void *)WCRRepl_AudioUnitRender, (void **)&gWCROrigAudioUnitRender);
-            if (gWCROrigAudioUnitRender) ok++;
-        }
-        if (pSetProp) {
-            hookFn(pSetProp, (void *)WCRRepl_AudioUnitSetProperty, (void **)&gWCROrigAudioUnitSetProperty);
-            if (gWCROrigAudioUnitSetProperty) ok++;
-        }
-        if (ok > 0) via = "MSHookFunction";
+    } else if (gWCROrigAudioOutputUnitStart || gWCROrigAudioUnitRender || gWCROrigAudioUnitSetProperty) {
+        ok = 1;
+        via = "MSHookFunction";
     }
 
-    // 2) Fallback: fishhook rebind (TrollFools / no Substrate).
-    if (ok == 0) {
-        gWCROrigAudioOutputUnitStart = NULL;
-        gWCROrigAudioUnitRender = NULL;
-        gWCROrigAudioUnitSetProperty = NULL;
+    // 2) Always re-run fishhook/chained rebind so newly loaded WeChat images get patched.
+    //    Keep existing originals if already captured (do not reset to NULL).
+    {
         WCRRebindEntry entries[] = {
             { "AudioOutputUnitStart", (void *)WCRRepl_AudioOutputUnitStart, (void **)&gWCROrigAudioOutputUnitStart, 0 },
             { "AudioUnitRender", (void *)WCRRepl_AudioUnitRender, (void **)&gWCROrigAudioUnitRender, 0 },
             { "AudioUnitSetProperty", (void *)WCRRepl_AudioUnitSetProperty, (void **)&gWCROrigAudioUnitSetProperty, 0 },
         };
         int slots = WCRRebindSymbols(entries, sizeof(entries) / sizeof(entries[0]));
-        // If a slot was rewritten but original pointer wasn't captured, seed from dlsym.
         if (entries[0].slots > 0 && !gWCROrigAudioOutputUnitStart && pStart)
             gWCROrigAudioOutputUnitStart = (WCRAudioOutputUnitStart_t)pStart;
         if (entries[1].slots > 0 && !gWCROrigAudioUnitRender && pRender)
@@ -2964,18 +3179,22 @@ static void WCRInstallAudioUnitHooks(void) {
         if (entries[2].slots > 0 && !gWCROrigAudioUnitSetProperty && pSetProp)
             gWCROrigAudioUnitSetProperty = (WCRAudioUnitSetProperty_t)pSetProp;
 
-        if (entries[0].slots > 0) ok++;
-        if (entries[1].slots > 0) ok++;
-        if (entries[2].slots > 0) ok++;
-        if (ok > 0) via = "fishhook";
-        WCRInfo("AudioUnit rebind slots=%d classic/chained (start=%d render=%d set=%d)",
-                slots, entries[0].slots, entries[1].slots, entries[2].slots);
+        int rb = 0;
+        if (entries[0].slots > 0) rb++;
+        if (entries[1].slots > 0) rb++;
+        if (entries[2].slots > 0) rb++;
+        if (rb > 0) {
+            if (ok == 0) via = "fishhook";
+            ok = ok > rb ? ok : rb;
+            WCRInfo("AudioUnit rebind slots=%d classic/chained (start=%d render=%d set=%d)",
+                    slots, entries[0].slots, entries[1].slots, entries[2].slots);
+        }
     }
 
     if (ok > 0) {
         atomic_store(&gWCRAudioUnitHooksInstalled, 1);
         atomic_store(&gWCRAudioHooksInstalled, 1);
-        WCRInfo("AudioUnit C hooks installed (%d) via %s", ok, via);
+        WCRInfo("AudioUnit C hooks ready (%d) via %s", ok, via);
     } else {
         WCRInfo("AudioUnit hooks NOT installed (no MSHookFunction / fishhook miss)");
     }
@@ -2983,9 +3202,6 @@ static void WCRInstallAudioUnitHooks(void) {
 
 
 #pragma mark - Runtime PCM probe (learn commercial ObjC-sink model)
-
-static atomic_int gWCRProbeHooksInstalled = 0;
-static atomic_int gWCRProbeHits = 0;
 
 static BOOL WCRLooksLikePCMLength(NSInteger n) {
     if (n < 160 || n > 64 * 1024) return NO;
@@ -3324,67 +3540,141 @@ static void WCRInstallProbeAudioHooks(void) {
     }
 }
 
+static IMP WCRPickLifecycleIMP(const char *selName, unsigned argc) {
+    if (!selName) return NULL;
+    // Only return trampolines whose ABI matches argc. Wrong arity = crash on answer.
+    if (strcmp(selName, "StartRecordAndPlayForVoIPWithRoomID:roomKey:") == 0) {
+        return (argc == 4) ? (IMP)wcr_call_room : NULL;
+    }
+    if (strcmp(selName, "ilinkOpenWindowWithContact:msgWrap:isCaller:from:startInApp:isEarMode:isAudioMode:") == 0) {
+        return (argc == 9) ? (IMP)wcr_ilink_open : NULL;
+    }
+    if (strcmp(selName, "joinMultiTalkWithGroup:roomId:roomKey:joinSuccessHandler:") == 0) {
+        return (argc == 6) ? (IMP)wcr_call_join : NULL;
+    }
+    if (strcmp(selName, "createMultiTalkWithContacts:withChatroomUsername:") == 0) {
+        return (argc == 4) ? (IMP)wcr_call_id_id : NULL;
+    }
+    if (strstr(selName, "Stop") || strstr(selName, "Hangup") || strstr(selName, "Reject") ||
+        strstr(selName, "Cancel") || strstr(selName, "CloseWindow") || strstr(selName, "hangup") ||
+        strstr(selName, "reject") || strstr(selName, "cancel") || strstr(selName, "End") ||
+        strstr(selName, "endCall") || strstr(selName, "dismiss") || strstr(selName, "Dismiss")) {
+        if (!(strstr(selName, "Start") || strstr(selName, "Enter") || strstr(selName, "Invite") ||
+              strstr(selName, "Accept") || strstr(selName, "Begin") || strstr(selName, "Open") ||
+              strstr(selName, "Create") || strstr(selName, "Join") || strstr(selName, "show") ||
+              strstr(selName, "Show") || strstr(selName, "present") || strstr(selName, "Present"))) {
+            if (argc == 2) return (IMP)wcr_stop;
+            if (argc == 3) return (IMP)wcr_stop_id;
+            return NULL;
+        }
+    }
+    if (argc == 2) return (IMP)wcr_call_void;
+    if (argc == 3) return (IMP)wcr_call_id;
+    if (argc == 4) return (IMP)wcr_call_id_id;
+    return NULL; // refuse unknown high-arity signatures
+}
+
 static void WCRInstallLifecycle(void) {
-    // Only hook known selectors with exact argc. Wrong ABI here crashes on accept.
-    struct Item { const char *selName; IMP repl; int argcHint; } items[] = {
-        {"StartRecordAndPlayForVoIP", (IMP)wcr_call_void, 0},
-        {"StartRecordAndPlayForVoIPInterruptionRecovery", (IMP)wcr_call_void, 0},
-        {"StartRecordAndPlayForMuTalk", (IMP)wcr_call_void, 0},
-        {"StartRecordAndPlayForIlink:", (IMP)wcr_call_id, 1},
-        {"StartRecordAndPlayForVoIPWithRoomID:roomKey:", (IMP)wcr_call_room, 2},
-        {"ilinkOpenWindowWithContact:msgWrap:isCaller:from:startInApp:isEarMode:isAudioMode:", (IMP)wcr_ilink_open, 7},
-        {"StopForVoIP", (IMP)wcr_stop, 0},
-        // Prefer VoIP-specific stop selectors only (generic hangup/reject is crash-prone).
-        {"StopRecordAndPlayForVoIP", (IMP)wcr_stop, 0},
-        {"StopRecordAndPlayForMuTalk", (IMP)wcr_stop, 0},
-        {"StopRecordAndPlayForIlink", (IMP)wcr_stop, 0},
-        {"StopRecordAndPlayForIlink:", (IMP)wcr_stop_id, 1},
-        {"StopRecordAndPlayForVoIPInterruptionRecovery", (IMP)wcr_stop, 0},
-        {"StopRecordAndPlay", (IMP)wcr_stop, 0},
-        {"onMultiTalkMainViewControllerHangup", (IMP)wcr_stop, 0},
-        {"onMultiTalkMainViewControllerReject", (IMP)wcr_stop, 0},
-        {"onMultiTalkMainViewControllerCancel", (IMP)wcr_stop, 0},
-        {"onMultiTalkMainViewControllerHangup:", (IMP)wcr_stop_id, 1},
-        {"onMultiTalkMainViewControllerReject:", (IMP)wcr_stop_id, 1},
-        {"onMultiTalkMainViewControllerCancel:", (IMP)wcr_stop_id, 1},
-        {"onMultiTalkMainViewControllerCloseWindow", (IMP)wcr_stop, 0},
-        {"onMultiTalkMainViewControllerCloseWindow:", (IMP)wcr_stop_id, 1},
-        {"onEnterMultiTalk:", (IMP)wcr_call_id, 1},
-        {"onInviteMultiTalk:", (IMP)wcr_call_id, 1},
-        {"onAcceptSubCallMultiTalk:", (IMP)wcr_call_id, 1},
-        {"onMultiTalkMainViewControllerAcceptWithGroup:", (IMP)wcr_call_id, 1},
-        {"createMultiTalkWithContacts:withChatroomUsername:", (IMP)wcr_call_id_id, 2},
-        {"joinMultiTalkWithGroup:roomId:roomKey:joinSuccessHandler:", (IMP)wcr_call_join, 4},
-        {"openAudioWindowWithContext:", (IMP)wcr_call_id, 1},
-        {"openVideoWindowWithContext:", (IMP)wcr_call_id, 1},
-        {NULL, NULL, 0}
+    // Commercial plaintext lifecycle selectors (from WCallRecorder.dylib strings).
+    static const char *selNames[] = {
+        "StartRecordAndPlayForVoIP",
+        "StartRecordAndPlayForVoIPInterruptionRecovery",
+        "StartRecordAndPlayForMuTalk",
+        "StartRecordAndPlayForIlink:",
+        "StartRecordAndPlayForVoIPWithRoomID:roomKey:",
+        "ilinkOpenWindowWithContact:msgWrap:isCaller:from:startInApp:isEarMode:isAudioMode:",
+        "StopForVoIP",
+        "StopRecordAndPlayForVoIP",
+        "StopRecordAndPlayForMuTalk",
+        "StopRecordAndPlayForIlink",
+        "StopRecordAndPlayForIlink:",
+        "StopRecordAndPlayForVoIPInterruptionRecovery",
+        "StopRecordAndPlay",
+        "onMultiTalkMainViewControllerHangup",
+        "onMultiTalkMainViewControllerReject",
+        "onMultiTalkMainViewControllerCancel",
+        "onMultiTalkMainViewControllerHangup:",
+        "onMultiTalkMainViewControllerReject:",
+        "onMultiTalkMainViewControllerCancel:",
+        "onMultiTalkMainViewControllerCloseWindow",
+        "onMultiTalkMainViewControllerCloseWindow:",
+        "onEnterMultiTalk:",
+        "onInviteMultiTalk:",
+        "onAcceptSubCallMultiTalk:",
+        "onMultiTalkMainViewControllerAcceptWithGroup:",
+        "createMultiTalkWithContacts:withChatroomUsername:",
+        "joinMultiTalkWithGroup:roomId:roomKey:joinSuccessHandler:",
+        "openAudioWindowWithContext:",
+        "openVideoWindowWithContext:",
+        "startVoipViewWithContact:",
+        "startVoipViewByCallKitWithContact:",
+        "openVoipViewWithContact:",
+        "showVoipViewWithContact:",
+        "presentVoipUIWithContact:",
+        "onVoipCallBegin",
+        "onVoipCallEnd",
+        "onVoipCallEnd:",
+        "onCallEnd",
+        "onCallEnd:",
+        "hangupCall",
+        "hangupCall:",
+        "hangUp",
+        "hangUp:",
+        "endCall",
+        "endCall:",
+        "rejectCall",
+        "rejectCall:",
+        "cancelCall",
+        "cancelCall:",
+        "closeVoipWindow",
+        "closeVoipWindow:",
+        "dismissVoipUI",
+        "dismissVoipUI:",
+        NULL
     };
     int hooked = 0;
-    for (int i = 0; items[i].selName; i++) {
-        SEL sel = sel_registerName(items[i].selName);
+    for (int i = 0; selNames[i]; i++) {
+        SEL sel = sel_registerName(selNames[i]);
         NSMutableArray *classes = [NSMutableArray array];
         for (NSString *name in WCRPreferredClasses()) {
             Class cls = NSClassFromString(name);
             if (cls && class_getInstanceMethod(cls, sel)) [classes addObject:cls];
+            Class meta = cls ? object_getClass((id)cls) : Nil;
+            if (meta && class_getInstanceMethod(meta, sel) && ![classes containsObject:meta]) {
+                [classes addObject:meta];
+            }
         }
-        if (classes.count == 0) {
-            Class cls = WCRFindClassForSelector(sel, YES);
-            if (cls) [classes addObject:cls];
+        unsigned int count = 0;
+        Class *all = objc_copyClassList(&count);
+        for (unsigned int c = 0; c < count; c++) {
+            Class cls = all[c];
+            if (!class_getInstanceMethod(cls, sel)) continue;
+            const char *cn = class_getName(cls);
+            if (!cn) continue;
+            BOOL prefer = WCRCaseContains(cn, "voip") || WCRCaseContains(cn, "multitalk") ||
+                          WCRCaseContains(cn, "ilink") || WCRCaseContains(cn, "audio") ||
+                          WCRCaseContains(cn, "talk") || WCRCaseContains(cn, "conf") ||
+                          WCRCaseContains(cn, "cloud") || WCRCaseContains(cn, "live") ||
+                          WCRCaseContains(cn, "component") || WCRCaseContains(cn, "mgr");
+            if (prefer || classes.count == 0) {
+                if (![classes containsObject:cls]) [classes addObject:cls];
+            }
         }
+        if (all) free(all);
+
         for (Class cls in classes) {
             Method m = class_getInstanceMethod(cls, sel);
             if (!m) continue;
             unsigned argc = method_getNumberOfArguments(m);
-            // self + _cmd + args
-            if (argc != (unsigned)(2 + items[i].argcHint)) {
-                WCRLog("skip lifecycle %s on %s argc=%u expected=%d",
-                       items[i].selName, class_getName(cls), argc, 2 + items[i].argcHint);
-                continue;
-            }
             char ret[8] = {0};
             method_getReturnType(m, ret, sizeof(ret));
-            if (ret[0] != 'v') continue;
-            if (WCRHookInstance(cls, sel, items[i].repl)) hooked++;
+            if (ret[0] != 'v') continue; // avoid ABI crash on non-void
+            IMP repl = WCRPickLifecycleIMP(selNames[i], argc);
+            if (!repl) continue;
+            if (WCRHookInstance(cls, sel, repl)) {
+                hooked++;
+                WCRLog("lifecycle ok -[%s %s] argc=%u", class_getName(cls), selNames[i], argc);
+            }
         }
     }
     if (hooked > 0) {
@@ -3567,6 +3857,229 @@ static void WCRAggressiveAudioScan(void) {
     }
 }
 
+
+#pragma mark - Commercial-style rescan / AVAudioSession / dyld
+
+static BOOL WCRCategoryLooksLikeCall(NSString *cat, NSString *mode) {
+    if (cat.length == 0 && mode.length == 0) return NO;
+    NSString *c = cat.lowercaseString ?: @"";
+    NSString *m = mode.lowercaseString ?: @"";
+    if ([c containsString:@"playandrecord"] || [c containsString:@"record"]) return YES;
+    if ([c isEqualToString:[AVAudioSessionCategoryPlayAndRecord lowercaseString]]) return YES;
+    if ([c isEqualToString:[AVAudioSessionCategoryRecord lowercaseString]]) return YES;
+    if ([m containsString:@"voicechat"] || [m containsString:@"videochat"] ||
+        [m containsString:@"voip"] || [m containsString:@"gamechat"]) return YES;
+    if ([m isEqualToString:[AVAudioSessionModeVoiceChat lowercaseString]]) return YES;
+    if ([m isEqualToString:[AVAudioSessionModeVideoChat lowercaseString]]) return YES;
+    return NO;
+}
+
+static void WCRNoteCallAudioMaybeStarted(NSString *why, NSString *cat, NSString *mode) {
+    if (!WCREnabled()) return;
+    if (!WCRCategoryLooksLikeCall(cat, mode)) return;
+    @try {
+        WCROnCallMaybeStarted();
+        NSString *hint = WCRGetLastContactName() ?: WCRGetLastContactHint() ?: WCRScrapeCallUIContactName();
+        if (hint.length == 0 || WCRLooksLikeBadDisplayName(hint)) hint = @"\u901a\u8bdd";
+        [[WCRSessionManager shared] beginWithReason:(why ?: @"AVAudioSession") contactHint:hint sampleRate:WCRPreferredSampleRate()];
+    } @catch (__unused NSException *e) {}
+}
+
+static void WCRNoteCallAudioMaybeEnded(NSString *why) {
+    @try {
+        if (![[WCRSessionManager shared] isRecording]) return;
+        BOOL inCall = NO;
+        @try { inCall = WCRIsLikelyInCallUI(); } @catch (__unused NSException *e) {}
+        if (inCall) {
+            WCRInfo("AVAudioSession end signal ignored (still in call UI): %@", why ?: @"?");
+            return;
+        }
+        [[WCRSessionManager shared] endWithReason:(why ?: @"AVAudioSession-end")];
+    } @catch (__unused NSException *e) {}
+}
+
+static BOOL (*WCR_orig_setCategory1)(id, SEL, id, id *) = NULL;
+static BOOL WCR_repl_setCategory1(id self, SEL cmd, id category, id *err) {
+    BOOL ok = YES;
+    if (WCR_orig_setCategory1) ok = WCR_orig_setCategory1(self, cmd, category, err);
+    else {
+        IMP o = WCRLookupOrig(self, cmd);
+        if (o) ok = ((BOOL(*)(id, SEL, id, id *))o)(self, cmd, category, err);
+    }
+    @try {
+        NSString *cat = [category isKindOfClass:[NSString class]] ? (NSString *)category : [category description];
+        WCRNoteCallAudioMaybeStarted(@"setCategory", cat, nil);
+        WCRLog("AVAudioSession setCategory:%@", cat);
+    } @catch (__unused NSException *e) {}
+    return ok;
+}
+
+static BOOL (*WCR_orig_setCategory4)(id, SEL, id, id, NSUInteger, id *) = NULL;
+static BOOL WCR_repl_setCategory4(id self, SEL cmd, id category, id mode, NSUInteger options, id *err) {
+    BOOL ok = YES;
+    if (WCR_orig_setCategory4) ok = WCR_orig_setCategory4(self, cmd, category, mode, options, err);
+    else {
+        IMP o = WCRLookupOrig(self, cmd);
+        if (o) ok = ((BOOL(*)(id, SEL, id, id, NSUInteger, id *))o)(self, cmd, category, mode, options, err);
+    }
+    @try {
+        NSString *cat = [category isKindOfClass:[NSString class]] ? (NSString *)category : [category description];
+        NSString *md = [mode isKindOfClass:[NSString class]] ? (NSString *)mode : [mode description];
+        WCRNoteCallAudioMaybeStarted(@"setCategory:mode:", cat, md);
+        WCRLog("AVAudioSession setCategory:%@ mode:%@", cat, md);
+    } @catch (__unused NSException *e) {}
+    return ok;
+}
+
+static BOOL (*WCR_orig_setActive)(id, SEL, BOOL, id *) = NULL;
+static BOOL WCR_repl_setActive(id self, SEL cmd, BOOL active, id *err) {
+    BOOL ok = YES;
+    if (WCR_orig_setActive) ok = WCR_orig_setActive(self, cmd, active, err);
+    else {
+        IMP o = WCRLookupOrig(self, cmd);
+        if (o) ok = ((BOOL(*)(id, SEL, BOOL, id *))o)(self, cmd, active, err);
+    }
+    @try {
+        if (active) {
+            NSString *cat = nil; NSString *mode = nil;
+            @try {
+                AVAudioSession *s = [AVAudioSession sharedInstance];
+                cat = s.category; mode = s.mode;
+            } @catch (__unused NSException *e) {}
+            WCRNoteCallAudioMaybeStarted(@"setActive:YES", cat, mode);
+        } else {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                WCRNoteCallAudioMaybeEnded(@"setActive:NO");
+            });
+        }
+    } @catch (__unused NSException *e) {}
+    return ok;
+}
+
+static void WCRInstallAVAudioSessionHooks(void) {
+    Class cls = NSClassFromString(@"AVAudioSession");
+    if (!cls) return;
+    int n = 0;
+    SEL s1 = @selector(setCategory:error:);
+    if (class_getInstanceMethod(cls, s1)) {
+        Method m = class_getInstanceMethod(cls, s1);
+        if (m) {
+            char ret[8] = {0}; method_getReturnType(m, ret, sizeof(ret));
+            if (ret[0] == 'B' || ret[0] == 'c') {
+                BOOL newly = WCRHookInstance(cls, s1, (IMP)WCR_repl_setCategory1);
+                NSValue *v = WCROrigMap()[WCRHookKey(cls, s1)];
+                if (v) WCR_orig_setCategory1 = (BOOL(*)(id,SEL,id,id*))v.pointerValue;
+                if (newly) n++;
+            }
+        }
+    }
+    SEL s4 = @selector(setCategory:mode:options:error:);
+    if (class_getInstanceMethod(cls, s4)) {
+        Method m = class_getInstanceMethod(cls, s4);
+        if (m) {
+            char ret[8] = {0}; method_getReturnType(m, ret, sizeof(ret));
+            if (ret[0] == 'B' || ret[0] == 'c') {
+                BOOL newly = WCRHookInstance(cls, s4, (IMP)WCR_repl_setCategory4);
+                NSValue *v = WCROrigMap()[WCRHookKey(cls, s4)];
+                if (v) WCR_orig_setCategory4 = (BOOL(*)(id,SEL,id,id,NSUInteger,id*))v.pointerValue;
+                if (newly) n++;
+            }
+        }
+    }
+    SEL sa = @selector(setActive:error:);
+    if (class_getInstanceMethod(cls, sa)) {
+        Method m = class_getInstanceMethod(cls, sa);
+        if (m) {
+            char ret[8] = {0}; method_getReturnType(m, ret, sizeof(ret));
+            if (ret[0] == 'B' || ret[0] == 'c') {
+                BOOL newly = WCRHookInstance(cls, sa, (IMP)WCR_repl_setActive);
+                NSValue *v = WCROrigMap()[WCRHookKey(cls, sa)];
+                if (v) WCR_orig_setActive = (BOOL(*)(id,SEL,BOOL,id*))v.pointerValue;
+                if (newly) n++;
+            }
+        }
+    }
+    if (n > 0) {
+        atomic_fetch_add(&gWCRLifecycleHooksInstalled, n);
+        WCRInfo("AVAudioSession hooks newly installed: %d", n);
+    }
+}
+
+static void WCRRescanAllHooks(const char *why) {
+    static atomic_int busy = 0;
+    static double last = 0;
+    double now = [NSDate date].timeIntervalSinceReferenceDate;
+    BOOL force = (why && (strstr(why, "manual") || strstr(why, "call-start") || strstr(why, "constructor")));
+    if (!force && (now - last) < 0.75) return;
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&busy, &expected, 1)) {
+        // Do not drop forced scans (constructor/call-start/manual).
+        if (force) {
+            const char *whyCopy = why ? why : "retry";
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                WCRRescanAllHooks(whyCopy);
+            });
+        }
+        return;
+    }
+    last = now;
+    @try {
+        WCRInfo("rescan hooks (%s) begin life~%ld audio~%ld AU=%d total=%lu",
+                why ?: "?",
+                (long)WCRLifecycleHookCount(),
+                (long)WCRAudioHookCount(),
+                (int)atomic_load(&gWCRAudioUnitHooksInstalled),
+                (unsigned long)WCRHookedKeys().count);
+        WCRInstallLifecycle();
+        WCRInstallAVAudioSessionHooks();
+        WCRInstallDiscoveredAudioHooks();
+        WCRInstallManualAudioHooks();
+        WCRAutoScanAudioHooks();
+        WCRInstallProbeAudioHooks();
+        WCRInstallAudioUnitHooks();
+        BOOL recording = NO;
+        @try { recording = [[WCRSessionManager shared] isRecording]; } @catch (__unused NSException *e) {}
+        if (WCRVerboseFlag() || recording || (why && strstr(why, "call-start"))) {
+            WCRAggressiveAudioScan();
+        }
+        if (recording || (why && strstr(why, "call-start"))) {
+            @try { WCRDumpAudioCandidates(); } @catch (__unused NSException *e) {}
+        }
+        WCRInfo("rescan hooks (%s) end life=%ld audio~%ld AU=%d probe=%d/%d total=%lu",
+                why ?: "?",
+                (long)WCRLifecycleHookCount(),
+                (long)WCRAudioHookCount(),
+                (int)atomic_load(&gWCRAudioUnitHooksInstalled),
+                (int)atomic_load(&gWCRProbeHooksInstalled),
+                (int)atomic_load(&gWCRProbeHits),
+                (unsigned long)WCRHookedKeys().count);
+    } @catch (NSException *e) {
+        WCRInfo("rescan exception: %@", e);
+    }
+    atomic_store(&busy, 0);
+}
+
+static void WCRDyldAddImageCallback(const struct mach_header *mh, intptr_t slide) {
+    (void)mh; (void)slide;
+    static atomic_int pending = 0;
+    if (atomic_exchange(&pending, 1)) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        atomic_store(&pending, 0);
+        if (!WCREnabled()) return;
+        @try {
+            WCRRescanAllHooks("dyld-add-image");
+        } @catch (__unused NSException *e) {}
+    });
+}
+
+static void WCRRegisterDyldObserver(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        _dyld_register_func_for_add_image(WCRDyldAddImageCallback);
+        WCRInfo("dyld add-image observer registered");
+    });
+}
+
 static void WCRObserveLifecycle(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
@@ -3577,6 +4090,26 @@ static void WCRObserveLifecycle(void) {
             WCREnsureFloatingBall();
             // Registration is once-guarded; safe to retry if WCPluginsMgr appears late.
             WCRTryRegisterPlugin();
+            if (WCREnabled()) {
+                @try { WCRRescanAllHooks("become-active"); } @catch (__unused NSException *e) {}
+            }
+        }];
+        [[NSNotificationCenter defaultCenter] addObserverForName:AVAudioSessionInterruptionNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
+            @try {
+                NSNumber *type = n.userInfo[AVAudioSessionInterruptionTypeKey];
+                if (type && type.unsignedIntegerValue == AVAudioSessionInterruptionTypeEnded) {
+                    // Call audio stack often flushes on interruption end; re-arm hooks.
+                    if (WCREnabled()) WCRRescanAllHooks("audio-interruption-end");
+                }
+            } @catch (__unused NSException *e) {}
+        }];
+        [[NSNotificationCenter defaultCenter] addObserverForName:AVAudioSessionRouteChangeNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(__unused NSNotification *n) {
+            @try {
+                if (!WCREnabled()) return;
+                if ([[WCRSessionManager shared] isRecording]) {
+                    WCRRescanAllHooks("route-change");
+                }
+            } @catch (__unused NSException *e) {}
         }];
     });
 }
@@ -3585,24 +4118,25 @@ __attribute__((constructor))
 static void WCallRecorderInit(void) {
     @autoreleasepool {
         WCRInfo("free rewrite for WeChat 8.0.71 loaded (v%@, enabled=%d, no auth)", kWCRPluginVersion, WCREnabled());
+        WCRRegisterDyldObserver();
         dispatch_async(dispatch_get_main_queue(), ^{
             WCRInstallUIEntries();
+            WCRObserveLifecycle();
         });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             if (!WCREnabled()) { WCRInfo("disabled WCR.Enabled=0"); return; }
             @try {
                 WCRInstallUIEntries();
-                WCRInstallLifecycle();
-                WCRInstallDiscoveredAudioHooks();
-                WCRInstallManualAudioHooks();
-                WCRAutoScanAudioHooks();
-                WCRInstallAudioUnitHooks();
-                WCRObserveLifecycle();
+                WCRRescanAllHooks("constructor+1s");
                 WCREnsureFloatingBall();
                 if (!WCRBool(kWCRPrivateKey, NO)) {
-                    WCRShowToast([NSString stringWithFormat:@"WCallRecorder 已加载 v%@\n点右下角蓝色悬浮球打开", kWCRPluginVersion]);
+                    WCRShowToast([NSString stringWithFormat:@"WCallRecorder \u5df2\u52a0\u8f7d v%@\n\u70b9\u53f3\u4e0b\u89d2\u84dd\u8272\u60ac\u6d6e\u7403\u6253\u5f00", kWCRPluginVersion]);
                 }
-                WCRInfo("ready for 8.0.71 => %@ (life=%ld audio~%ld)", [[WCRSessionManager shared] rootDir], (long)WCRLifecycleHookCount(), (long)WCRAudioHookCount());
+                WCRInfo("ready for 8.0.71 => %@ (life=%ld audio~%ld AU=%d)",
+                        [[WCRSessionManager shared] rootDir],
+                        (long)WCRLifecycleHookCount(),
+                        (long)WCRAudioHookCount(),
+                        (int)atomic_load(&gWCRAudioUnitHooksInstalled));
             } @catch (NSException *e) {
                 WCRInfo("install exception: %@", e);
             }
@@ -3611,12 +4145,7 @@ static void WCallRecorderInit(void) {
             if (!WCREnabled()) return;
             @try {
                 WCRInstallUIEntries();
-                WCRInstallLifecycle();
-                WCRInstallDiscoveredAudioHooks();
-                WCRInstallManualAudioHooks();
-                WCRAutoScanAudioHooks();
-                WCRInstallAudioUnitHooks();
-                if (WCRVerboseFlag()) WCRAggressiveAudioScan();
+                WCRRescanAllHooks("constructor+3s");
                 WCREnsureFloatingBall();
             } @catch (__unused NSException *e) {}
         });
@@ -3624,14 +4153,13 @@ static void WCallRecorderInit(void) {
             if (!WCREnabled()) return;
             @try {
                 WCRTryRegisterPlugin();
-                WCRInstallLifecycle();
-                WCRInstallDiscoveredAudioHooks();
-                WCRInstallManualAudioHooks();
-                WCRAutoScanAudioHooks();
-                WCRInstallAudioUnitHooks();
-                if (WCRVerboseFlag()) WCRAggressiveAudioScan();
+                WCRRescanAllHooks("constructor+8s");
                 WCREnsureFloatingBall();
             } @catch (__unused NSException *e) {}
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (!WCREnabled()) return;
+            @try { WCRRescanAllHooks("constructor+20s"); } @catch (__unused NSException *e) {}
         });
     }
 }
