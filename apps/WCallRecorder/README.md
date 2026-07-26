@@ -10,14 +10,22 @@ HiveNoAds 内的**免费、无授权**微信通话录音模块。
 - Bootstrap / RootHide（`iphoneos-arm64e`）
 - 也可经 TrollFools 等注入器注入 `WCallRecorder.dylib`
 
+## v0.4.0 可见入口（解决“插件里看不到”）
+
+1. **蓝色悬浮球**（默认开启）— 点开设置/录音列表  
+2. 微信 **我 → 设置** 右上角 **「录音」** 按钮  
+3. 若设备有 `WCPluginsMgr` 插件中心，会注册 **「WCallRecorder 通话录音」**  
+4. 启动约 1 秒后 Toast：`WCallRecorder 已加载 v0.4.0`
+
 ## 功能
 
 - 语音 / 视频通话、ilink、MultiTalk 生命周期检测
 - 双轨 PCM 落盘：`mic.wav` + `remote.wav`
 - 可选混音：`mixed.wav`（`WCR.WriteMixed`，默认开）
 - 会话元数据：`meta.json`
-- 通话中 `REC` 指示条 + 中文 Toast（可关）
-- 纯 ObjC runtime hook，仅依赖 Foundation + UIKit（适配仓库默认 CI）
+- 通话中 `REC` 指示条 + 中文 Toast
+- 设置页：开关 / 钩子诊断 / 强制测试会话 / 最近录音列表
+- 纯 ObjC runtime hook，仅依赖 Foundation + UIKit
 
 ## 保存位置（微信沙盒）
 
@@ -34,6 +42,7 @@ Documents/WCallRecorder/<yyyyMMdd-HHmmss-hint>/
 | Key | 默认 | 说明 |
 |-----|------|------|
 | `WCR.Enabled` | YES | 总开关 |
+| `WCR.ShowFloating` | YES | 蓝色悬浮球 |
 | `WCR.ShowIndicator` | YES | 顶部 REC 指示 |
 | `WCR.PrivateMode` | NO | 隐私模式（隐藏 Toast） |
 | `WCR.SampleRate` | 16000 | 采样率 8000–48000 |
@@ -51,11 +60,8 @@ Windows 无法本地编 arm64 iOS dylib，请用 GitHub Actions 或 macOS：
 
 ```bash
 bash apps/WCallRecorder/package_deb.sh
-# => dist/com.blueskycrb.wcallrecorder-rootless_0.3.0_iphoneos-arm64e.deb
+# => dist/com.blueskycrb.wcallrecorder-rootless_0.4.0_iphoneos-arm64e.deb
 ```
-
-> 当前 `build.yml` 只会自动打包 AllowNotifications / WeAppHelper 的 deb。  
-> 本模块默认只产出 dylib，避免改其他代码。
 
 ## 安装
 
@@ -67,16 +73,23 @@ bash apps/WCallRecorder/package_deb.sh
 
 **TrollFools / 注入**
 
-1. 注入 `dist/WCallRecorder.dylib` 到微信
-2. 打开微信，确认日志出现：  
-   `[WCallRecorder] free rewrite for WeChat 8.0.71 loaded (v0.3.0, ...)`
+1. 注入 `dist/WCallRecorder.dylib` 到微信  
+2. 打开微信，应看到：  
+   - Toast：`WCallRecorder 已加载 v0.4.0`  
+   - 右侧蓝色悬浮球「录音插件」  
+3. 日志：`[WCallRecorder] free rewrite for WeChat 8.0.71 loaded (v0.4.0, ...)`
+
+> 注意：注入器列表里的条目 ≠ 微信内「插件中心」条目。  
+> 本版在微信内自带悬浮球/设置按钮，不依赖商业版授权 UI。
 
 ## 验证
 
-1. 打一通微信语音/视频
-2. 应看到 `通话录音已开始` 与 `REC`
-3. 挂断后看 `Documents/WCallRecorder/` 下的 wav + meta.json
-4. 若提示「无音频」：PCM 钩子未命中，需要 Frida 补点
+1. 注入后打开微信 → 看到悬浮球 / 加载 Toast  
+2. 点悬浮球 → 设置页显示版本 `0.4.0` 与钩子数量  
+3. 打一通微信语音/视频  
+4. 应看到 `通话录音已开始` 与 `REC`  
+5. 挂断后看 `Documents/WCallRecorder/` 下的 wav + meta.json  
+6. 若提示「无音频」：PCM 钩子未命中，需要 Frida 补点
 
 ### Frida 补 PCM 钩子
 
@@ -103,5 +116,6 @@ hooks = @[
 
 ## 版本
 
-- **0.3.0**：mixed.wav、空音频提示、联系人 hint、通话开始二次扫 hook、去掉 strcasestr 依赖
-- **0.2.0**：无授权双轨录音骨架 + 幂等 hook 表
+- **0.4.0**：可见 UI（悬浮球/设置入口/插件注册）、加载 Toast、诊断页、通话时激进音频扫描、remote 也可自动开会话
+- **0.3.0**：mixed.wav、空音频提示、联系人 hint、通话开始二次扫 hook
+- **0.2.0**：无授权双轨录音骨架 + 平等 hook 表
