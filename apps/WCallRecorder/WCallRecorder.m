@@ -1,8 +1,9 @@
 //
 // WCallRecorder - free rewrite for HiveNoAds (no license / no auth)
 // Target: WeChat 8.0.71 + Bootstrap/RootHide / TrollFools
-// Pure ObjC runtime hooks, no license/auth. v0.5.1
+// Pure ObjC runtime hooks, no license/auth. v0.5.2
 // Features: remark filename, MP3 export (Shine), playback UI, hangup auto-stop
+// v0.5.2: Substrate-free fishhook AudioUnit PCM, remark naming fix, hook diagnostics
 // v0.5.1: Ilink contact resolve, empty-file play guard, AudioUnit PCM capture, faster idle end
 //
 
@@ -17,6 +18,11 @@
 #import <math.h>
 #import <stdatomic.h>
 #import <ctype.h>
+#import <mach/mach.h>
+#import <mach/mach_host.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <mach-o/nlist.h>
 #include "layer3.h"
 
 #pragma mark - Config
@@ -32,7 +38,7 @@ static NSString * const kWCRPrivateKey    = @"WCR.PrivateMode";
 static NSString * const kWCRSampleRateKey = @"WCR.SampleRate";
 static NSString * const kWCRWriteMixedKey = @"WCR.WriteMixed";
 static NSString * const kWCRVerboseKey    = @"WCR.Verbose";
-static NSString * const kWCRPluginVersion = @"0.5.1";
+static NSString * const kWCRPluginVersion = @"0.5.2";
 
 static void WCRShowToast(NSString *text);
 static void WCRUpdateIndicator(BOOL on);
@@ -350,6 +356,9 @@ static NSString *WCRResolveRemarkName(NSString *hintOrWxid) {
 static BOOL WCRLooksLikeMethodName(NSString *s) {
     if (s.length == 0) return YES;
     if ([s containsString:@":"]) return YES;
+    // Pure digits / short numeric room ids are not useful display names.
+    NSCharacterSet *nonDigit = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
+    if (s.length <= 12 && [s rangeOfCharacterFromSet:nonDigit].location == NSNotFound) return YES;
     static NSArray<NSString *> *bad;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
@@ -521,7 +530,7 @@ static NSString *WCRBestSessionName(NSString *reason, NSString *hint) {
     NSDateFormatter *fmt = [NSDateFormatter new];
     fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
     fmt.dateFormat = @"HHmmss";
-    return [NSString stringWithFormat:@"??_%@", [fmt stringFromDate:[NSDate date]]];
+    return [NSString stringWithFormat:@"\u901a\u8bdd_%@", [fmt stringFromDate:[NSDate date]]];
 }
 
 static NSString *WCRContactHintFromObject(id obj) {
@@ -611,31 +620,43 @@ static void WCRSetLastSessionInfo(NSString *info) {
     [WCRDefaults() setObject:(info ?: @"-") forKey:@"WCR.LastSessionInfo"];
     [WCRDefaults() synchronize];
 }
-static NSInteger WCRLifecycleHookCount(void) {
-    return (NSInteger)atomic_load(&gWCRLifecycleHooksInstalled);
-}
-static NSInteger WCRAudioHookCount(void) {
-    NSInteger n = 0;
-    for (NSString *key in WCRHookedKeys()) {
-        NSString *low = key.lowercaseString;
-        if ([low containsString:@"startrecord"] || [low containsString:@"stopforvoip"] ||
+static BOOL WCRKeyLooksLifecycle(NSString *low) {
+    if (low.length == 0) return NO;
+    return ([low containsString:@"startrecord"] || [low containsString:@"stopforvoip"] ||
             [low containsString:@"stoprecord"] || [low containsString:@"hangup"] ||
             [low containsString:@"endcall"] || [low containsString:@"cancelcall"] ||
             [low containsString:@"onenter"] || [low containsString:@"oninvite"] ||
             [low containsString:@"openaudio"] || [low containsString:@"openvideo"] ||
             [low containsString:@"ilinkopen"] || [low containsString:@"createmulti"] ||
             [low containsString:@"joinmulti"] || [low containsString:@"onaccept"] ||
-            [low containsString:@"onmultitalk"] || [low containsString:@"viewdidappear"]) {
-            continue;
-        }
-        if ([low containsString:@"pcm"] || [low containsString:@"audio"] ||
+            [low containsString:@"onmultitalk"] || [low containsString:@"stopfor"] ||
+            [low containsString:@"closewindow"]);
+}
+static BOOL WCRKeyLooksAudio(NSString *low) {
+    if (low.length == 0) return NO;
+    if (WCRKeyLooksLifecycle(low)) return NO;
+    if ([low containsString:@"viewdidappear"] || [low containsString:@"newsetting"]) return NO;
+    return ([low containsString:@"pcm"] || [low containsString:@"audio"] ||
             [low containsString:@"mic"] || [low containsString:@"play"] ||
             [low containsString:@"buffer"] || [low containsString:@"frame"] ||
             [low containsString:@"record"] || [low containsString:@"speaker"] ||
-            [low containsString:@"remote"] || [low containsString:@"local"]) {
-            n++;
-        }
+            [low containsString:@"remote"] || [low containsString:@"local"] ||
+            [low containsString:@"audiounit"] || [low containsString:@"render"]);
+}
+static NSInteger WCRLifecycleHookCount(void) {
+    NSInteger n = 0;
+    for (NSString *key in WCRHookedKeys()) {
+        if (WCRKeyLooksLifecycle(key.lowercaseString)) n++;
     }
+    if (n == 0) n = (NSInteger)atomic_load(&gWCRLifecycleHooksInstalled);
+    return n;
+}
+static NSInteger WCRAudioHookCount(void) {
+    NSInteger n = 0;
+    for (NSString *key in WCRHookedKeys()) {
+        if (WCRKeyLooksAudio(key.lowercaseString)) n++;
+    }
+    if (atomic_load(&gWCRAudioUnitHooksInstalled)) n += 1; // C-level AU capture counts as one
     if (n == 0) n = (NSInteger)atomic_load(&gWCRAudioHooksInstalled);
     return n;
 }
@@ -1123,9 +1144,14 @@ static BOOL WCRPCMBufferLooksSilent(const void *bytes, NSUInteger len) {
         [self stopIdleWatchdog];
         // Late contact resolve (Ilink sometimes only has contact after connected).
         NSString *better = WCRBestSessionName(reason, self.contactDisplayName);
-        if (better.length && (self.contactDisplayName.length == 0 || WCRLooksLikeMethodName(self.contactDisplayName))) {
+        BOOL weakName = (self.contactDisplayName.length == 0 ||
+                         WCRLooksLikeMethodName(self.contactDisplayName) ||
+                         [self.contactDisplayName hasPrefix:@"\u901a\u8bdd_"] ||
+                         [self.contactDisplayName hasPrefix:@"通话_"]);
+        if (better.length && weakName && ![better isEqualToString:self.contactDisplayName] && !WCRLooksLikeMethodName(better)) {
             self.contactDisplayName = better;
             self.meta[@"displayName"] = better;
+            WCRInfo("resolved better displayName=%@", better);
         }
         [self.micWriter closeFile]; [self.remoteWriter closeFile];
         NSString *micPath = [self.sessionDir stringByAppendingPathComponent:@"mic.wav"];
@@ -1466,7 +1492,7 @@ static void WCREnsureFloatingBall(void) {
 }
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (section == 1) {
-        return @"若通话结束提示无音频：说明 PCM 钩子未命中。可点“重新扫描钩子”，或用 Frida 脚本补 WCRExtraAudioHooks。";
+        return @"若通话结束仍无音频：看 AU 是否为1。AU=0 表示 C 钩未装上；AU=1 仍 mic=0 则需 Frida 补 ObjC PCM 选择子。";
     }
     if (section == 3) return [[WCRSessionManager shared] rootDir];
     return nil;
@@ -1527,7 +1553,7 @@ static void WCREnsureFloatingBall(void) {
             cell.detailTextLabel.text = @"免费无授权 · 目标 WeChat 8.0.71";
         } else if (indexPath.row == 1) {
             cell.textLabel.text = [NSString stringWithFormat:@"生命周期钩子: %ld", (long)WCRLifecycleHookCount()];
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"音频钩子约: %ld  AU=%d  (总hook=%lu)", (long)WCRAudioHookCount(), atomic_load(&gWCRAudioUnitHooksInstalled), (unsigned long)WCRHookedKeys().count];
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"音频钩子约: %ld  AU=%d%@  (总hook=%lu)", (long)WCRAudioHookCount(), atomic_load(&gWCRAudioUnitHooksInstalled), atomic_load(&gWCRAudioUnitHooksInstalled) ? @" fishhook/MS" : @" 未装", (unsigned long)WCRHookedKeys().count];
         } else if (indexPath.row == 2) {
             cell.textLabel.text = rec ? @"当前: 录音中" : @"当前: 空闲";
             cell.detailTextLabel.text = [NSString stringWithFormat:@"PCM帧 mic=%d remote=%d",
@@ -2069,6 +2095,8 @@ static BOOL WCRHookAudioSelector(Class cls, SEL sel, WCRTrack track) {
 }
 
 #pragma mark - AudioUnit PCM capture (fallback when ObjC PCM selectors miss)
+// Substrate-free path: fishhook-style dyld symbol rebind for TrollFools / no-MSHookFunction.
+// Optional MSHookFunction remains preferred when present.
 
 typedef OSStatus (*WCRAudioOutputUnitStart_t)(AudioUnit ci);
 typedef OSStatus (*WCRAudioUnitRender_t)(AudioUnit inUnit,
@@ -2077,12 +2105,28 @@ typedef OSStatus (*WCRAudioUnitRender_t)(AudioUnit inUnit,
                                          UInt32 inOutputBusNumber,
                                          UInt32 inNumberFrames,
                                          AudioBufferList *ioData);
+typedef OSStatus (*WCRAudioUnitSetProperty_t)(AudioUnit inUnit,
+                                              AudioUnitPropertyID inID,
+                                              AudioUnitScope inScope,
+                                              AudioUnitElement inElement,
+                                              const void *inData,
+                                              UInt32 inDataSize);
 typedef void (*WCRMSHookFunction_t)(void *symbol, void *replace, void **result);
 
 static WCRAudioOutputUnitStart_t gWCROrigAudioOutputUnitStart = NULL;
 static WCRAudioUnitRender_t gWCROrigAudioUnitRender = NULL;
+static WCRAudioUnitSetProperty_t gWCROrigAudioUnitSetProperty = NULL;
 static AudioStreamBasicDescription gWCRLastASBD;
 static BOOL gWCRHasASBD = NO;
+
+typedef struct {
+    AURenderCallback origProc;
+    void *origRefCon;
+    AudioUnit unit;
+    BOOL isInput; // YES=mic input callback, NO=output render callback
+} WCRWrappedCB;
+static WCRWrappedCB gWCRWrappedCBs[8];
+static int gWCRWrappedCBCount = 0;
 
 static void WCRCaptureAudioBufferList(AudioBufferList *ioData, WCRTrack track, double srHint) {
     if (!ioData || ioData->mNumberBuffers == 0) return;
@@ -2169,33 +2213,79 @@ static OSStatus WCRRenderNotify(void *inRefCon,
                                 UInt32 inNumberFrames,
                                 AudioBufferList *ioData) {
     (void)inRefCon; (void)inTimeStamp; (void)inNumberFrames;
-    if (!ioActionFlags) return noErr;
+    if (!ioActionFlags || !ioData) return noErr;
+    if (!WCREnabled() || ![[WCRSessionManager shared] isRecording]) return noErr;
     BOOL post = ((*ioActionFlags) & kAudioUnitRenderAction_PostRender) != 0;
-    if (!post || !ioData) return noErr;
-    // Bus 0 output (speaker / remote mix). Input is captured via AudioUnitRender hook.
+    if (!post) return noErr;
+    // Bus 0 output (speaker / remote mix). Input is captured via AudioUnitRender / input callback.
     if (inBusNumber == 0) {
         WCRCaptureAudioBufferList(ioData, WCRTrackRemote, gWCRHasASBD ? gWCRLastASBD.mSampleRate : 0);
     }
     return noErr;
 }
 
-static void WCRTryAttachUnit(AudioUnit unit) {
+static void WCRCacheUnitASBD(AudioUnit unit) {
     if (!unit) return;
-    // Cache stream format if possible
     AudioStreamBasicDescription asbd = {0};
     UInt32 sz = sizeof(asbd);
     if (AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &asbd, &sz) == noErr && asbd.mSampleRate > 0) {
         gWCRLastASBD = asbd;
         gWCRHasASBD = YES;
-    } else {
-        sz = sizeof(asbd);
-        if (AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1, &asbd, &sz) == noErr && asbd.mSampleRate > 0) {
-            gWCRLastASBD = asbd;
-            gWCRHasASBD = YES;
+        return;
+    }
+    sz = sizeof(asbd);
+    if (AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1, &asbd, &sz) == noErr && asbd.mSampleRate > 0) {
+        gWCRLastASBD = asbd;
+        gWCRHasASBD = YES;
+    }
+}
+
+static void WCRTryAttachUnit(AudioUnit unit) {
+    if (!unit) return;
+    WCRCacheUnitASBD(unit);
+    // Adding notify twice is mostly harmless; AudioUnit keeps a list.
+    AudioUnitAddRenderNotify(unit, WCRRenderNotify, NULL);
+}
+
+static OSStatus WCRWrappedAUCallback(void *inRefCon,
+                                     AudioUnitRenderActionFlags *ioActionFlags,
+                                     const AudioTimeStamp *inTimeStamp,
+                                     UInt32 inBusNumber,
+                                     UInt32 inNumberFrames,
+                                     AudioBufferList *ioData) {
+    WCRWrappedCB *wrap = (WCRWrappedCB *)inRefCon;
+    OSStatus st = noErr;
+    if (wrap && wrap->origProc) {
+        st = wrap->origProc(wrap->origRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
+    }
+    if (st == noErr && ioData && WCREnabled() && [[WCRSessionManager shared] isRecording]) {
+        WCRTrack track = (wrap && wrap->isInput) ? WCRTrackMic : WCRTrackRemote;
+        // For output render, bus0 is speaker; for input, bus1/0 may carry mic.
+        if (!wrap || wrap->isInput || inBusNumber == 0) {
+            WCRCaptureAudioBufferList(ioData, track, gWCRHasASBD ? gWCRLastASBD.mSampleRate : 0);
         }
     }
-    // Avoid duplicate notify where possible; adding twice is mostly harmless but noisy.
-    AudioUnitAddRenderNotify(unit, WCRRenderNotify, NULL);
+    return st;
+}
+
+static WCRWrappedCB *WCRStoreWrappedCB(AudioUnit unit, BOOL isInput, AURenderCallback origProc, void *origRefCon) {
+    if (!origProc) return NULL;
+    for (int i = 0; i < gWCRWrappedCBCount; i++) {
+        if (gWCRWrappedCBs[i].unit == unit && gWCRWrappedCBs[i].isInput == isInput) {
+            gWCRWrappedCBs[i].origProc = origProc;
+            gWCRWrappedCBs[i].origRefCon = origRefCon;
+            return &gWCRWrappedCBs[i];
+        }
+    }
+    if (gWCRWrappedCBCount >= (int)(sizeof(gWCRWrappedCBs) / sizeof(gWCRWrappedCBs[0]))) {
+        // overwrite oldest slot
+        WCRWrappedCB *w = &gWCRWrappedCBs[0];
+        w->unit = unit; w->isInput = isInput; w->origProc = origProc; w->origRefCon = origRefCon;
+        return w;
+    }
+    WCRWrappedCB *w = &gWCRWrappedCBs[gWCRWrappedCBCount++];
+    w->unit = unit; w->isInput = isInput; w->origProc = origProc; w->origRefCon = origRefCon;
+    return w;
 }
 
 static OSStatus WCRRepl_AudioOutputUnitStart(AudioUnit ci) {
@@ -2214,48 +2304,281 @@ static OSStatus WCRRepl_AudioUnitRender(AudioUnit inUnit,
     if (gWCROrigAudioUnitRender) {
         st = gWCROrigAudioUnitRender(inUnit, ioActionFlags, inTimeStamp, inOutputBusNumber, inNumberFrames, ioData);
     }
-    // Pulling input bus typically means mic frames.
-    if (st == noErr && ioData && (inOutputBusNumber == 1 || inOutputBusNumber == 0)) {
+    // Pulling input bus typically means mic frames; bus0 may also be used by some stacks.
+    if (st == noErr && ioData) {
         WCRTrack track = (inOutputBusNumber == 1) ? WCRTrackMic : WCRTrackRemote;
         WCRCaptureAudioBufferList(ioData, track, gWCRHasASBD ? gWCRLastASBD.mSampleRate : 0);
     }
     return st;
 }
 
-static void WCRInstallAudioUnitHooks(void) {
-    if (atomic_load(&gWCRAudioUnitHooksInstalled)) return;
+static OSStatus WCRRepl_AudioUnitSetProperty(AudioUnit inUnit,
+                                             AudioUnitPropertyID inID,
+                                             AudioUnitScope inScope,
+                                             AudioUnitElement inElement,
+                                             const void *inData,
+                                             UInt32 inDataSize) {
+    // Wrap RemoteIO input/output callbacks so we see PCM even without RenderNotify.
+    if (inData && inDataSize >= sizeof(AURenderCallbackStruct) &&
+        (inID == kAudioUnitProperty_SetRenderCallback || inID == kAudioOutputUnitProperty_SetInputCallback)) {
+        const AURenderCallbackStruct *src = (const AURenderCallbackStruct *)inData;
+        if (src->inputProc && src->inputProc != WCRWrappedAUCallback) {
+            BOOL isInput = (inID == kAudioOutputUnitProperty_SetInputCallback);
+            WCRWrappedCB *wrap = WCRStoreWrappedCB(inUnit, isInput, src->inputProc, src->inputProcRefCon);
+            if (wrap) {
+                AURenderCallbackStruct repl = {0};
+                repl.inputProc = WCRWrappedAUCallback;
+                repl.inputProcRefCon = wrap;
+                WCRCacheUnitASBD(inUnit);
+                if (gWCROrigAudioUnitSetProperty) {
+                    return gWCROrigAudioUnitSetProperty(inUnit, inID, inScope, inElement, &repl, sizeof(repl));
+                }
+            }
+        }
+    }
+    if (gWCROrigAudioUnitSetProperty) {
+        OSStatus st = gWCROrigAudioUnitSetProperty(inUnit, inID, inScope, inElement, inData, inDataSize);
+        if (st == noErr && inID == kAudioUnitProperty_StreamFormat) {
+            WCRCacheUnitASBD(inUnit);
+        }
+        return st;
+    }
+    return -1;
+}
 
-    WCRMSHookFunction_t hookFn = (WCRMSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
-    if (!hookFn) {
-        // Common substrate / ellekit locations when not already in default namespace.
-        void *h = dlopen("/usr/lib/libsubstrate.dylib", RTLD_LAZY);
-        if (!h) h = dlopen("/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate", RTLD_LAZY);
-        if (!h) h = dlopen("@rpath/CydiaSubstrate.framework/CydiaSubstrate", RTLD_LAZY);
-        if (h) hookFn = (WCRMSHookFunction_t)dlsym(h, "MSHookFunction");
-    }
-    if (!hookFn) {
-        WCRLog("AudioUnit hooks skipped: MSHookFunction not found");
-        return;
-    }
+#pragma mark - fishhook-style rebind (no CydiaSubstrate)
 
-    void *pStart = dlsym(RTLD_DEFAULT, "AudioOutputUnitStart");
-    void *pRender = dlsym(RTLD_DEFAULT, "AudioUnitRender");
-    int ok = 0;
-    if (pStart) {
-        hookFn(pStart, (void *)WCRRepl_AudioOutputUnitStart, (void **)&gWCROrigAudioOutputUnitStart);
-        ok++;
+#ifndef SEG_DATA_CONST
+#define SEG_DATA_CONST "__DATA_CONST"
+#endif
+
+typedef struct {
+    const char *name;
+    void *replacement;
+    void **replaced;   // out: original function pointer from GOT (if found)
+    int slots;         // out: number of import slots rewritten
+} WCRRebindEntry;
+
+static int WCRMakeWritableAndSet(void **slot, void *value, void **outOld) {
+    if (!slot) return 0;
+    vm_address_t page = (vm_address_t)slot;
+    // Align down to host page size.
+    vm_size_t psz = 0;
+    host_page_size(mach_host_self(), &psz);
+    if (psz == 0) psz = 16384; // safe default on modern Apple Silicon iOS
+    page &= ~(vm_address_t)(psz - 1);
+    kern_return_t kr = vm_protect(mach_task_self(), page, psz, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) {
+        // Retry without COPY for some environments.
+        kr = vm_protect(mach_task_self(), page, psz, 0, VM_PROT_READ | VM_PROT_WRITE);
+        if (kr != KERN_SUCCESS) return 0;
     }
-    if (pRender) {
-        hookFn(pRender, (void *)WCRRepl_AudioUnitRender, (void **)&gWCROrigAudioUnitRender);
-        ok++;
+    if (outOld && *outOld == NULL) *outOld = *slot;
+    *slot = value;
+    // Best-effort restore; ignore failure.
+    vm_protect(mach_task_self(), page, psz, 0, VM_PROT_READ);
+    return 1;
+}
+
+static void WCRPerformRebindInImage(const struct mach_header *header,
+                                    intptr_t slide,
+                                    WCRRebindEntry *entries,
+                                    size_t ne) {
+    if (!header || !entries || ne == 0) return;
+
+#if defined(__LP64__)
+    typedef struct mach_header_64 wcr_mh_t;
+    typedef struct segment_command_64 wcr_seg_t;
+    typedef struct section_64 wcr_sec_t;
+    typedef struct nlist_64 wcr_nlist_t;
+    const uint32_t expected_magic = MH_MAGIC_64;
+    const uint32_t seg_cmd = LC_SEGMENT_64;
+#else
+    typedef struct mach_header wcr_mh_t;
+    typedef struct segment_command wcr_seg_t;
+    typedef struct section wcr_sec_t;
+    typedef struct nlist wcr_nlist_t;
+    const uint32_t expected_magic = MH_MAGIC;
+    const uint32_t seg_cmd = LC_SEGMENT;
+#endif
+    if (header->magic != expected_magic) return;
+
+    const wcr_mh_t *mh = (const wcr_mh_t *)header;
+    const wcr_seg_t *linkedit = NULL;
+    struct symtab_command *symtab_cmd = NULL;
+    struct dysymtab_command *dysymtab_cmd = NULL;
+
+    uintptr_t cur = (uintptr_t)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        struct load_command *lc = (struct load_command *)cur;
+        if (lc->cmd == seg_cmd) {
+            const wcr_seg_t *seg = (const wcr_seg_t *)lc;
+            if (strcmp(seg->segname, SEG_LINKEDIT) == 0) linkedit = seg;
+        } else if (lc->cmd == LC_SYMTAB) {
+            symtab_cmd = (struct symtab_command *)lc;
+        } else if (lc->cmd == LC_DYSYMTAB) {
+            dysymtab_cmd = (struct dysymtab_command *)lc;
+        }
+        cur += lc->cmdsize;
     }
-    if (ok > 0) {
-        atomic_store(&gWCRAudioUnitHooksInstalled, 1);
-        atomic_store(&gWCRAudioHooksInstalled, 1);
-        WCRInfo("AudioUnit C hooks installed (%d)", ok);
+    if (!symtab_cmd || !dysymtab_cmd || !linkedit) return;
+    if (dysymtab_cmd->nindirectsyms == 0) return;
+
+    uintptr_t linkedit_base = (uintptr_t)slide + (uintptr_t)linkedit->vmaddr - (uintptr_t)linkedit->fileoff;
+    const char *strtab = (const char *)(linkedit_base + symtab_cmd->stroff);
+    wcr_nlist_t *symtab = (wcr_nlist_t *)(linkedit_base + symtab_cmd->symoff);
+    uint32_t *indirect_symtab = (uint32_t *)(linkedit_base + dysymtab_cmd->indirectsymoff);
+
+    cur = (uintptr_t)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        struct load_command *lc = (struct load_command *)cur;
+        if (lc->cmd == seg_cmd) {
+            const wcr_seg_t *seg = (const wcr_seg_t *)lc;
+            if (strcmp(seg->segname, SEG_DATA) != 0 &&
+                strcmp(seg->segname, SEG_DATA_CONST) != 0 &&
+                strcmp(seg->segname, "__DATA_DIRTY") != 0 &&
+                strcmp(seg->segname, "__AUTH_CONST") != 0) {
+                cur += lc->cmdsize;
+                continue;
+            }
+            wcr_sec_t *sections = (wcr_sec_t *)((uintptr_t)seg + sizeof(wcr_seg_t));
+            for (uint32_t j = 0; j < seg->nsects; j++) {
+                wcr_sec_t *sect = &sections[j];
+                uint32_t stype = sect->flags & SECTION_TYPE;
+                if (stype != S_LAZY_SYMBOL_POINTERS && stype != S_NON_LAZY_SYMBOL_POINTERS) continue;
+                if (sect->reserved1 >= dysymtab_cmd->nindirectsyms) continue;
+
+                uint32_t *indirect = indirect_symtab + sect->reserved1;
+                void **bindings = (void **)((uintptr_t)slide + (uintptr_t)sect->addr);
+                uint32_t count = (uint32_t)(sect->size / sizeof(void *));
+                for (uint32_t k = 0; k < count; k++) {
+                    uint32_t symIndex = indirect[k];
+                    if ((symIndex & INDIRECT_SYMBOL_ABS) != 0 || (symIndex & INDIRECT_SYMBOL_LOCAL) != 0) continue;
+                    if (symIndex >= symtab_cmd->nsyms) continue;
+                    uint32_t strx = symtab[symIndex].n_un.n_strx;
+                    if (strx == 0) continue;
+                    const char *name = strtab + strx;
+                    if (!name || !name[0]) continue;
+                    const char *cmp = (name[0] == '_') ? (name + 1) : name;
+                    for (size_t e = 0; e < ne; e++) {
+                        if (strcmp(cmp, entries[e].name) != 0) continue;
+                        // Avoid re-writing if already our replacement.
+                        if (bindings[k] == entries[e].replacement) {
+                            entries[e].slots += 1;
+                            break;
+                        }
+                        if (WCRMakeWritableAndSet(&bindings[k], entries[e].replacement, entries[e].replaced)) {
+                            entries[e].slots += 1;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        cur += lc->cmdsize;
     }
 }
 
+static int WCRRebindSymbols(WCRRebindEntry *entries, size_t ne) {
+    if (!entries || ne == 0) return 0;
+    for (size_t e = 0; e < ne; e++) entries[e].slots = 0;
+    uint32_t imgCount = _dyld_image_count();
+    for (uint32_t i = 0; i < imgCount; i++) {
+        const struct mach_header *hdr = _dyld_get_image_header(i);
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        if (!hdr) continue;
+        WCRPerformRebindInImage(hdr, slide, entries, ne);
+    }
+    int slots = 0;
+    for (size_t e = 0; e < ne; e++) slots += entries[e].slots;
+    return slots;
+}
+
+static void WCRInstallAudioUnitHooks(void) {
+    if (atomic_load(&gWCRAudioUnitHooksInstalled)) return;
+
+    void *pStart = dlsym(RTLD_DEFAULT, "AudioOutputUnitStart");
+    void *pRender = dlsym(RTLD_DEFAULT, "AudioUnitRender");
+    void *pSetProp = dlsym(RTLD_DEFAULT, "AudioUnitSetProperty");
+    if (!pStart && !pRender && !pSetProp) {
+        WCRInfo("AudioUnit symbols missing from process");
+        return;
+    }
+
+    int ok = 0;
+    const char *via = "none";
+
+    // 1) Prefer MSHookFunction when Substrate/ElleKit is present.
+    WCRMSHookFunction_t hookFn = (WCRMSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
+    if (!hookFn) {
+        const char *libs[] = {
+            "/usr/lib/libsubstrate.dylib",
+            "/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate",
+            "@rpath/CydiaSubstrate.framework/CydiaSubstrate",
+            "/var/jb/usr/lib/libsubstrate.dylib",
+            "/var/jb/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate",
+            "/usr/lib/libellekit.dylib",
+            "/var/jb/usr/lib/libellekit.dylib",
+            NULL
+        };
+        for (int i = 0; libs[i]; i++) {
+            void *h = dlopen(libs[i], RTLD_LAZY);
+            if (!h) continue;
+            hookFn = (WCRMSHookFunction_t)dlsym(h, "MSHookFunction");
+            if (hookFn) break;
+        }
+    }
+    if (hookFn) {
+        if (pStart) {
+            hookFn(pStart, (void *)WCRRepl_AudioOutputUnitStart, (void **)&gWCROrigAudioOutputUnitStart);
+            if (gWCROrigAudioOutputUnitStart) ok++;
+        }
+        if (pRender) {
+            hookFn(pRender, (void *)WCRRepl_AudioUnitRender, (void **)&gWCROrigAudioUnitRender);
+            if (gWCROrigAudioUnitRender) ok++;
+        }
+        if (pSetProp) {
+            hookFn(pSetProp, (void *)WCRRepl_AudioUnitSetProperty, (void **)&gWCROrigAudioUnitSetProperty);
+            if (gWCROrigAudioUnitSetProperty) ok++;
+        }
+        if (ok > 0) via = "MSHookFunction";
+    }
+
+    // 2) Fallback: fishhook rebind (TrollFools / no Substrate).
+    if (ok == 0) {
+        gWCROrigAudioOutputUnitStart = NULL;
+        gWCROrigAudioUnitRender = NULL;
+        gWCROrigAudioUnitSetProperty = NULL;
+        WCRRebindEntry entries[] = {
+            { "AudioOutputUnitStart", (void *)WCRRepl_AudioOutputUnitStart, (void **)&gWCROrigAudioOutputUnitStart, 0 },
+            { "AudioUnitRender", (void *)WCRRepl_AudioUnitRender, (void **)&gWCROrigAudioUnitRender, 0 },
+            { "AudioUnitSetProperty", (void *)WCRRepl_AudioUnitSetProperty, (void **)&gWCROrigAudioUnitSetProperty, 0 },
+        };
+        int slots = WCRRebindSymbols(entries, sizeof(entries) / sizeof(entries[0]));
+        // If a slot was rewritten but original pointer wasn't captured, seed from dlsym.
+        if (entries[0].slots > 0 && !gWCROrigAudioOutputUnitStart && pStart)
+            gWCROrigAudioOutputUnitStart = (WCRAudioOutputUnitStart_t)pStart;
+        if (entries[1].slots > 0 && !gWCROrigAudioUnitRender && pRender)
+            gWCROrigAudioUnitRender = (WCRAudioUnitRender_t)pRender;
+        if (entries[2].slots > 0 && !gWCROrigAudioUnitSetProperty && pSetProp)
+            gWCROrigAudioUnitSetProperty = (WCRAudioUnitSetProperty_t)pSetProp;
+
+        if (entries[0].slots > 0) ok++;
+        if (entries[1].slots > 0) ok++;
+        if (entries[2].slots > 0) ok++;
+        if (ok > 0) via = "fishhook";
+        WCRInfo("AudioUnit fishhook slots=%d (start=%d render=%d set=%d)",
+                slots, entries[0].slots, entries[1].slots, entries[2].slots);
+    }
+
+    if (ok > 0) {
+        atomic_store(&gWCRAudioUnitHooksInstalled, 1);
+        atomic_store(&gWCRAudioHooksInstalled, 1);
+        WCRInfo("AudioUnit C hooks installed (%d) via %s", ok, via);
+    } else {
+        WCRInfo("AudioUnit hooks NOT installed (no MSHookFunction / fishhook miss)");
+    }
+}
 
 static void WCRInstallLifecycle(void) {
     // Only hook known selectors with exact argc. Wrong ABI here crashes on accept.

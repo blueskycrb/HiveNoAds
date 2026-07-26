@@ -3,13 +3,14 @@
 HiveNoAds 内的**免费、无授权**微信通话录音模块。  
 根据商业版 `WCallRecorder.dylib` 的公开生命周期选择子做独立重写，**不含授权/联网校验**。
 
-## v0.5.1 修复
+## v0.5.2 修复（针对 AU=0 / 无 PCM）
 
-1. **备注命名**：接入 `ilinkOpenWindowWithContact...`，拒绝用方法名当文件名，优先联系人备注
-2. **播放保护**：空 WAV/无 PCM 不再尝试播放，提示“无有效音频”
-3. **挂断收尾**：无 PCM 约 25 秒自动结束，避免一直“录音中”
-4. **PCM 兜底**：在 Substrate 可用时 hook `AudioOutputUnitStart` / `AudioUnitRender` 捕获通话 PCM
-5. 通话中自动加强音频选择子扫描
+1. **不依赖 CydiaSubstrate**：用 fishhook 风格 dyld 符号重绑定 hook  
+   `AudioOutputUnitStart` / `AudioUnitRender` / `AudioUnitSetProperty`  
+   （TrollFools 等无 MSHookFunction 环境可装上，状态页应显示 **AU=1**）
+2. **回调包装**：拦截 RemoteIO 的 input/render callback，通话中采集 mic/remote PCM
+3. **备注命名修复**：不再出现 `142655_时间戳` 这种被 `?` 洗掉的文件名；回退为 `通话_HHmmss`，并拒绝纯数字名
+4. **诊断计数**：生命周期/音频钩子按已 hook 的 key 统计，避免一直显示 0
 
 ## 目标环境
 
@@ -18,12 +19,12 @@ HiveNoAds 内的**免费、无授权**微信通话录音模块。
 - Bootstrap / RootHide（`iphoneos-arm64e`）
 - 也可经 TrollFools 等注入器注入 `WCallRecorder.dylib`
 
-## v0.5.1 新特性
+## 功能
 
 1. **MP3 输出**：通话结束混音后编码为 `call.mp3`，并复制到根目录 `{备注}_{时间}.mp3`
 2. **备注命名**：优先联系人备注（`m_nsRemark`），可读中文文件名
 3. **列表可播放**：点最近录音 → 播放 / 分享 / 复制路径 / 删除
-4. **挂断自动结束**：更多 stop/hangup 钩子 + 无 PCM 静默看门狗（约 10s）
+4. **挂断自动结束**：stop/hangup 钩子 + 无 PCM 静默看门狗
 5. 仍保留双轨 `mic.wav` / `remote.wav`，可选 `mixed.wav`
 
 ## 可见入口
@@ -31,7 +32,7 @@ HiveNoAds 内的**免费、无授权**微信通话录音模块。
 1. **蓝色悬浮球**（默认开启）
 2. 微信 **我 → 设置** 右上角 **「录音」** 按钮
 3. 若有 `WCPluginsMgr` 插件中心：注册 **「WCallRecorder 通话录音」**
-4. 启动 Toast：`WCallRecorder 已加载 v0.5.1`
+4. 启动 Toast：`WCallRecorder 已加载 v0.5.2`
 
 ## 保存位置（微信沙盒）
 
@@ -63,20 +64,21 @@ Documents/WCallRecorder/
 Windows 无法本地编 arm64 iOS dylib，请用 GitHub Actions：
 
 1. 推送 `apps/WCallRecorder/`（含 `third_party/shine`）
-2. workflow 会额外链接 AVFoundation + Shine 源码
+2. workflow 会额外链接 AVFoundation + AudioToolbox + Shine 源码
 3. 产物：`dist/WCallRecorder.dylib`
 
 ```bash
 bash apps/WCallRecorder/package_deb.sh
-# => dist/com.blueskycrb.wcallrecorder-rootless_0.5.1_iphoneos-arm64e.deb
+# => dist/com.blueskycrb.wcallrecorder-rootless_0.5.2_iphoneos-arm64e.deb
 ```
 
 ## 安装
 
 1. **先删除旧版** `WCallRecorder.dylib` / 旧 deb
 2. 注入新 dylib 或安装新 deb
-3. **冷启动微信**（划掉后台再开）
-4. 应看到 Toast `v0.5.1` 与悬浮球
+3. **冷启动微信**（划掉后再开）
+4. 应看到 Toast `v0.5.2` 与悬浮球
+5. 状态页确认 **AU=1**（fishhook/MS）
 
 ## 验证清单
 
@@ -86,8 +88,9 @@ bash apps/WCallRecorder/package_deb.sh
 4. **挂断后自动结束**，Toast「通话录音已保存(MP3)」
 5. 最近录音可点开 **播放**
 6. 文件名含来电备注中文，扩展名 `.mp3`
+7. 状态：**AU=1**，通话中 **mic/remote > 0**
 
-若提示「无音频」：PCM 钩子未命中。点「重新扫描钩子」，或用 Frida 补 `WCRExtraAudioHooks()`。
+若 **AU=1** 仍无 PCM：ObjC 选择子未命中且 AudioUnit 路径被绕过。点「重新扫描钩子」，或用 Frida 补 `WCRExtraAudioHooks()`：
 
 ```bash
 frida -U -n WeChat -l apps/WCallRecorder/find_voip_hooks.js
